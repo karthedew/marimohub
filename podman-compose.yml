@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: molab
+      POSTGRES_PASSWORD: molab
+      POSTGRES_DB: molab
+    ports:
+      - "5432:5432"
+    volumes:
+      - molab-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U molab -d molab"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Containerfile.backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://molab:molab@postgres:5432/molab
+      SECRET_KEY: dev-secret-change-me
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      IDLE_TIMEOUT_MINUTES: 10
+      MAX_CONCURRENT_SESSIONS: 10
+      MARIMO_PORT_RANGE: 9000-9099
+    volumes:
+      - ./backend:/app/backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    image: node:22
+    working_dir: /app/frontend
+    volumes:
+      - ./frontend:/app/frontend
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  molab-pgdata:
