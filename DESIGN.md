@@ -32,20 +32,24 @@ MoLab is a Marimo notebook hub for scientists and engineers. The core loop:
 ## Architecture Decisions
 
 ### Authentication
+
 - **MVP:** Basic username/password stored in Postgres (bcrypt hashed), JWT session tokens
 - **Future:** SAML / OAuth 2.0 (e.g., ORCID, GitHub, institutional SSO)
 - Auth layer is abstracted behind an `AuthService` interface to make the swap clean
 - **Access model:** anonymous users can browse and run notebooks; auth required for create, publish, deploy, fork
 
 ### Notebook Execution
+
 WASM was considered and rejected — PyTorch and other C-extension packages are required and are not Pyodide-compatible. All execution is server-side via Marimo subprocesses.
 
 Three process modes:
+
 - **Edit mode** (`marimo edit`) — creating/editing a draft notebook
 - **Run mode** (`marimo run`) — ephemeral session for viewing/running a published notebook
 - **Deploy mode** (`marimo run`) — persistent named process with a stable URL
 
 ### Deploy Lifecycle
+
 - Deployed notebooks **spin up on the first request** and **sleep after idle timeout** (default `IDLE_TIMEOUT_MINUTES=10`, configurable via env var)
 - A background asyncio task (idle reaper) checks every 60 seconds and kills idle processes
 - Deployments are **still reachable when sleeping** — FastAPI buffers the incoming request, wakes the process, waits up to 10 seconds for it to be ready, then forwards
@@ -54,35 +58,44 @@ Three process modes:
 - **Production:** OpenShift resource quotas handle per-notebook limits
 
 ### Grafana Data Actions Integration
+
 Two patterns, both supported:
 
 1. **Query params** — Grafana hits `GET /deploy/{slug}?metric=cpu&value=94.2`; notebook reads `mo.query_params` reactively
 2. **Data buffer** — Grafana POSTs JSON to `POST /api/notebooks/{id}/data`; FastAPI stores payload in Postgres; notebook fetches `GET /api/notebooks/{id}/data` on load; works correctly even if notebook was sleeping when Grafana fired
 
 ### Notebook Storage
+
 - **MVP:** Notebook `.py` source stored as text in the `notebooks` table in Postgres
 - **Near-future:** Migrate to MinIO (S3-compatible object storage) — works locally and on OpenShift
 - A `NotebookStorageService` abstraction (`get` / `put` / `delete`) is used from day one so the swap is a drop-in replacement
 
 ### Discovery & Search
+
 Two search mechanisms run in parallel:
+
 - **Full-text search:** Postgres `tsvector` generated column on title + description + tags, with a GIN index
 - **Semantic search:** `pgvector` column (`vector(384)`) populated at publish time using `all-MiniLM-L6-v2`; cosine similarity queries for "find notebooks like this one"
 
 ### Notebook Visibility
+
 Three-state enum on every notebook:
+
 - `draft` — only the owner can see it
 - `unlisted` — accessible via direct link, not in the discovery feed
 - `public` — appears in discovery/search
 
 ### Forking
+
 - Fork creates a **new `draft` notebook** in the forker's account with a `parent_id` pointing to the original
 - Fork count is displayed on the original notebook's detail page
 - The lineage ("forked from…") is surfaced in the UI
 - Forks follow the normal publish flow: draft → unlisted → public
 
 ### Notebook Ingestion (How Users Add Notebooks)
+
 Three paths:
+
 1. **Create blank** — main CTA on the landing page ("Create new Notebook"); spins up a `marimo edit` session immediately
 2. **Upload `.py` file** — for scientists with existing notebooks
 3. **GitLab raw file URL** — paste a raw file URL; backend fetches with `httpx`; supports private repos via Personal Access Token (PAT); GitHub support to follow GitLab
@@ -92,11 +105,13 @@ Three paths:
 ## Database Schema (Key Tables)
 
 ### `users`
+
 ```
 id, username, email, password_hash, created_at
 ```
 
 ### `notebooks`
+
 ```
 id, user_id (FK), parent_id (FK self, nullable),
 title, description, tags text[],
@@ -109,6 +124,7 @@ created_at, updated_at
 ```
 
 ### `deployments`
+
 ```
 id, notebook_id (FK), slug (unique),
 status enum('running','sleeping','stopped'),
@@ -118,6 +134,7 @@ created_at
 ```
 
 ### `notebook_data`
+
 ```
 id, notebook_id (FK),
 payload jsonb,
