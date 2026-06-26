@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from pathlib import Path
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
-
 
 HOST = "127.0.0.1"
 TOKEN = "molab-spike-token"
@@ -117,7 +116,7 @@ def free_port() -> int:
 
 
 def notebook_source() -> str:
-    return '''import marimo
+    return """import marimo
 
 __generated_with = "0.23.10"
 app = marimo.App()
@@ -125,13 +124,13 @@ app = marimo.App()
 
 @app.cell
 def _():
-    "MoLab marimo process spike"
+    "MarimoHub marimo process spike"
     return
 
 
 if __name__ == "__main__":
     app.run()
-'''
+"""
 
 
 if __name__ == "__main__":

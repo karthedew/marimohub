@@ -18,12 +18,12 @@ from app.db.database import get_db
 from app.main import app
 from app.services.embedding_service import EMBEDDING_DIMENSIONS
 
-
 DEFAULT_TEST_DATABASE_URL = "postgresql+asyncpg://molab:molab@localhost:5432/molab_test"
 
 
 class FakeEmbeddingService:
     def __init__(self) -> None:
+        super().__init__()
         self.calls: list[str] = []
 
     async def embed(self, text: str) -> list[float]:
@@ -57,7 +57,9 @@ def test_database_url() -> Generator[str, None, None]:
         raise RuntimeError("TEST_DATABASE_URL must include a database name")
 
     with psycopg.connect(_sync_url(database_url, "postgres"), autocommit=True) as conn:
-        exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,)).fetchone()
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (database_name,)
+        ).fetchone()
         if exists is None:
             conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
 
@@ -87,14 +89,18 @@ async def db_session(test_database_url: str) -> AsyncGenerator[AsyncSession, Non
     sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE notebook_data, deployments, notebooks, users RESTART IDENTITY CASCADE"))
+        await conn.execute(
+            text("TRUNCATE notebook_data, deployments, notebooks, users RESTART IDENTITY CASCADE")
+        )
 
     async with sessionmaker() as session:
         yield session
         await session.rollback()
 
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE notebook_data, deployments, notebooks, users RESTART IDENTITY CASCADE"))
+        await conn.execute(
+            text("TRUNCATE notebook_data, deployments, notebooks, users RESTART IDENTITY CASCADE")
+        )
 
     await engine.dispose()
 

@@ -1,13 +1,20 @@
 <script lang="ts">
 	import '../app.css';
+	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { api } from '$lib/api';
 	import { auth } from '$lib/stores/auth';
 	import { applyTheme, getInitialTheme, type Theme } from '$lib/theme';
-	import favicon from '$lib/assets/favicon.svg';
+	import Button from '$lib/components/Button.svelte';
 
 	let { children } = $props();
 	let theme = $state<Theme>('light');
+	const sessionRoute = $derived(/\/notebooks\/[^/]+\/(edit|run)$/.test(page.url.pathname));
+	const shellClass = $derived(
+		sessionRoute
+			? 'flex h-screen min-h-0 flex-col overflow-hidden bg-[radial-gradient(circle_at_top_left,_rgba(0,135,121,0.18),_transparent_32rem),linear-gradient(180deg,_#f2fbf9,_#f8fffd)] text-ink transition-colors dark:bg-[radial-gradient(circle_at_top_left,_rgba(0,135,121,0.24),_transparent_30rem),linear-gradient(180deg,_#061816,_#111827)] dark:text-slate-50'
+			: 'flex min-h-screen flex-col bg-[radial-gradient(circle_at_top_left,_rgba(0,135,121,0.18),_transparent_32rem),linear-gradient(180deg,_#f2fbf9,_#f8fffd)] text-ink transition-colors dark:bg-[radial-gradient(circle_at_top_left,_rgba(0,135,121,0.24),_transparent_30rem),linear-gradient(180deg,_#061816,_#111827)] dark:text-slate-50'
+	);
 
 	$effect(() => {
 		theme = getInitialTheme();
@@ -30,48 +37,47 @@
 </script>
 
 <svelte:head>
-	<link rel="icon" href={favicon} />
+	<link rel="icon" href="/assets/marimohub-icon-light.svg" />
+	<link rel="icon" href="/assets/marimohub-icon-light.svg" media="(prefers-color-scheme: light)" />
+	<link rel="icon" href="/assets/marimohub-icon-dark-transparent.svg" media="(prefers-color-scheme: dark)" />
 </svelte:head>
 
 
-<div class="flex min-h-screen flex-col bg-[radial-gradient(circle_at_top_left,_rgba(249,115,22,0.18),_transparent_32rem),linear-gradient(180deg,_#f7f4ec,_#fffaf0)] text-ink transition-colors dark:bg-[radial-gradient(circle_at_top_left,_rgba(249,115,22,0.16),_transparent_30rem),linear-gradient(180deg,_#0b1120,_#111827)] dark:text-slate-50">
-	<header class="mx-auto flex w-full max-w-6xl flex-col gap-4 px-5 py-5 sm:px-8 md:flex-row md:items-center md:justify-between">
-		<a href="/" class="flex items-center gap-3 font-semibold tracking-tight" aria-label="MoLab home">
-			<span class="grid size-10 place-items-center rounded-2xl bg-graphite text-lg text-white shadow-lg shadow-orange-950/10 dark:bg-molten">Mo</span>
-			<span class="text-xl">MoLab</span>
+<div class={shellClass}>
+	<header class="mx-auto flex w-full max-w-6xl shrink-0 flex-col gap-4 px-5 py-5 sm:px-8 md:flex-row md:items-center md:justify-between">
+		<a href="/" class="flex w-fit items-center" aria-label="MarimoHub home">
+			<img class="h-12 w-auto dark:hidden" src="/assets/marimohub-lockup-light.svg" alt="MarimoHub" />
+			<img class="hidden h-12 w-auto dark:block" src="/assets/marimohub-lockup-dark-transparent.svg" alt="MarimoHub" />
 		</a>
 
 		<nav class="flex flex-wrap items-center gap-2 text-sm font-medium sm:gap-3 md:justify-end">
-			<a class="rounded-full px-3 py-2 text-slate-700 hover:bg-white/70 dark:text-slate-200 dark:hover:bg-white/10" href="/discover">Discover</a>
+			<Button intent="ghost" size="sm" href="/discover">Discover</Button>
 			{#if $auth.currentUser}
 				<span class="hidden rounded-full bg-white/70 px-3 py-2 text-slate-700 dark:bg-white/10 dark:text-slate-200 sm:inline">{$auth.currentUser.username}</span>
-				<button
-					class="rounded-full bg-graphite px-4 py-2 text-white shadow-sm dark:bg-white dark:text-slate-950"
-					type="button"
-					onclick={logout}
-				>
-					Logout
-				</button>
+				<Button intent="primary" size="sm" type="button" onclick={logout}>Logout</Button>
 			{:else}
-				<a class="rounded-full bg-graphite px-4 py-2 text-white shadow-sm dark:bg-white dark:text-slate-950" href="/auth/login">Login</a>
+				<Button intent="primary" size="sm" href="/auth/login">Login</Button>
 			{/if}
-			<button
-				class="rounded-full border border-slate-300/70 bg-white/60 px-3 py-2 text-slate-700 backdrop-blur hover:bg-white dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15"
+			<Button
+				intent="secondary"
+				size="sm"
 				type="button"
 				aria-label="Toggle color theme"
 				aria-pressed={theme === 'dark'}
 				onclick={toggleTheme}
 			>
 				{theme === 'dark' ? 'Light' : 'Dark'}
-			</button>
+			</Button>
 		</nav>
 	</header>
 
-	<main class="mx-auto w-full max-w-6xl flex-1 px-5 pb-16 pt-8 sm:px-8">
+	<main class={sessionRoute ? 'flex min-h-0 w-full flex-1 flex-col px-0 pb-0 pt-0' : 'mx-auto w-full max-w-6xl flex-1 px-5 pb-16 pt-8 sm:px-8'}>
 		{@render children()}
 	</main>
 
-	<footer class="border-t border-slate-900/10 px-5 py-8 text-center text-sm text-slate-600 dark:border-white/10 dark:text-slate-400">
-		MoLab hosts forkable marimo notebooks for research, demos, and deployed apps.
-	</footer>
+	{#if !sessionRoute}
+		<footer class="border-t border-slate-900/10 px-5 py-8 text-center text-sm text-slate-600 dark:border-white/10 dark:text-slate-400">
+			MarimoHub hosts forkable marimo notebooks for research, demos, and deployed apps.
+		</footer>
+	{/if}
 </div>

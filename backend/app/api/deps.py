@@ -23,6 +23,7 @@ async def get_current_user_optional(
     token: Annotated[str | None, Depends(oauth2_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User | None:
+    """Return the authenticated user for the bearer token, or ``None``."""
     if token is None:
         return None
 
@@ -36,6 +37,7 @@ async def get_current_user_optional(
 async def get_current_user(
     current_user: Annotated[User | None, Depends(get_current_user_optional)],
 ) -> User:
+    """Return the authenticated user, raising 401 if not authenticated."""
     if current_user is None:
         raise _auth_error()
     return current_user

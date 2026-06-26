@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { ApiError, api } from '$lib/api';
 	import { auth } from '$lib/stores/auth';
+	import Button from '$lib/components/Button.svelte';
 
 	type LoginErrors = Partial<Record<'username' | 'password' | 'server', string>>;
 
@@ -43,12 +44,12 @@
 </script>
 
 <svelte:head>
-	<title>Login | MoLab</title>
+	<title>Login | MarimoHub</title>
 </svelte:head>
 
 <section class="mx-auto grid max-w-5xl gap-10 lg:grid-cols-[minmax(0,1fr)_26rem] lg:items-center">
 	<div class="space-y-5">
-		<p class="w-fit rounded-full bg-orange-100 px-4 py-2 text-sm font-semibold text-orange-900 dark:bg-orange-400/10 dark:text-orange-200">
+		<p class="w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
 			Welcome back
 		</p>
 		<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Sign in to your notebooks.</h1>
@@ -62,7 +63,7 @@
 			<div>
 				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="username">Username</label>
 				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
+					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
 					id="username"
 					name="username"
 					type="text"
@@ -79,7 +80,7 @@
 			<div>
 				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="password">Password</label>
 				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
+					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
 					id="password"
 					name="password"
 					type="password"
@@ -97,13 +98,13 @@
 				<p class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200">{errors.server}</p>
 			{/if}
 
-			<button class="w-full rounded-full bg-graphite px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-950/10 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-slate-950" type="submit" disabled={submitting}>
+			<Button class="w-full" type="submit" disabled={submitting}>
 				{submitting ? 'Signing in...' : 'Sign in'}
-			</button>
+			</Button>
 
 			<p class="text-center text-sm text-slate-600 dark:text-slate-300">
-				New to MoLab?
-				<a class="font-bold text-orange-700 hover:text-orange-900 dark:text-orange-300 dark:hover:text-orange-200" href="/auth/register">Create an account</a>
+				New to MarimoHub?
+				<a class="font-bold text-hub-700 hover:text-hub-950 dark:text-hub-300 dark:hover:text-hub-200" href="/auth/register">Create an account</a>
 			</p>
 		</div>
 	</form>

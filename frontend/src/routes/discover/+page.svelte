@@ -1,6 +1,9 @@
 <script lang="ts">
+	import { navigating } from '$app/state';
+	import Button from '$lib/components/Button.svelte';
+
 	let { data } = $props();
-	let loading = $state(false);
+	const loading = $derived(navigating.to !== null);
 
 	const totalPages = $derived(Math.max(1, Math.ceil(data.notebooks.total / data.notebooks.page_size)));
 	const showingFrom = $derived(data.notebooks.total === 0 ? 0 : (data.notebooks.page - 1) * data.notebooks.page_size + 1);
@@ -18,13 +21,13 @@
 </script>
 
 <svelte:head>
-	<title>Discover | MoLab</title>
+	<title>Discover | MarimoHub</title>
 </svelte:head>
 
 <section class="space-y-8">
 	<div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
 		<div class="space-y-3">
-			<p class="w-fit rounded-full bg-orange-100 px-4 py-2 text-sm font-semibold text-orange-900 dark:bg-orange-400/10 dark:text-orange-200">
+			<p class="w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
 				Discover
 			</p>
 			<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Browse notebooks</h1>
@@ -37,15 +40,12 @@
 	<form
 		class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-5 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20"
 		method="GET"
-		onsubmit={() => {
-			loading = true;
-		}}
 	>
 		<div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(13rem,0.45fr)_auto] lg:items-end">
 			<div>
 				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="q">Search</label>
 				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
+					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
 					id="q"
 					name="q"
 					type="search"
@@ -57,7 +57,7 @@
 			<div>
 				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="tags">Tags</label>
 				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
+					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
 					id="tags"
 					name="tags"
 					type="text"
@@ -66,13 +66,13 @@
 				/>
 			</div>
 
-			<button class="rounded-full bg-graphite px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-950/10 disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-slate-950" type="submit" disabled={loading}>
+			<Button intent="primary" type="submit" disabled={loading}>
 				{loading ? 'Searching...' : 'Search'}
-			</button>
+			</Button>
 		</div>
 
 		<label class="mt-4 flex w-fit items-center gap-3 rounded-full bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 dark:bg-white/10 dark:text-slate-200">
-			<input class="size-4 accent-orange-600" type="checkbox" name="semantic" value="1" checked={data.filters.semantic} />
+			<input class="size-4 accent-hub-600" type="checkbox" name="semantic" value="1" checked={data.filters.semantic} />
 			Semantic search
 		</label>
 	</form>
@@ -81,7 +81,7 @@
 		<div class="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">
 			<p class="font-black">Unable to load notebooks</p>
 			<p class="mt-1 font-semibold">{data.error}</p>
-			<a class="mt-4 inline-flex rounded-full bg-red-900 px-4 py-2 text-xs font-black text-white dark:bg-red-100 dark:text-red-950" href={pageHref(data.notebooks.page)} onclick={() => (loading = true)}>Try again</a>
+			<Button intent="primary" size="sm" class="mt-4" href={pageHref(data.notebooks.page)}>Try again</Button>
 		</div>
 	{:else if loading}
 		<div class="grid gap-4 md:grid-cols-2" aria-label="Loading notebooks">
@@ -108,8 +108,8 @@
 				>
 					<div class="flex items-start justify-between gap-4">
 						<div>
-							<p class="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700 dark:text-orange-300">{notebook.visibility}</p>
-							<h2 class="mt-3 text-2xl font-black text-slate-950 group-hover:text-orange-700 dark:text-white dark:group-hover:text-orange-200">
+							<p class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300">{notebook.visibility}</p>
+							<h2 class="mt-3 text-2xl font-black text-slate-950 group-hover:text-hub-700 dark:text-white dark:group-hover:text-hub-200">
 								{notebook.title}
 							</h2>
 						</div>
@@ -135,13 +135,13 @@
 
 		<div class="flex items-center justify-between gap-3">
 			{#if data.notebooks.page > 1}
-				<a class="rounded-full border border-slate-300/80 bg-white/60 px-5 py-3 text-sm font-bold text-slate-800 backdrop-blur hover:bg-white dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15" href={pageHref(data.notebooks.page - 1)} onclick={() => (loading = true)}>Previous</a>
+				<Button intent="secondary" href={pageHref(data.notebooks.page - 1)}>Previous</Button>
 			{:else}
 				<span></span>
 			{/if}
 
 			{#if data.notebooks.page < totalPages}
-				<a class="rounded-full bg-graphite px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-950/10 dark:bg-white dark:text-slate-950" href={pageHref(data.notebooks.page + 1)} onclick={() => (loading = true)}>Next</a>
+				<Button intent="primary" href={pageHref(data.notebooks.page + 1)}>Next</Button>
 			{/if}
 		</div>
 	{/if}

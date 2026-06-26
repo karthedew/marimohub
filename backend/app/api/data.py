@@ -1,7 +1,8 @@
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import JsonValue
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,13 +23,16 @@ async def _ensure_notebook_exists(db: AsyncSession, notebook_id: UUID) -> None:
         raise _notebook_not_found()
 
 
-@router.post("/{notebook_id}/data", response_model=NotebookDataCreated, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{notebook_id}/data", response_model=NotebookDataCreated, status_code=status.HTTP_201_CREATED
+)
 async def create_notebook_data(
     notebook_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    payload: Annotated[Any, Body()],
+    payload: Annotated[JsonValue, Body()],
     source: Annotated[str | None, Query(max_length=255)] = None,
 ) -> NotebookDataCreated:
+    """Store a new JSON data payload for a notebook."""
     await _ensure_notebook_exists(db, notebook_id)
     data = NotebookData(notebook_id=notebook_id, payload=payload, source=source)
     db.add(data)
@@ -42,6 +46,7 @@ async def get_latest_notebook_data(
     notebook_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> NotebookDataOut:
+    """Return the most recently stored data payload for a notebook."""
     await _ensure_notebook_exists(db, notebook_id)
     data = await db.scalar(
         select(NotebookData)

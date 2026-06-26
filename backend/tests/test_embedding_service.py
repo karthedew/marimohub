@@ -4,7 +4,6 @@ import pytest
 
 from app.services.embedding_service import EMBEDDING_DIMENSIONS, EmbeddingService
 
-
 _MODEL_UNAVAILABLE_RUNTIME_MARKERS = (
     "connection",
     "download",

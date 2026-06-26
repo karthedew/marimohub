@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict
 
 
 class UserOut(BaseModel):
+    """Public-facing representation of a user account."""
+
     id: UUID
     username: str
     email: str

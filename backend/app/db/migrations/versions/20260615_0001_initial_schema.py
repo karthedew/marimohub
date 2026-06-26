@@ -12,7 +12,6 @@ from pgvector.sqlalchemy import Vector
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-
 revision: str = "20260615_0001"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
@@ -34,7 +33,12 @@ def upgrade() -> None:
         sa.Column("username", sa.String(length=255), nullable=False),
         sa.Column("email", sa.String(length=255), nullable=False),
         sa.Column("password_hash", sa.String(length=255), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
         sa.UniqueConstraint("email", name="uq_users_email"),
         sa.UniqueConstraint("username", name="uq_users_username"),
     )
@@ -46,11 +50,18 @@ def upgrade() -> None:
         sa.Column("parent_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("title", sa.Text(), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("tags", postgresql.ARRAY(sa.Text()), server_default=sa.text("ARRAY[]::text[]"), nullable=False),
+        sa.Column(
+            "tags",
+            postgresql.ARRAY(sa.Text()),
+            server_default=sa.text("ARRAY[]::text[]"),
+            nullable=False,
+        ),
         sa.Column("source", sa.Text(), nullable=True),
         sa.Column(
             "visibility",
-            postgresql.ENUM("draft", "unlisted", "public", name="notebook_visibility", create_type=False),
+            postgresql.ENUM(
+                "draft", "unlisted", "public", name="notebook_visibility", create_type=False
+            ),
             nullable=False,
         ),
         sa.Column("fork_count", sa.Integer(), server_default=sa.text("0"), nullable=False),
@@ -67,12 +78,28 @@ def upgrade() -> None:
             nullable=True,
         ),
         sa.Column("embedding", Vector(384), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.ForeignKeyConstraint(["parent_id"], ["notebooks.id"], name="fk_notebooks_parent_id", ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["user_id"], ["users.id"], name="fk_notebooks_user_id", ondelete="CASCADE"),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["parent_id"], ["notebooks.id"], name="fk_notebooks_parent_id", ondelete="SET NULL"
+        ),
+        sa.ForeignKeyConstraint(
+            ["user_id"], ["users.id"], name="fk_notebooks_user_id", ondelete="CASCADE"
+        ),
     )
-    op.create_index("ix_notebooks_search_vector", "notebooks", ["search_vector"], postgresql_using="gin")
+    op.create_index(
+        "ix_notebooks_search_vector", "notebooks", ["search_vector"], postgresql_using="gin"
+    )
 
     op.create_table(
         "deployments",
@@ -81,13 +108,22 @@ def upgrade() -> None:
         sa.Column("slug", sa.String(length=255), nullable=False),
         sa.Column(
             "status",
-            postgresql.ENUM("running", "sleeping", "stopped", name="deployment_status", create_type=False),
+            postgresql.ENUM(
+                "running", "sleeping", "stopped", name="deployment_status", create_type=False
+            ),
             nullable=False,
         ),
         sa.Column("port", sa.Integer(), nullable=True),
         sa.Column("last_active", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.ForeignKeyConstraint(["notebook_id"], ["notebooks.id"], name="fk_deployments_notebook_id", ondelete="CASCADE"),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["notebook_id"], ["notebooks.id"], name="fk_deployments_notebook_id", ondelete="CASCADE"
+        ),
         sa.UniqueConstraint("notebook_id", name="uq_deployments_notebook_id"),
         sa.UniqueConstraint("slug", name="uq_deployments_slug"),
     )
@@ -98,8 +134,18 @@ def upgrade() -> None:
         sa.Column("notebook_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("payload", postgresql.JSONB(), nullable=False),
         sa.Column("source", sa.String(length=255), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.ForeignKeyConstraint(["notebook_id"], ["notebooks.id"], name="fk_notebook_data_notebook_id", ondelete="CASCADE"),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["notebook_id"],
+            ["notebooks.id"],
+            name="fk_notebook_data_notebook_id",
+            ondelete="CASCADE",
+        ),
     )
 
 

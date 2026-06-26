@@ -3,6 +3,10 @@
 	import { goto } from '$app/navigation';
 	import { ApiError, api, type Deployment } from '$lib/api';
 	import { auth } from '$lib/stores/auth';
+	import Button from '$lib/components/Button.svelte';
+
+	const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+	const SLUG_MESSAGE = 'Use lowercase letters, numbers, and hyphens. Start and end with a letter or number.';
 
 	let { data } = $props();
 	let slug = $state('');
@@ -22,6 +26,7 @@
 	const loginHref = $derived(`/auth/login?next=${encodeURIComponent(`/notebooks/${data.notebook.id}`)}`);
 	const publicDeploymentHref = $derived(deployment ? publicDeploymentUrl(deployment) : '');
 	const stopSlug = $derived(deployment && deployment.status !== 'stopped' ? deployment.slug : slug.trim());
+	const slugInvalid = $derived(slug.trim().length > 0 && !SLUG_PATTERN.test(slug.trim()));
 
 	function formatDate(value: string) {
 		return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(value));
@@ -44,6 +49,7 @@
 	}
 
 	async function deployNotebook() {
+		if (slugInvalid) return;
 		deployLoading = true;
 		deployError = null;
 		try {
@@ -91,18 +97,16 @@
 </script>
 
 <svelte:head>
-	<title>{data.notebook.title} | MoLab</title>
+	<title>{data.notebook.title} | MarimoHub</title>
 </svelte:head>
 
 <article class="space-y-8">
-	<a class="inline-flex rounded-full bg-white/70 px-4 py-2 text-sm font-bold text-slate-700 shadow-sm hover:bg-white dark:bg-white/10 dark:text-slate-200 dark:hover:bg-white/15" href="/discover">
-		Back to discover
-	</a>
+	<Button intent="secondary" size="sm" class="w-fit" href="/discover">Back to discover</Button>
 
 	<section class="grid gap-8 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-start">
 		<div class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-7 shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20 sm:p-9">
 			<div class="flex flex-wrap items-center gap-3">
-				<span class="rounded-full bg-orange-100 px-4 py-2 text-sm font-semibold capitalize text-orange-900 dark:bg-orange-400/10 dark:text-orange-200">
+				<span class="rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold capitalize text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
 					{data.notebook.visibility}
 				</span>
 				<span class="rounded-full bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 dark:bg-white/10 dark:text-slate-200">
@@ -146,18 +150,18 @@
 
 		<aside class="space-y-4 lg:sticky lg:top-6">
 			<div class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-5 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
-				<p class="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700 dark:text-orange-300">Actions</p>
+				<p class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300">Actions</p>
 				<div class="mt-5 grid gap-3">
-					<a class="rounded-full bg-graphite px-5 py-3 text-center text-sm font-bold text-white shadow-lg shadow-slate-950/10 hover:opacity-90 dark:bg-white dark:text-slate-950" href={`/notebooks/${data.notebook.id}/run`}>Run</a>
+					<Button intent="primary" href={`/notebooks/${data.notebook.id}/run`}>Run</Button>
 					{#if isOwner}
-						<a class="rounded-full border border-slate-300/80 bg-white/60 px-5 py-3 text-center text-sm font-bold text-slate-800 hover:bg-white dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15" href={`/notebooks/${data.notebook.id}/edit`}>Edit</a>
+						<Button intent="secondary" href={`/notebooks/${data.notebook.id}/edit`}>Edit</Button>
 					{/if}
 					{#if isAuthenticated}
-						<button class="rounded-full border border-slate-300/80 bg-white/60 px-5 py-3 text-sm font-bold text-slate-800 hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15" type="button" onclick={() => void forkNotebook()} disabled={forkLoading}>
+						<Button intent="secondary" type="button" onclick={() => void forkNotebook()} disabled={forkLoading}>
 							{forkLoading ? 'Forking...' : 'Fork'}
-						</button>
+						</Button>
 					{:else}
-						<a class="rounded-full border border-slate-300/80 bg-white/60 px-5 py-3 text-center text-sm font-bold text-slate-800 hover:bg-white dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15" href={loginHref}>Sign in to fork</a>
+						<Button intent="secondary" href={loginHref}>Sign in to fork</Button>
 					{/if}
 				</div>
 				<p class="mt-4 text-sm leading-6 text-slate-600 dark:text-slate-300">Open this notebook in marimo, or fork it into a private draft you can edit.</p>
@@ -173,20 +177,24 @@
 
 			{#if isOwner}
 				<div class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-5 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
-					<p class="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700 dark:text-orange-300">Deployment</p>
+					<p class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300">Deployment</p>
 					<form class="mt-5 grid gap-3" onsubmit={(event) => { event.preventDefault(); void deployNotebook(); }}>
 						<label class="grid gap-2 text-sm font-semibold text-slate-700 dark:text-slate-200">
 							Slug
 							<input
-								class="rounded-2xl border border-slate-300/80 bg-white/80 px-4 py-3 text-sm text-slate-950 outline-none transition focus:border-orange-400 focus:ring-4 focus:ring-orange-200/60 dark:border-white/15 dark:bg-slate-950/60 dark:text-white dark:focus:ring-orange-400/15"
+								class="rounded-2xl border border-slate-300/80 bg-white/80 px-4 py-3 text-sm text-slate-950 outline-none transition focus:border-hub-400 focus:ring-4 focus:ring-hub-200/60 dark:border-white/15 dark:bg-slate-950/60 dark:text-white dark:focus:ring-hub-400/15"
 								bind:value={slug}
 								placeholder="Optional public slug"
 								disabled={deployLoading}
+								aria-invalid={slugInvalid}
 							/>
+							{#if slugInvalid}
+								<span class="font-medium text-red-700 dark:text-red-300">{SLUG_MESSAGE}</span>
+							{/if}
 						</label>
-						<button class="rounded-full bg-molten px-5 py-3 text-sm font-black text-white shadow-lg shadow-orange-950/10 disabled:cursor-not-allowed disabled:opacity-60" type="submit" disabled={deployLoading}>
+						<Button intent="primary" type="submit" disabled={deployLoading || slugInvalid}>
 							{deployLoading ? 'Working...' : deployment?.status === 'stopped' ? 'Deploy again' : 'Deploy'}
-						</button>
+						</Button>
 					</form>
 
 					{#if deployError}
@@ -196,22 +204,22 @@
 					{#if deployment}
 						<div class="mt-5 rounded-3xl bg-slate-100/80 p-4 text-sm dark:bg-white/10">
 							<div class="flex flex-wrap items-center justify-between gap-2">
-								<a class="break-all font-bold text-slate-950 underline decoration-slate-400 underline-offset-4 hover:decoration-orange-500 dark:text-white dark:decoration-slate-500" href={publicDeploymentHref} target="_blank" rel="noreferrer">{publicDeploymentHref}</a>
+								<a class="break-all font-bold text-slate-950 underline decoration-slate-400 underline-offset-4 hover:decoration-hub-500 dark:text-white dark:decoration-slate-500" href={publicDeploymentHref} target="_blank" rel="noreferrer">{publicDeploymentHref}</a>
 								<span class="rounded-full bg-white px-3 py-1 text-xs font-bold capitalize text-slate-700 dark:bg-slate-950/60 dark:text-slate-200">{deployment.status}</span>
 							</div>
-							<a class="mt-4 block rounded-full bg-graphite px-4 py-3 text-center text-sm font-bold text-white hover:opacity-90 dark:bg-white dark:text-slate-950" href={publicDeploymentHref} target="_blank" rel="noreferrer">
+							<Button intent="primary" class="mt-4 w-full" href={publicDeploymentHref} target="_blank" rel="noreferrer">
 								Open public deployment
-							</a>
+							</Button>
 							{#if deployment.status !== 'stopped'}
-								<button class="mt-3 w-full rounded-full border border-slate-300/80 bg-white/70 px-4 py-3 text-sm font-bold text-slate-800 hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15" type="button" onclick={() => void stopDeployment()} disabled={deployLoading}>
+								<Button intent="secondary" class="mt-3 w-full" type="button" onclick={() => void stopDeployment()} disabled={deployLoading}>
 									Stop deployment
-								</button>
+								</Button>
 							{/if}
 						</div>
 					{:else if slug.trim()}
-						<button class="mt-5 w-full rounded-full border border-slate-300/80 bg-white/70 px-4 py-3 text-sm font-bold text-slate-800 hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 dark:border-white/15 dark:bg-white/10 dark:text-slate-100 dark:hover:bg-white/15" type="button" onclick={() => void stopDeployment()} disabled={deployLoading}>
+						<Button intent="secondary" class="mt-5 w-full" type="button" onclick={() => void stopDeployment()} disabled={deployLoading}>
 							Stop deployment for this slug
-						</button>
+						</Button>
 					{:else}
 						<p class="mt-5 rounded-3xl bg-slate-100/80 p-4 text-sm leading-6 text-slate-600 dark:bg-white/10 dark:text-slate-300">
 							Deployments start asleep and wake on the first public visit.
@@ -221,12 +229,12 @@
 			{/if}
 
 			<div class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-5 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
-				<p class="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700 dark:text-orange-300">Lineage</p>
+				<p class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300">Lineage</p>
 				{#if data.notebook.parent_id}
 					{#if data.notebook.parent_title}
 						<p class="mt-4 text-sm leading-6 text-slate-600 dark:text-slate-300">
 							Forked from
-							<a class="font-bold text-slate-950 underline decoration-slate-400 underline-offset-4 hover:decoration-orange-500 dark:text-white dark:decoration-slate-500" href={`/notebooks/${data.notebook.parent_id}`}>{data.notebook.parent_title}</a>{#if data.notebook.parent_owner_username} by {data.notebook.parent_owner_username}{/if}.
+							<a class="font-bold text-slate-950 underline decoration-slate-400 underline-offset-4 hover:decoration-hub-500 dark:text-white dark:decoration-slate-500" href={`/notebooks/${data.notebook.parent_id}`}>{data.notebook.parent_title}</a>{#if data.notebook.parent_owner_username} by {data.notebook.parent_owner_username}{/if}.
 						</p>
 					{:else}
 						<p class="mt-4 text-sm leading-6 text-slate-600 dark:text-slate-300">Forked from a notebook you cannot view.</p>

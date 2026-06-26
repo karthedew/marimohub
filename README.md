@@ -1,6 +1,6 @@
-# MoLab
+# MarimoHub
 
-MoLab is a FastAPI, SvelteKit, and PostgreSQL/pgvector application for publishing and running Marimo notebooks.
+MarimoHub is a FastAPI, SvelteKit, and PostgreSQL/pgvector application for publishing and running Marimo notebooks.
 
 ## Local Development
 

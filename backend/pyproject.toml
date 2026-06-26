@@ -32,9 +32,13 @@ explicit = true
 
 [dependency-groups]
 dev = [
+    "basedpyright>=1.22.0",
+    "complexipy>=5.6.1",
     "psycopg[binary]>=3.3.4",
     "pytest>=9.1.0",
     "pytest-asyncio>=1.4.0",
+    "radon>=6.0.1",
+    "ruff>=0.15.20",
 ]
 
 [tool.pytest.ini_options]

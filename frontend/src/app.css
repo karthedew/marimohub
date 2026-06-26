@@ -6,8 +6,17 @@
 	--font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
 	--color-ink: #101828;
 	--color-paper: #f7f4ec;
-	--color-graphite: #1f2937;
-	--color-molten: #f97316;
+	--color-hub-50: #e7fffb;
+	--color-hub-100: #c8fff7;
+	--color-hub-200: #93fff0;
+	--color-hub-300: #52f7e4;
+	--color-hub-400: #19dccb;
+	--color-hub-500: #00b9aa;
+	--color-hub-600: #009b8d;
+	--color-hub-700: #008779;
+	--color-hub-800: #00665e;
+	--color-hub-900: #064f49;
+	--color-hub-950: #00332f;
 }
 
 html {
@@ -21,13 +30,13 @@ html.dark {
 body {
 	margin: 0;
 	min-height: 100vh;
-	background: #f7f4ec;
+	background: #f2fbf9;
 	color: #101828;
 	font-family: var(--font-sans);
 }
 
 html.dark body {
-	background: #0b1120;
+	background: #061816;
 	color: #f8fafc;
 }
 

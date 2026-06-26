@@ -178,7 +178,7 @@ export function resolveApiUrl(value: string) {
 }
 
 export function deploymentProxyUrl(slug: string) {
-	return resolveApiUrl(buildUrl(`/api/deployments/${slug}`));
+	return resolveApiUrl(buildUrl(`/api/deployments/${slug}/`));
 }
 
 export function normalizeTagInput(tags: string | string[] | undefined) {
@@ -260,6 +260,7 @@ function createLiveApi(fetcher?: typeof fetch) {
 		},
 		sessions: {
 			create: (body: SessionCreateRequest) => request<Session>('/api/sessions', { method: 'POST', body }),
+			save: (id: string) => request<void>(`/api/sessions/${id}/save`, { method: 'POST' }),
 			delete: (id: string) => request<void>(`/api/sessions/${id}`, { method: 'DELETE' })
 		},
 		deployments: {

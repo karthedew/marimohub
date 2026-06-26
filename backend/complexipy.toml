@@ -1,0 +1,21 @@
+paths = ["app"]
+max-complexity-allowed = 10
+
+exclude = [
+  "tests/**",
+  "app/db/migrations/**",
+  "scripts/**",
+]
+
+snapshot-create = false
+snapshot-ignore = false
+quiet = false
+ignore-complexity = false
+failed = true
+color = "auto"
+sort = "desc"
+check-script = true
+no-ignore = true
+report-ignored = true
+output-format = ["json", "sarif"]
+output = "reports/complexipy"

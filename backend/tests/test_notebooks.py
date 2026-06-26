@@ -1,7 +1,8 @@
+from typing import Protocol, cast
 from uuid import UUID
 
-from httpx import AsyncClient
 import httpx
+from httpx import AsyncClient
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,19 +11,39 @@ from app.models import Notebook, NotebookVisibility
 from app.services.gitlab_import import MAX_IMPORT_BYTES
 
 
-async def register_and_login(client: AsyncClient, username: str) -> tuple[dict[str, str], dict[str, str]]:
-    password = "correct-horse"
+class _EmbeddingRecorder(Protocol):
+    """Structural type for the fake embedding service used in tests."""
+
+    calls: list[str]
+
+
+def json_dict(response: httpx.Response) -> dict[str, object]:
+    """Parse a JSON object response as a typed mapping (httpx ``.json()`` is ``Any``)."""
+    return cast("dict[str, object]", response.json())
+
+
+def json_items(response: httpx.Response) -> list[dict[str, object]]:
+    """Parse a paginated list response's ``items`` as typed mappings."""
+    return cast("list[dict[str, object]]", json_dict(response)["items"])
+
+
+async def register_and_login(
+    client: AsyncClient, username: str
+) -> tuple[dict[str, object], dict[str, str]]:
+    login_value = "correct-horse"
     register_response = await client.post(
         "/api/auth/register",
-        json={"username": username, "email": f"{username}@example.com", "password": password},
+        json={"username": username, "email": f"{username}@example.com", "password": login_value},
     )
     assert register_response.status_code == 201
 
-    login_response = await client.post("/api/auth/login", json={"username": username, "password": password})
+    login_response = await client.post(
+        "/api/auth/login", json={"username": username, "password": login_value}
+    )
     assert login_response.status_code == 200
 
-    headers = {"Authorization": f"Bearer {login_response.json()['access_token']}"}
-    return register_response.json(), headers
+    headers = {"Authorization": f"Bearer {json_dict(login_response)['access_token']}"}
+    return json_dict(register_response), headers
 
 
 async def create_notebook(
@@ -44,7 +65,7 @@ async def create_notebook(
         },
     )
     assert response.status_code == 201
-    return response.json()
+    return json_dict(response)
 
 
 async def publish_notebook(
@@ -59,7 +80,7 @@ async def publish_notebook(
         json={"visibility": visibility},
     )
     assert response.status_code == 200
-    return response.json()
+    return json_dict(response)
 
 
 @pytest.mark.asyncio
@@ -69,7 +90,9 @@ async def test_crud_happy_path_persists_notebook_schema_behavior(
 ) -> None:
     owner, owner_headers = await register_and_login(api_client, "owner")
 
-    anonymous_create = await api_client.post("/api/notebooks", json={"title": "Draft", "source": "x = 1"})
+    anonymous_create = await api_client.post(
+        "/api/notebooks", json={"title": "Draft", "source": "x = 1"}
+    )
     created = await create_notebook(api_client, owner_headers, "Draft", "x = 1")
     notebook_id = str(created["id"])
     persisted = await db_session.get(Notebook, UUID(notebook_id))
@@ -113,13 +136,23 @@ async def test_crud_happy_path_persists_notebook_schema_behavior(
 
 
 @pytest.mark.asyncio
-async def test_list_notebooks_shows_public_and_callers_own_notebooks(api_client: AsyncClient) -> None:
+async def test_list_notebooks_shows_public_and_callers_own_notebooks(
+    api_client: AsyncClient,
+) -> None:
     _, owner_headers = await register_and_login(api_client, "owner")
     _, other_headers = await register_and_login(api_client, "other")
-    owner_draft = await create_notebook(api_client, owner_headers, "Owner Draft", "print('owner draft')")
-    owner_public = await create_notebook(api_client, owner_headers, "Owner Public", "print('owner public')")
-    other_public = await create_notebook(api_client, other_headers, "Other Public", "print('other public')")
-    other_unlisted = await create_notebook(api_client, other_headers, "Other Unlisted", "print('other unlisted')")
+    owner_draft = await create_notebook(
+        api_client, owner_headers, "Owner Draft", "print('owner draft')"
+    )
+    owner_public = await create_notebook(
+        api_client, owner_headers, "Owner Public", "print('owner public')"
+    )
+    other_public = await create_notebook(
+        api_client, other_headers, "Other Public", "print('other public')"
+    )
+    other_unlisted = await create_notebook(
+        api_client, other_headers, "Other Unlisted", "print('other unlisted')"
+    )
     await publish_notebook(api_client, owner_headers, str(owner_public["id"]), "public")
     await publish_notebook(api_client, other_headers, str(other_public["id"]), "public")
     await publish_notebook(api_client, other_headers, str(other_unlisted["id"]), "unlisted")
@@ -127,24 +160,33 @@ async def test_list_notebooks_shows_public_and_callers_own_notebooks(api_client:
     anonymous = await api_client.get("/api/notebooks")
     owner_response = await api_client.get("/api/notebooks", headers=owner_headers)
 
-    anonymous_items = anonymous.json()["items"]
-    owner_items = owner_response.json()["items"]
+    anonymous_items = json_items(anonymous)
+    owner_items = json_items(owner_response)
     owner_items_by_id = {item["id"]: item for item in owner_items}
     assert anonymous.status_code == 200
-    assert {item["id"] for item in anonymous_items} == {str(owner_public["id"]), str(other_public["id"])}
+    assert {item["id"] for item in anonymous_items} == {
+        str(owner_public["id"]),
+        str(other_public["id"]),
+    }
     assert all("source" not in item for item in anonymous_items)
     assert owner_response.status_code == 200
     assert owner_response.json()["total"] == 3
     assert owner_response.json()["page"] == 1
     assert owner_response.json()["page_size"] == 20
-    assert set(owner_items_by_id) == {str(owner_draft["id"]), str(owner_public["id"]), str(other_public["id"])}
+    assert set(owner_items_by_id) == {
+        str(owner_draft["id"]),
+        str(owner_public["id"]),
+        str(other_public["id"]),
+    }
     assert owner_items_by_id[str(owner_draft["id"])]["source"] == "print('owner draft')"
     assert owner_items_by_id[str(owner_public["id"])]["source"] == "print('owner public')"
     assert "source" not in owner_items_by_id[str(other_public["id"])]
 
 
 @pytest.mark.asyncio
-async def test_list_notebooks_full_text_search_matches_title_description_and_tags(api_client: AsyncClient) -> None:
+async def test_list_notebooks_full_text_search_matches_title_description_and_tags(
+    api_client: AsyncClient,
+) -> None:
     _, owner_headers = await register_and_login(api_client, "owner")
     title_match = await create_notebook(
         api_client,
@@ -177,16 +219,22 @@ async def test_list_notebooks_full_text_search_matches_title_description_and_tag
     for notebook in [title_match, description_match, tag_match, miss]:
         await publish_notebook(api_client, owner_headers, str(notebook["id"]), "public")
 
-    response = await api_client.get("/api/notebooks", params={"q": "cryogenic", "page": 1, "page_size": 2})
+    response = await api_client.get(
+        "/api/notebooks", params={"q": "cryogenic", "page": 1, "page_size": 2}
+    )
 
     assert response.status_code == 200
-    body = response.json()
-    result_ids = {item["id"] for item in body["items"]}
+    body = json_dict(response)
+    result_ids = {item["id"] for item in json_items(response)}
     assert body["total"] == 3
     assert body["page"] == 1
     assert body["page_size"] == 2
-    assert len(body["items"]) == 2
-    assert result_ids <= {str(title_match["id"]), str(description_match["id"]), str(tag_match["id"])}
+    assert len(json_items(response)) == 2
+    assert result_ids <= {
+        str(title_match["id"]),
+        str(description_match["id"]),
+        str(tag_match["id"]),
+    }
     assert str(miss["id"]) not in result_ids
 
 
@@ -213,7 +261,7 @@ async def test_list_notebooks_orders_full_text_results_by_rank(api_client: Async
     response = await api_client.get("/api/notebooks", params={"q": "plasma"})
 
     assert response.status_code == 200
-    ids = [item["id"] for item in response.json()["items"]]
+    ids = [item["id"] for item in json_items(response)]
     assert ids[:2] == [str(strongest["id"]), str(weaker["id"])]
 
 
@@ -244,11 +292,13 @@ async def test_list_notebooks_filters_by_tags(api_client: AsyncClient) -> None:
     for notebook in [matching, partial, unrelated]:
         await publish_notebook(api_client, owner_headers, str(notebook["id"]), "public")
 
-    response = await api_client.get("/api/notebooks", params=[("tags", "solar"), ("tags", "forecast")])
+    response = await api_client.get(
+        "/api/notebooks", params=[("tags", "solar"), ("tags", "forecast")]
+    )
 
     assert response.status_code == 200
     assert response.json()["total"] == 1
-    assert [item["id"] for item in response.json()["items"]] == [str(matching["id"])]
+    assert [item["id"] for item in json_items(response)] == [str(matching["id"])]
 
 
 @pytest.mark.asyncio
@@ -304,8 +354,8 @@ async def test_list_notebooks_semantic_search_ranks_public_on_topic_notebook_fir
     )
 
     assert response.status_code == 200
-    body = response.json()
-    ids = [item["id"] for item in body["items"]]
+    body = json_dict(response)
+    ids = [item["id"] for item in json_items(response)]
     assert body["total"] == 3
     assert ids[0] == str(rocket["id"])
     assert set(ids) == {str(rocket["id"]), str(climate["id"]), str(music["id"])}
@@ -314,7 +364,9 @@ async def test_list_notebooks_semantic_search_ranks_public_on_topic_notebook_fir
 
 
 @pytest.mark.asyncio
-async def test_semantic_search_preserves_text_tags_and_pagination_filters(api_client: AsyncClient) -> None:
+async def test_semantic_search_preserves_text_tags_and_pagination_filters(
+    api_client: AsyncClient,
+) -> None:
     _, owner_headers = await register_and_login(api_client, "semantic-filters")
     matching = await create_notebook(
         api_client,
@@ -342,19 +394,27 @@ async def test_semantic_search_preserves_text_tags_and_pagination_filters(api_cl
 
     response = await api_client.get(
         "/api/notebooks",
-        params={"semantic": "market trading", "q": "market", "tags": "propulsion", "page": 1, "page_size": 1},
+        params={
+            "semantic": "market trading",
+            "q": "market",
+            "tags": "propulsion",
+            "page": 1,
+            "page_size": 1,
+        },
     )
 
     assert response.status_code == 200
-    body = response.json()
+    body = json_dict(response)
     assert body["total"] == 1
     assert body["page"] == 1
     assert body["page_size"] == 1
-    assert [item["id"] for item in body["items"]] == [str(matching["id"])]
+    assert [item["id"] for item in json_items(response)] == [str(matching["id"])]
 
 
 @pytest.mark.asyncio
-async def test_list_notebooks_combines_visibility_search_and_tag_filters(api_client: AsyncClient) -> None:
+async def test_list_notebooks_combines_visibility_search_and_tag_filters(
+    api_client: AsyncClient,
+) -> None:
     _, owner_headers = await register_and_login(api_client, "owner")
     _, other_headers = await register_and_login(api_client, "other")
     owner_draft = await create_notebook(
@@ -393,14 +453,17 @@ async def test_list_notebooks_combines_visibility_search_and_tag_filters(api_cli
     owner_response = await api_client.get("/api/notebooks", headers=owner_headers, params=params)
 
     assert anonymous.status_code == 200
-    assert {item["id"] for item in anonymous.json()["items"]} == {str(owner_public["id"]), str(other_public["id"])}
+    assert {item["id"] for item in json_items(anonymous)} == {
+        str(owner_public["id"]),
+        str(other_public["id"]),
+    }
     assert owner_response.status_code == 200
-    assert {item["id"] for item in owner_response.json()["items"]} == {
+    assert {item["id"] for item in json_items(owner_response)} == {
         str(owner_draft["id"]),
         str(owner_public["id"]),
         str(other_public["id"]),
     }
-    assert str(other_draft["id"]) not in {item["id"] for item in owner_response.json()["items"]}
+    assert str(other_draft["id"]) not in {item["id"] for item in json_items(owner_response)}
 
 
 @pytest.mark.asyncio
@@ -453,7 +516,9 @@ async def test_publish_transitions_between_all_visibility_states(api_client: Asy
 
 
 @pytest.mark.asyncio
-async def test_fork_notebook_copies_public_and_unlisted_sources_with_lineage(api_client: AsyncClient) -> None:
+async def test_fork_notebook_copies_public_and_unlisted_sources_with_lineage(
+    api_client: AsyncClient,
+) -> None:
     owner, owner_headers = await register_and_login(api_client, "fork-source-owner")
     forker, forker_headers = await register_and_login(api_client, "forker")
     public = await create_notebook(
@@ -476,13 +541,17 @@ async def test_fork_notebook_copies_public_and_unlisted_sources_with_lineage(api
     await publish_notebook(api_client, owner_headers, str(unlisted["id"]), "unlisted")
 
     anonymous_fork = await api_client.post(f"/api/notebooks/{public['id']}/fork")
-    public_fork = await api_client.post(f"/api/notebooks/{public['id']}/fork", headers=forker_headers)
-    unlisted_fork = await api_client.post(f"/api/notebooks/{unlisted['id']}/fork", headers=forker_headers)
+    public_fork = await api_client.post(
+        f"/api/notebooks/{public['id']}/fork", headers=forker_headers
+    )
+    unlisted_fork = await api_client.post(
+        f"/api/notebooks/{unlisted['id']}/fork", headers=forker_headers
+    )
     parent_after_fork = await api_client.get(f"/api/notebooks/{public['id']}")
 
     assert anonymous_fork.status_code == 401
     assert public_fork.status_code == 201
-    public_body = public_fork.json()
+    public_body = json_dict(public_fork)
     assert public_body["user_id"] == forker["id"]
     assert public_body["parent_id"] == public["id"]
     assert public_body["parent_title"] == "Public Source"
@@ -498,7 +567,7 @@ async def test_fork_notebook_copies_public_and_unlisted_sources_with_lineage(api
     assert parent_after_fork.json()["fork_count"] == 1
 
     assert unlisted_fork.status_code == 201
-    unlisted_body = unlisted_fork.json()
+    unlisted_body = json_dict(unlisted_fork)
     assert unlisted_body["parent_id"] == unlisted["id"]
     assert unlisted_body["parent_title"] == "Unlisted Source"
     assert unlisted_body["source"] == "print('unlisted')"
@@ -511,8 +580,10 @@ async def test_forked_draft_is_private_to_forker(api_client: AsyncClient) -> Non
     _, other_headers = await register_and_login(api_client, "private-fork-other")
     source = await create_notebook(api_client, owner_headers, "Forkable", "x = 1")
     await publish_notebook(api_client, owner_headers, str(source["id"]), "public")
-    fork_response = await api_client.post(f"/api/notebooks/{source['id']}/fork", headers=forker_headers)
-    fork_id = fork_response.json()["id"]
+    fork_response = await api_client.post(
+        f"/api/notebooks/{source['id']}/fork", headers=forker_headers
+    )
+    fork_id = str(json_dict(fork_response)["id"])
 
     anonymous = await api_client.get(f"/api/notebooks/{fork_id}")
     parent_owner = await api_client.get(f"/api/notebooks/{fork_id}", headers=owner_headers)
@@ -528,12 +599,16 @@ async def test_forked_draft_is_private_to_forker(api_client: AsyncClient) -> Non
 
 
 @pytest.mark.asyncio
-async def test_published_fork_hides_parent_metadata_when_parent_is_not_visible(api_client: AsyncClient) -> None:
+async def test_published_fork_hides_parent_metadata_when_parent_is_not_visible(
+    api_client: AsyncClient,
+) -> None:
     _, owner_headers = await register_and_login(api_client, "hidden-parent-owner")
     _, other_headers = await register_and_login(api_client, "hidden-parent-other")
     parent = await create_notebook(api_client, owner_headers, "Hidden Parent", "secret = True")
-    fork_response = await api_client.post(f"/api/notebooks/{parent['id']}/fork", headers=owner_headers)
-    fork_id = fork_response.json()["id"]
+    fork_response = await api_client.post(
+        f"/api/notebooks/{parent['id']}/fork", headers=owner_headers
+    )
+    fork_id = str(json_dict(fork_response)["id"])
     await publish_notebook(api_client, owner_headers, fork_id, "public")
 
     owner = await api_client.get(f"/api/notebooks/{fork_id}", headers=owner_headers)
@@ -546,7 +621,7 @@ async def test_published_fork_hides_parent_metadata_when_parent_is_not_visible(a
     assert owner.json()["parent_owner_username"] == "hidden-parent-owner"
     assert other.status_code == 200
     assert anonymous.status_code == 200
-    for body in [other.json(), anonymous.json()]:
+    for body in [json_dict(other), json_dict(anonymous)]:
         assert body["parent_id"] == parent["id"]
         assert "parent_title" not in body
         assert "parent_owner_id" not in body
@@ -568,7 +643,7 @@ async def test_fork_someone_elses_draft_returns_404(api_client: AsyncClient) -> 
 async def test_publish_embeds_when_draft_becomes_visible_and_not_when_returning_to_draft(
     api_client: AsyncClient,
     db_session: AsyncSession,
-    fake_embedding_service,
+    fake_embedding_service: _EmbeddingRecorder,
 ) -> None:
     _, owner_headers = await register_and_login(api_client, "embedding-owner")
     public_notebook = await create_notebook(
@@ -614,11 +689,19 @@ async def test_update_and_delete_enforce_ownership(api_client: AsyncClient) -> N
     await publish_notebook(api_client, owner_headers, notebook_id, "public")
 
     anonymous_update = await api_client.put(f"/api/notebooks/{notebook_id}", json={"title": "Nope"})
-    other_update = await api_client.put(f"/api/notebooks/{notebook_id}", headers=other_headers, json={"title": "Nope"})
-    owner_update = await api_client.put(f"/api/notebooks/{notebook_id}", headers=owner_headers, json={"title": "Updated"})
-    other_delete_public = await api_client.delete(f"/api/notebooks/{notebook_id}", headers=other_headers)
+    other_update = await api_client.put(
+        f"/api/notebooks/{notebook_id}", headers=other_headers, json={"title": "Nope"}
+    )
+    owner_update = await api_client.put(
+        f"/api/notebooks/{notebook_id}", headers=owner_headers, json={"title": "Updated"}
+    )
+    other_delete_public = await api_client.delete(
+        f"/api/notebooks/{notebook_id}", headers=other_headers
+    )
     await publish_notebook(api_client, owner_headers, notebook_id, "draft")
-    other_delete_hidden_draft = await api_client.delete(f"/api/notebooks/{notebook_id}", headers=other_headers)
+    other_delete_hidden_draft = await api_client.delete(
+        f"/api/notebooks/{notebook_id}", headers=other_headers
+    )
     owner_delete = await api_client.delete(f"/api/notebooks/{notebook_id}", headers=owner_headers)
 
     assert anonymous_update.status_code == 401
@@ -631,13 +714,19 @@ async def test_update_and_delete_enforce_ownership(api_client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
-async def test_update_rejects_null_title_and_tags_without_changing_database(api_client: AsyncClient) -> None:
+async def test_update_rejects_null_title_and_tags_without_changing_database(
+    api_client: AsyncClient,
+) -> None:
     _, owner_headers = await register_and_login(api_client, "owner")
     notebook = await create_notebook(api_client, owner_headers, "Original", "x = 1")
     notebook_id = str(notebook["id"])
 
-    null_title = await api_client.put(f"/api/notebooks/{notebook_id}", headers=owner_headers, json={"title": None})
-    null_tags = await api_client.put(f"/api/notebooks/{notebook_id}", headers=owner_headers, json={"tags": None})
+    null_title = await api_client.put(
+        f"/api/notebooks/{notebook_id}", headers=owner_headers, json={"title": None}
+    )
+    null_tags = await api_client.put(
+        f"/api/notebooks/{notebook_id}", headers=owner_headers, json={"tags": None}
+    )
     persisted = await api_client.get(f"/api/notebooks/{notebook_id}", headers=owner_headers)
 
     assert null_title.status_code == 422
@@ -647,12 +736,14 @@ async def test_update_rejects_null_title_and_tags_without_changing_database(api_
     assert persisted.json()["tags"] == ["original"]
 
 
-def mock_gitlab_response(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> list[dict[str, str] | None]:
+def mock_gitlab_response(
+    monkeypatch: pytest.MonkeyPatch, response: httpx.Response
+) -> list[dict[str, str] | None]:
     calls: list[dict[str, str] | None] = []
 
     class MockAsyncClient:
         def __init__(self, *args: object, **kwargs: object) -> None:
-            pass
+            super().__init__()
 
         async def __aenter__(self) -> "MockAsyncClient":
             return self
@@ -692,8 +783,8 @@ async def test_import_notebook_fetches_public_raw_file_and_persists_draft(
     )
 
     assert response.status_code == 201
-    body = response.json()
-    persisted = await db_session.get(Notebook, UUID(body["id"]))
+    body = json_dict(response)
+    persisted = await db_session.get(Notebook, UUID(str(body["id"])))
     assert body["title"] == "pump"
     assert body["visibility"] == "draft"
     assert body["source"] == source
@@ -709,7 +800,7 @@ async def test_import_notebook_sends_pat_header_without_storing_or_exposing_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, owner_headers = await register_and_login(api_client, "private-importer")
-    token = "glpat-secret-token"
+    private_pat = "glpat-secret-token"
     source = "from marimo import App\n\napp = App()\n"
     calls = mock_gitlab_response(
         monkeypatch,
@@ -719,17 +810,20 @@ async def test_import_notebook_sends_pat_header_without_storing_or_exposing_it(
     response = await api_client.post(
         "/api/notebooks/import",
         headers=owner_headers,
-        json={"url": "https://gitlab.example.com/group/project/-/raw/main/private.py", "pat": token},
+        json={
+            "url": "https://gitlab.example.com/group/project/-/raw/main/private.py",
+            "pat": private_pat,
+        },
     )
 
     assert response.status_code == 201
-    body = response.json()
-    persisted = await db_session.get(Notebook, UUID(body["id"]))
-    assert calls == [{"PRIVATE-TOKEN": token}]
-    assert token not in response.text
+    body = json_dict(response)
+    persisted = await db_session.get(Notebook, UUID(str(body["id"])))
+    assert calls == [{"PRIVATE-TOKEN": private_pat}]
+    assert private_pat not in response.text
     assert persisted is not None
     assert persisted.source == source
-    assert token not in persisted.source
+    assert private_pat not in persisted.source
 
 
 @pytest.mark.asyncio
@@ -740,7 +834,9 @@ async def test_import_notebook_rejects_non_python_source(
     _, owner_headers = await register_and_login(api_client, "bad-python-importer")
     mock_gitlab_response(
         monkeypatch,
-        raw_file_response("https://gitlab.example.com/group/project/-/raw/main/bad.py", "import marimo as mo\nif"),
+        raw_file_response(
+            "https://gitlab.example.com/group/project/-/raw/main/bad.py", "import marimo as mo\nif"
+        ),
     )
 
     response = await api_client.post(
@@ -761,7 +857,9 @@ async def test_import_notebook_rejects_python_without_marimo_import(
     _, owner_headers = await register_and_login(api_client, "plain-python-importer")
     mock_gitlab_response(
         monkeypatch,
-        raw_file_response("https://gitlab.example.com/group/project/-/raw/main/script.py", "print('hello')\n"),
+        raw_file_response(
+            "https://gitlab.example.com/group/project/-/raw/main/script.py", "print('hello')\n"
+        ),
     )
 
     response = await api_client.post(
@@ -782,7 +880,11 @@ async def test_import_notebook_surfaces_upstream_404(
     _, owner_headers = await register_and_login(api_client, "missing-importer")
     mock_gitlab_response(
         monkeypatch,
-        raw_file_response("https://gitlab.example.com/group/project/-/raw/main/missing.py", "missing", status_code=404),
+        raw_file_response(
+            "https://gitlab.example.com/group/project/-/raw/main/missing.py",
+            "missing",
+            status_code=404,
+        ),
     )
 
     response = await api_client.post(
@@ -803,7 +905,10 @@ async def test_import_notebook_rejects_files_over_size_limit(
     _, owner_headers = await register_and_login(api_client, "large-importer")
     mock_gitlab_response(
         monkeypatch,
-        raw_file_response("https://gitlab.example.com/group/project/-/raw/main/large.py", b"x" * (MAX_IMPORT_BYTES + 1)),
+        raw_file_response(
+            "https://gitlab.example.com/group/project/-/raw/main/large.py",
+            b"x" * (MAX_IMPORT_BYTES + 1),
+        ),
     )
 
     response = await api_client.post(

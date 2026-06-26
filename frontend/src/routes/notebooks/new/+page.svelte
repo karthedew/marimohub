@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { ApiError, api, normalizeTagInput, type NotebookCreateRequest } from '$lib/api';
 	import { auth } from '$lib/stores/auth';
+	import Button from '$lib/components/Button.svelte';
 
 	type Tab = 'blank' | 'upload' | 'gitlab';
 	type FieldErrors = Partial<Record<'title' | 'file' | 'url' | 'server', string>>;
@@ -134,13 +135,13 @@
 </script>
 
 <svelte:head>
-	<title>Create notebook | MoLab</title>
+	<title>Create notebook | MarimoHub</title>
 </svelte:head>
 
 <section class="space-y-8">
 	<div class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-end">
 		<div class="space-y-4">
-			<p class="w-fit rounded-full bg-orange-100 px-4 py-2 text-sm font-semibold text-orange-900 dark:bg-orange-400/10 dark:text-orange-200">
+			<p class="w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
 				Create
 			</p>
 			<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Start a marimo notebook.</h1>
@@ -150,12 +151,12 @@
 		</div>
 
 		{#if !isAuthenticated}
-			<div class="rounded-[2rem] border border-orange-200 bg-orange-50 p-5 text-sm leading-6 text-orange-950 shadow-lg shadow-orange-950/5 dark:border-orange-300/20 dark:bg-orange-400/10 dark:text-orange-100">
+			<div class="rounded-[2rem] border border-hub-200 bg-hub-50 p-5 text-sm leading-6 text-hub-950 shadow-lg shadow-hub-950/5 dark:border-hub-300/20 dark:bg-hub-400/10 dark:text-hub-50">
 				<p class="font-black">Authentication required</p>
 				<p class="mt-2">Notebook creation and imports require an account.</p>
 				<div class="mt-4 flex flex-wrap gap-2">
-					<a class="rounded-full bg-graphite px-4 py-2 font-bold text-white dark:bg-white dark:text-slate-950" href="/auth/login">Sign in</a>
-					<a class="rounded-full border border-orange-300 px-4 py-2 font-bold dark:border-orange-200/30" href="/auth/register">Create account</a>
+					<Button intent="primary" size="sm" href="/auth/login">Sign in</Button>
+					<Button intent="secondary" size="sm" href="/auth/register">Create account</Button>
 				</div>
 			</div>
 		{/if}
@@ -177,58 +178,58 @@
 				<div class="grid gap-5 md:grid-cols-2">
 					<div>
 						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="title">Title</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="title" bind:value={title} aria-invalid={Boolean(errors.title)} />
+						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="title" bind:value={title} aria-invalid={Boolean(errors.title)} />
 						{#if errors.title}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.title}</p>{/if}
 					</div>
 					<div>
 						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="tags">Tags</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="tags" bind:value={tags} placeholder="signals, demo" />
+						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="tags" bind:value={tags} placeholder="signals, demo" />
 					</div>
 				</div>
 				<div>
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="description">Description</label>
-					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="description" bind:value={description}></textarea>
+					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="description" bind:value={description}></textarea>
 				</div>
-				<button class="w-fit rounded-full bg-graphite px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-950/10 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-slate-950" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Creating...' : 'Create blank notebook'}</button>
+				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Creating...' : 'Create blank notebook'}</Button>
 			</form>
 		{:else if activeTab === 'upload'}
 			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitUpload(); }} novalidate>
 				<div class="rounded-[1.5rem] border border-dashed border-slate-300 bg-slate-50 p-5 dark:border-white/15 dark:bg-slate-950/30">
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="file">Python source file</label>
-					<input class="mt-3 block w-full text-sm font-semibold text-slate-700 file:mr-4 file:rounded-full file:border-0 file:bg-graphite file:px-4 file:py-2 file:text-sm file:font-bold file:text-white dark:text-slate-200 dark:file:bg-white dark:file:text-slate-950" id="file" type="file" accept=".py,text/x-python" onchange={selectFile} />
+					<input class="mt-3 block w-full text-sm font-semibold text-slate-700 file:mr-4 file:rounded-full file:border-0 file:bg-hub-700 file:px-4 file:py-2 file:text-sm file:font-bold file:text-white dark:text-slate-200 dark:file:bg-white dark:file:text-slate-950" id="file" type="file" accept=".py,text/x-python" onchange={selectFile} />
 					<p class="mt-3 text-sm text-slate-600 dark:text-slate-300">The file is read in your browser and sent as notebook source.</p>
 					{#if errors.file}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.file}</p>{/if}
 				</div>
 				<div class="grid gap-5 md:grid-cols-2">
 					<div>
 						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-title">Title</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-title" bind:value={uploadTitle} placeholder="Defaults to filename" aria-invalid={Boolean(errors.title)} />
+						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-title" bind:value={uploadTitle} placeholder="Defaults to filename" aria-invalid={Boolean(errors.title)} />
 						{#if errors.title}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.title}</p>{/if}
 					</div>
 					<div>
 						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-tags">Tags</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-tags" bind:value={uploadTags} placeholder="analysis, teaching" />
+						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-tags" bind:value={uploadTags} placeholder="analysis, teaching" />
 					</div>
 				</div>
 				<div>
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-description">Description</label>
-					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-description" bind:value={uploadDescription}></textarea>
+					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-description" bind:value={uploadDescription}></textarea>
 				</div>
-				<button class="w-fit rounded-full bg-graphite px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-950/10 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-slate-950" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Uploading...' : 'Create from file'}</button>
+				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Uploading...' : 'Create from file'}</Button>
 			</form>
 		{:else}
 			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitGitLab(); }} novalidate>
 				<div>
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="gitlab-url">GitLab raw file URL</label>
-					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-url" type="url" bind:value={gitlabUrl} placeholder="https://gitlab.com/.../-/raw/main/notebook.py" aria-invalid={Boolean(errors.url)} />
+					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-url" type="url" bind:value={gitlabUrl} placeholder="https://gitlab.com/.../-/raw/main/notebook.py" aria-invalid={Boolean(errors.url)} />
 					{#if errors.url}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.url}</p>{/if}
 				</div>
 				<div>
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="gitlab-pat">Personal access token <span class="font-semibold text-slate-500 dark:text-slate-400">optional</span></label>
-					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-orange-500 focus:ring-4 focus:ring-orange-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-pat" type="password" autocomplete="off" bind:value={gitlabPat} placeholder="Only needed for private files" />
-					<p class="mt-2 text-sm font-semibold text-slate-600 dark:text-slate-300">The token is sent once to fetch this file and is never stored by MoLab.</p>
+					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-pat" type="password" autocomplete="off" bind:value={gitlabPat} placeholder="Only needed for private files" />
+					<p class="mt-2 text-sm font-semibold text-slate-600 dark:text-slate-300">The token is sent once to fetch this file and is never stored by MarimoHub.</p>
 				</div>
-				<button class="w-fit rounded-full bg-graphite px-5 py-3 text-sm font-bold text-white shadow-lg shadow-slate-950/10 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-white dark:text-slate-950" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Importing...' : 'Import from GitLab'}</button>
+				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Importing...' : 'Import from GitLab'}</Button>
 			</form>
 		{/if}
 	</div>

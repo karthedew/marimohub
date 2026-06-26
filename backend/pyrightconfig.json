@@ -1,0 +1,44 @@
+{
+  "include": ["app", "tests"],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "build",
+    "dist",
+    "app/db/migrations"
+  ],
+
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+
+  "strictListInference": true,
+  "strictDictionaryInference": true,
+  "strictSetInference": true,
+
+  "reportMissingImports": "error",
+  "reportMissingTypeStubs": "error",
+  "reportUnknownParameterType": "error",
+  "reportUnknownArgumentType": "error",
+  "reportUnknownLambdaType": "error",
+  "reportUnknownVariableType": "error",
+  "reportUnknownMemberType": "error",
+  "reportAny": "error",
+  "reportExplicitAny": "error",
+  "reportImplicitOverride": "error",
+  "reportImplicitStringConcatenation": "error",
+  "reportImportCycles": "error",
+  "reportMissingSuperCall": "error",
+  "reportPropertyTypeMismatch": "error",
+  "reportUninitializedInstanceVariable": "error",
+  "reportUnnecessaryCast": "error",
+  "reportUnnecessaryComparison": "error",
+  "reportUnnecessaryContains": "error",
+  "reportUnnecessaryIsInstance": "error",
+  "reportUnnecessaryTypeIgnoreComment": "error",
+  "reportUnusedClass": "error",
+  "reportUnusedFunction": "error",
+  "reportUnusedImport": "error",
+  "reportUnusedVariable": "error",
+  "reportWildcardImportFromLibrary": "error"
+}

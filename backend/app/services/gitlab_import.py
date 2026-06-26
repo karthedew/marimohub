@@ -1,22 +1,28 @@
 import ast
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
 
 import httpx
 
-
 MAX_IMPORT_BYTES = 1_000_000
 
 
 class GitLabImportError(Exception):
+    """Raised when importing a notebook from a URL fails."""
+
     def __init__(self, status_code: int, detail: str) -> None:
+        """Capture the HTTP status and client-safe detail for the failure."""
+        super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
 
 
 @dataclass(frozen=True)
 class ImportedNotebook:
+    """A notebook successfully fetched and validated from a URL."""
+
     title: str
     source: str
 
@@ -30,15 +36,20 @@ def _title_from_url(url: str) -> str:
     return filename
 
 
-def _has_marimo_import(tree: ast.AST) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            if any(alias.name == "marimo" or alias.name.startswith("marimo.") for alias in node.names):
-                return True
-        if isinstance(node, ast.ImportFrom) and node.module is not None:
-            if node.module == "marimo" or node.module.startswith("marimo."):
-                return True
+def _is_marimo_module(name: str) -> bool:
+    return name == "marimo" or name.startswith("marimo.")
+
+
+def _imports_marimo(node: ast.AST) -> bool:
+    if isinstance(node, ast.Import):
+        return any(_is_marimo_module(alias.name) for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        return node.module is not None and _is_marimo_module(node.module)
     return False
+
+
+def _has_marimo_import(tree: ast.AST) -> bool:
+    return any(_imports_marimo(node) for node in ast.walk(tree))
 
 
 def _validate_source(source: str) -> None:
@@ -51,6 +62,7 @@ def _validate_source(source: str) -> None:
 
 
 async def import_gitlab_notebook(url: str, pat: str | None = None) -> ImportedNotebook:
+    """Fetch and validate a marimo notebook from a (GitLab) URL."""
     headers = {"PRIVATE-TOKEN": pat} if pat else None
     try:
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -58,9 +70,16 @@ async def import_gitlab_notebook(url: str, pat: str | None = None) -> ImportedNo
     except httpx.HTTPError as exc:
         raise GitLabImportError(502, "Unable to fetch notebook from upstream") from exc
 
-    if response.status_code in {401, 403, 404}:
-        raise GitLabImportError(response.status_code, f"Upstream returned {response.status_code} while fetching notebook")
-    if response.status_code >= 400:
+    if response.status_code in {
+        HTTPStatus.UNAUTHORIZED,
+        HTTPStatus.FORBIDDEN,
+        HTTPStatus.NOT_FOUND,
+    }:
+        raise GitLabImportError(
+            response.status_code,
+            f"Upstream returned {response.status_code} while fetching notebook",
+        )
+    if response.status_code >= HTTPStatus.BAD_REQUEST:
         raise GitLabImportError(502, "Upstream failed while fetching notebook")
     if len(response.content) > MAX_IMPORT_BYTES:
         raise GitLabImportError(413, "Imported notebook exceeds the 1 MB size limit")

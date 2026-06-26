@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Deployment, DeploymentStatus, NotebookData
-from test_notebooks import create_notebook, register_and_login
+from test_notebooks import create_notebook, json_dict, register_and_login
 
 
 @pytest.mark.asyncio
@@ -17,7 +17,9 @@ async def test_post_data_while_deployment_sleeps_then_get_latest(
     _, owner_headers = await register_and_login(api_client, "data-owner")
     notebook = await create_notebook(api_client, owner_headers, "Data Buffer", "x = 1")
     notebook_id = UUID(str(notebook["id"]))
-    db_session.add(Deployment(notebook_id=notebook_id, slug="data-buffer", status=DeploymentStatus.SLEEPING))
+    db_session.add(
+        Deployment(notebook_id=notebook_id, slug="data-buffer", status=DeploymentStatus.SLEEPING)
+    )
     await db_session.commit()
 
     first = await api_client.post(
@@ -33,13 +35,13 @@ async def test_post_data_while_deployment_sleeps_then_get_latest(
     latest = await api_client.get(f"/api/notebooks/{notebook_id}/data")
 
     assert first.status_code == 201
-    first_body = first.json()
+    first_body = json_dict(first)
     assert set(first_body) == {"id"}
-    assert UUID(first_body["id"])
+    assert UUID(str(first_body["id"]))
     assert second.status_code == 201
-    second_body = second.json()
+    second_body = json_dict(second)
     assert set(second_body) == {"id"}
-    assert UUID(second_body["id"])
+    assert UUID(str(second_body["id"]))
     assert latest.status_code == 200
     assert latest.json()["payload"] == {"metric": "memory", "value": 42}
     assert latest.json()["source"] == "grafana-panel"
@@ -58,7 +60,9 @@ async def test_get_data_returns_404_when_notebook_has_no_data(api_client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_data_post_requires_existing_notebook(api_client: AsyncClient, db_session: AsyncSession) -> None:
+async def test_data_post_requires_existing_notebook(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
     missing_id = UUID("00000000-0000-0000-0000-000000000001")
 
     response = await api_client.post(
@@ -66,7 +70,9 @@ async def test_data_post_requires_existing_notebook(api_client: AsyncClient, db_
         params={"source": "grafana"},
         json={"metric": "cpu"},
     )
-    stored = await db_session.scalar(select(NotebookData).where(NotebookData.notebook_id == missing_id))
+    stored = await db_session.scalar(
+        select(NotebookData).where(NotebookData.notebook_id == missing_id)
+    )
 
     assert response.status_code == 404
     assert stored is None

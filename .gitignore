@@ -6,6 +6,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+backend/reports/
 node_modules/
 dist/
 build/
+backend/.molab-notebooks/

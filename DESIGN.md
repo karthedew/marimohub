@@ -1,12 +1,12 @@
-# MoLab — Design Decisions & MVP Roadmap
+# MarimoHub — Design Decisions & MVP Roadmap
 
 Captured from initial planning session (2026-06-12).
 
 ---
 
-## What Is MoLab?
+## What Is MarimoHub?
 
-MoLab is a Marimo notebook hub for scientists and engineers. The core loop:
+MarimoHub is a Marimo notebook hub for scientists and engineers. The core loop:
 
 1. **Create** — author a Marimo notebook (blank, upload `.py`, or import from GitLab)
 2. **Publish** — share it with the world (or just collaborators) via a discovery hub
@@ -47,6 +47,16 @@ Three process modes:
 - **Edit mode** (`marimo edit`) — creating/editing a draft notebook
 - **Run mode** (`marimo run`) — ephemeral session for viewing/running a published notebook
 - **Deploy mode** (`marimo run`) — persistent named process with a stable URL
+
+### Runtime Package Environments
+
+Marimo subprocesses inherit the backend's interpreter, so packages installed from an edit or run session (via marimo's in-notebook package manager) land in the **shared backend `.venv`**, global to the backend process and visible to every notebook.
+
+The backend itself runs under `uv run`, which exports `UV` and `UV_PROJECT_ENVIRONMENT`. Those markers make marimo treat the notebook as part of the backend's uv *project* and install with `uv add` against the backend's own `pyproject.toml`, which fails. Spawned marimo processes therefore run with those two variables stripped from the environment (`_marimo_env` in `process_manager.py`), so marimo falls back to `uv pip install` into the active `.venv`.
+
+This is intentional for the MVP — there is no per-notebook environment isolation yet. The seam for that follow-up is marimo's `--sandbox` flag, which runs a notebook in an isolated `uv` environment derived from its PEP 723 inline script metadata. Isolation is a one-line change at the command-construction point (`_marimo_command` in `process_manager.py`): add `--sandbox` and persist a per-notebook dependency manifest. No new subsystem is required, which is why the global-`.venv` choice is safe to ship now.
+
+Edit sessions autosave to a working-copy file; on session end the backend reads that file back and persists it to `notebooks.source` (`_persist_edit_session`), so edits survive across sessions and are what deployments serve.
 
 ### Deploy Lifecycle
 

@@ -5,8 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.db.database import Base
 from app import models  # noqa: F401
+from app.db.database import Base
 
 
 class MigrationSettings(BaseSettings):
@@ -18,7 +18,7 @@ class MigrationSettings(BaseSettings):
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

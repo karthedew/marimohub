@@ -16,6 +16,7 @@ from app.services.process_manager import shutdown_process_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Start background services on startup and tear them down on shutdown."""
     reaper = await start_deployment_lifecycle()
     try:
         yield
@@ -24,7 +25,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await shutdown_process_manager()
 
 
-app = FastAPI(title="MoLab API", lifespan=lifespan)
+app = FastAPI(title="MarimoHub API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,4 +45,5 @@ app.include_router(proxy_router)
 
 @app.get("/api/health")
 async def health() -> dict[str, str]:
+    """Return a simple liveness payload."""
     return {"status": "ok"}
