@@ -1,12 +1,18 @@
 from logging.config import fileConfig
 
 from alembic import context
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.core.config import get_settings
 from app.db.database import Base
 from app import models  # noqa: F401
+
+
+class MigrationSettings(BaseSettings):
+    DATABASE_URL: str = "postgresql+asyncpg://molab:molab@localhost:5432/molab"
+
+    model_config = SettingsConfigDict(env_file=("../.env", ".env"), extra="ignore")
 
 
 config = context.config
@@ -16,12 +22,14 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL)
+database_url = MigrationSettings().DATABASE_URL
+
+config.set_main_option("sqlalchemy.url", database_url)
 
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=get_settings().DATABASE_URL,
+        url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
     )

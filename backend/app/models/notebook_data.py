@@ -14,7 +14,7 @@ class NotebookData(Base):
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     notebook_id: Mapped[UUID] = mapped_column(ForeignKey("notebooks.id", ondelete="CASCADE"), nullable=False)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    payload: Mapped[Any] = mapped_column(JSONB, nullable=False)
     source: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

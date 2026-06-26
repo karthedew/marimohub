@@ -88,6 +88,7 @@ def upgrade() -> None:
         sa.Column("last_active", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         sa.ForeignKeyConstraint(["notebook_id"], ["notebooks.id"], name="fk_deployments_notebook_id", ondelete="CASCADE"),
+        sa.UniqueConstraint("notebook_id", name="uq_deployments_notebook_id"),
         sa.UniqueConstraint("slug", name="uq_deployments_slug"),
     )
 

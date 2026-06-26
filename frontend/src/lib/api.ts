@@ -1,3 +1,4 @@
+import { browser } from '$app/environment';
 import { env } from '$env/dynamic/public';
 import { getAuthToken } from '$lib/stores/auth';
 
@@ -8,12 +9,20 @@ export type User = {
 	created_at: string;
 };
 
+export type Token = {
+	access_token: string;
+	token_type: 'bearer';
+};
+
 export type NotebookVisibility = 'draft' | 'unlisted' | 'public';
 
 export type Notebook = {
 	id: string;
 	user_id: string;
 	parent_id: string | null;
+	parent_title?: string | null;
+	parent_owner_id?: string | null;
+	parent_owner_username?: string | null;
 	title: string;
 	description: string | null;
 	tags: string[];
@@ -24,126 +33,257 @@ export type Notebook = {
 	updated_at: string;
 };
 
-export type LoginResponse = { access_token: string; token_type: 'bearer' };
-export type NotebookListResponse = { items: Notebook[]; total: number; page: number; page_size: number };
+export type Paginated<T> = {
+	items: T[];
+	total: number;
+	page: number;
+	page_size: number;
+};
+
+export type RegisterRequest = {
+	username: string;
+	email: string;
+	password: string;
+};
+
+export type LoginRequest = {
+	username: string;
+	password: string;
+};
+
+export type NotebookListParams = {
+	q?: string;
+	tags?: string | string[];
+	semantic?: string;
+	page?: number;
+	page_size?: number;
+};
+
+export type NotebookCreateRequest = {
+	title: string;
+	description?: string | null;
+	tags?: string[];
+	source?: string;
+};
+
+export type NotebookUpdateRequest = Partial<NotebookCreateRequest>;
+
+export type NotebookPublishRequest = {
+	visibility: NotebookVisibility;
+};
+
+export type NotebookImportRequest = {
+	url: string;
+	pat?: string;
+};
+
 export type SessionMode = 'edit' | 'run';
-export type SessionResponse = { id: string; notebook_id: string; mode: SessionMode; proxy_url: string };
-export type DeploymentResponse = { slug: string; status: string; url: string };
-export type NotebookDataResponse = { payload: unknown; source: string; created_at: string };
-export type CreatedNotebookDataResponse = { id: string };
 
-export type ApiError = Error & { status: number; detail: string };
+export type SessionCreateRequest = {
+	notebook_id: string;
+	mode: SessionMode;
+};
 
-type RequestOptions = Omit<RequestInit, 'body'> & { body?: unknown; token?: string | null };
+export type Session = {
+	id: string;
+	notebook_id: string;
+	mode: SessionMode;
+	proxy_url: string;
+};
 
-const baseUrl = env.PUBLIC_API_URL ?? '';
-export const mockApiEnabled = env.PUBLIC_MOCK_API === 'true' || (!baseUrl && env.PUBLIC_MOCK_API !== 'false');
+export type DeploymentStatus = 'running' | 'sleeping' | 'stopped';
 
-export const fixtureNotebooks: Notebook[] = [
-	{
-		id: 'nb_molab_intro',
-		user_id: 'user_demo',
-		parent_id: null,
-		title: 'MoLab getting started',
-		description: 'A fixture notebook for frontend development before the backend is available.',
-		tags: ['demo', 'marimo', 'phase-0'],
-		visibility: 'public',
-		fork_count: 7,
-		source: 'https://github.com/demo/molab-intro.py',
-		created_at: '2026-06-01T12:00:00.000Z',
-		updated_at: '2026-06-10T12:00:00.000Z'
-	},
-	{
-		id: 'nb_vector_search',
-		user_id: 'user_demo',
-		parent_id: null,
-		title: 'Vector search playground',
-		description: 'Mock search and tag metadata for Discover UI work.',
-		tags: ['search', 'pgvector'],
-		visibility: 'public',
-		fork_count: 3,
-		created_at: '2026-06-03T09:30:00.000Z',
-		updated_at: '2026-06-12T16:45:00.000Z'
+export type DeploymentCreateRequest = {
+	slug?: string;
+};
+
+export type Deployment = {
+	slug: string;
+	status: DeploymentStatus;
+	url: string;
+};
+
+export type NotebookData = {
+	payload: unknown;
+	source: string;
+	created_at: string;
+};
+
+export type NotebookDataCreated = {
+	id: string;
+};
+
+export class ApiError extends Error {
+	readonly status: number;
+	readonly detail: string;
+
+	constructor(status: number, detail: string) {
+		super(detail);
+		this.name = 'ApiError';
+		this.status = status;
+		this.detail = detail;
 	}
-];
-
-function createApiError(status: number, detail: string): ApiError {
-	const error = new Error(detail) as ApiError;
-	error.status = status;
-	error.detail = detail;
-	return error;
 }
 
-function pathWithQuery(path: string, query?: Record<string, string | number | undefined>) {
-	if (path.startsWith('http://') || path.startsWith('https://')) return path;
-	const url = new URL(`${baseUrl}${path}`, baseUrl || 'http://localhost');
+type RequestOptions = Omit<RequestInit, 'body'> & {
+	auth?: boolean;
+	body?: unknown;
+	fetch?: typeof fetch;
+	query?: Record<string, string | number | boolean | string[] | undefined>;
+};
+
+const apiBaseUrl = normalizeApiBaseUrl(env.PUBLIC_API_URL ?? '');
+
+function normalizeApiBaseUrl(value: string) {
+	const trimmed = value.trim().replace(/\/$/, '');
+	if (!trimmed) return '';
+
+	let url: URL;
+	try {
+		url = new URL(trimmed);
+	} catch {
+		throw new Error('PUBLIC_API_URL must be an absolute http(s) URL');
+	}
+
+	if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+		throw new Error('PUBLIC_API_URL must be an absolute http(s) URL');
+	}
+
+	return trimmed;
+}
+
+function buildUrl(path: string, query?: RequestOptions['query']) {
+	const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+	const url = new URL(`${apiBaseUrl}${normalizedPath}`, 'http://localhost');
+
 	for (const [key, value] of Object.entries(query ?? {})) {
-		if (value !== undefined && value !== '') url.searchParams.set(key, String(value));
+		if (value === undefined || value === '') continue;
+		if (Array.isArray(value)) {
+			if (value.length > 0) url.searchParams.set(key, value.join(','));
+		} else {
+			url.searchParams.set(key, String(value));
+		}
 	}
-	return baseUrl ? url.toString() : `${url.pathname}${url.search}`;
+
+	return apiBaseUrl ? url.toString() : `${url.pathname}${url.search}`;
 }
 
-export async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<T> {
-	const { body, token = getAuthToken(), headers, ...init } = options;
-	const response = await fetch(pathWithQuery(path), {
+export function resolveApiUrl(value: string) {
+	try {
+		return new URL(value).toString();
+	} catch {
+		if (!apiBaseUrl) return value;
+		return new URL(value, `${apiBaseUrl}/`).toString();
+	}
+}
+
+export function deploymentProxyUrl(slug: string) {
+	return resolveApiUrl(buildUrl(`/api/deployments/${slug}`));
+}
+
+export function normalizeTagInput(tags: string | string[] | undefined) {
+	const values = Array.isArray(tags) ? tags : tags?.split(',') ?? [];
+	return values.map((tag) => tag.trim()).filter((tag) => tag.length > 0);
+}
+
+async function readError(response: Response) {
+	try {
+		const body = (await response.json()) as { detail?: unknown };
+		if (typeof body.detail === 'string') return body.detail;
+		if (Array.isArray(body.detail)) {
+			const messages = body.detail
+				.map((item) => {
+					if (item && typeof item === 'object' && 'msg' in item) return String(item.msg);
+					return undefined;
+				})
+				.filter(Boolean);
+			if (messages.length > 0) return messages.join(', ');
+		}
+	} catch {
+		return response.statusText || 'Request failed';
+	}
+	return response.statusText || 'Request failed';
+}
+
+export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
+	const { auth, body, fetch: fetcher = globalThis.fetch, query, ...init } = options;
+	const headers = new Headers(init.headers);
+	const token = getAuthToken();
+
+	if (!apiBaseUrl && !browser && fetcher === globalThis.fetch) {
+		throw new Error('PUBLIC_API_URL must be set for server-side live API requests without SvelteKit fetch');
+	}
+
+	if (auth !== false && token) headers.set('Authorization', `Bearer ${token}`);
+	if (body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+
+	const response = await fetcher(buildUrl(path, query), {
 		...init,
-		headers: {
-			...(body === undefined ? {} : { 'content-type': 'application/json' }),
-			...(token ? { authorization: `Bearer ${token}` } : {}),
-			...headers
-		},
+		headers,
 		body: body === undefined ? undefined : JSON.stringify(body)
 	});
 
-	if (!response.ok) {
-		let detail = response.statusText;
-		try {
-			const payload = (await response.json()) as { detail?: string };
-			detail = payload.detail ?? detail;
-		} catch {
-			// Non-JSON errors still become the frozen {detail} shape for callers.
-		}
-		throw createApiError(response.status, detail);
-	}
-
+	if (!response.ok) throw new ApiError(response.status, await readError(response));
 	if (response.status === 204) return undefined as T;
+
 	return (await response.json()) as T;
 }
 
-async function mockOrFetch<T>(mockValue: T, fetcher: () => Promise<T>) {
-	return mockApiEnabled ? mockValue : fetcher();
+function createLiveApi(fetcher?: typeof fetch) {
+	const request = <T>(path: string, options: RequestOptions = {}) =>
+		apiRequest<T>(path, fetcher ? { ...options, fetch: fetcher } : options);
+
+	return {
+		auth: {
+			register: (body: RegisterRequest) => request<User>('/api/auth/register', { method: 'POST', auth: false, body }),
+			login: (body: LoginRequest) => request<Token>('/api/auth/login', { method: 'POST', auth: false, body }),
+			logout: () => request<void>('/api/auth/logout', { method: 'POST' })
+		},
+		notebooks: {
+			list: (query: NotebookListParams = {}) =>
+				request<Paginated<Notebook>>('/api/notebooks', { query: { ...query, tags: normalizeTagInput(query.tags) } }),
+			create: (body: NotebookCreateRequest) => request<Notebook>('/api/notebooks', { method: 'POST', body }),
+			get: (id: string) => request<Notebook>(`/api/notebooks/${id}`),
+			update: (id: string, body: NotebookUpdateRequest) =>
+				request<Notebook>(`/api/notebooks/${id}`, { method: 'PUT', body }),
+			delete: (id: string) => request<void>(`/api/notebooks/${id}`, { method: 'DELETE' }),
+			publish: (id: string, body: NotebookPublishRequest) =>
+				request<Notebook>(`/api/notebooks/${id}/publish`, { method: 'POST', body }),
+			fork: (id: string) => request<Notebook>(`/api/notebooks/${id}/fork`, { method: 'POST' }),
+			import: (body: NotebookImportRequest) =>
+				request<Notebook>('/api/notebooks/import', { method: 'POST', body }),
+			deploy: (id: string, body: DeploymentCreateRequest = {}) =>
+				request<Deployment>(`/api/notebooks/${id}/deploy`, { method: 'POST', body }),
+			postData: (id: string, body: unknown) =>
+				request<NotebookDataCreated>(`/api/notebooks/${id}/data`, { method: 'POST', auth: false, body }),
+			getData: (id: string) => request<NotebookData>(`/api/notebooks/${id}/data`, { auth: false })
+		},
+		sessions: {
+			create: (body: SessionCreateRequest) => request<Session>('/api/sessions', { method: 'POST', body }),
+			delete: (id: string) => request<void>(`/api/sessions/${id}`, { method: 'DELETE' })
+		},
+		deployments: {
+			get: async (slug: string) => {
+				const headers = new Headers();
+				const token = getAuthToken();
+				if (token) headers.set('Authorization', `Bearer ${token}`);
+				if (!apiBaseUrl && !browser && !fetcher) {
+					throw new Error('PUBLIC_API_URL must be set for server-side live API requests without SvelteKit fetch');
+				}
+
+				const response = await (fetcher ?? globalThis.fetch)(buildUrl(`/api/deployments/${slug}`), { headers });
+				if (!response.ok) throw new ApiError(response.status, await readError(response));
+				return response;
+			},
+			delete: (slug: string) => request<void>(`/api/deployments/${slug}`, { method: 'DELETE' })
+		}
+	};
 }
 
-export const api = {
-	register: (body: { username: string; email: string; password: string }) =>
-		apiFetch<User>('/api/auth/register', { method: 'POST', body }),
-	login: (body: { username: string; password: string }) =>
-		apiFetch<LoginResponse>('/api/auth/login', { method: 'POST', body, token: null }),
-	logout: () => apiFetch<void>('/api/auth/logout', { method: 'POST' }),
-	listNotebooks: (query: { q?: string; tags?: string; semantic?: string; page?: number; page_size?: number } = {}) =>
-		mockOrFetch(
-			{ items: fixtureNotebooks, total: fixtureNotebooks.length, page: query.page ?? 1, page_size: query.page_size ?? 20 },
-			() => apiFetch<NotebookListResponse>(pathWithQuery('/api/notebooks', query))
-		),
-	createNotebook: (body: { title: string; description?: string; tags?: string[]; source?: string }) =>
-		apiFetch<Notebook>('/api/notebooks', { method: 'POST', body }),
-	getNotebook: (id: string) => apiFetch<Notebook>(`/api/notebooks/${id}`, { token: getAuthToken() }),
-	updateNotebook: (id: string, body: { title?: string; description?: string; tags?: string[]; source?: string }) =>
-		apiFetch<Notebook>(`/api/notebooks/${id}`, { method: 'PUT', body }),
-	deleteNotebook: (id: string) => apiFetch<void>(`/api/notebooks/${id}`, { method: 'DELETE' }),
-	publishNotebook: (id: string, body: { visibility: NotebookVisibility }) =>
-		apiFetch<Notebook>(`/api/notebooks/${id}/publish`, { method: 'POST', body }),
-	forkNotebook: (id: string) => apiFetch<Notebook>(`/api/notebooks/${id}/fork`, { method: 'POST' }),
-	importNotebook: (body: { url: string; pat?: string }) =>
-		apiFetch<Notebook>('/api/notebooks/import', { method: 'POST', body }),
-	createSession: (body: { notebook_id: string; mode: SessionMode }) =>
-		apiFetch<SessionResponse>('/api/sessions', { method: 'POST', body }),
-	deleteSession: (id: string) => apiFetch<void>(`/api/sessions/${id}`, { method: 'DELETE' }),
-	deployNotebook: (id: string, body: { slug?: string }) =>
-		apiFetch<DeploymentResponse>(`/api/notebooks/${id}/deploy`, { method: 'POST', body }),
-	getDeployment: (slug: string) => apiFetch<Response>(`/api/deployments/${slug}`),
-	deleteDeployment: (slug: string) => apiFetch<void>(`/api/deployments/${slug}`, { method: 'DELETE' }),
-	createNotebookData: (id: string, body: unknown) =>
-		apiFetch<CreatedNotebookDataResponse>(`/api/notebooks/${id}/data`, { method: 'POST', body, token: null }),
-	getNotebookData: (id: string) => apiFetch<NotebookDataResponse>(`/api/notebooks/${id}/data`, { token: null })
-};
+const liveApi = createLiveApi();
+
+export function apiWithFetch(fetcher: typeof fetch) {
+	return createLiveApi(fetcher);
+}
+
+export const api = liveApi;

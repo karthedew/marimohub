@@ -3,11 +3,16 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<meta name="text-scale" content="scale" />
+		<title>MoLab</title>
+		<meta name="description" content="Discover, fork, run, and deploy marimo notebooks." />
 		<script>
-			const theme = localStorage.getItem('molab-theme');
-			const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-			if (theme === 'dark' || (!theme && prefersDark)) document.documentElement.classList.add('dark');
+			try {
+				const theme = localStorage.getItem('molab-theme');
+				const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+				if (theme === 'dark' || (!theme && prefersDark)) document.documentElement.classList.add('dark');
+			} catch {
+				// Storage can be unavailable in constrained browser contexts; system light remains usable.
+			}
 		</script>
 		%sveltekit.head%
 	</head>

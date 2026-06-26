@@ -28,8 +28,18 @@ services:
       MARIMO_PORT_RANGE: 9000-9099
     volumes:
       - ./backend:/app/backend
+      - backend-venv:/app/backend/.venv
     ports:
       - "8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=2)\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,13 +47,25 @@ services:
   frontend:
     image: node:22
     working_dir: /app/frontend
+    environment:
+      PUBLIC_API_URL: http://localhost:8000
     volumes:
       - ./frontend:/app/frontend
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     ports:
       - "5173:5173"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:5173').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     depends_on:
       - backend
 
 volumes:
   molab-pgdata:
+  backend-venv:

@@ -1,0 +1,16 @@
+.git
+.DS_Store
+.env
+
+backend/.venv
+backend/.pytest_cache
+backend/.ruff_cache
+backend/.mypy_cache
+backend/__pycache__
+backend/**/*.pyc
+backend/**/*.pyo
+
+frontend/node_modules
+frontend/.svelte-kit
+frontend/dist
+frontend/build

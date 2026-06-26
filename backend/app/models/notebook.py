@@ -3,7 +3,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Enum, FetchedValue, ForeignKey, Integer, Text, func
+from sqlalchemy import DateTime, Enum, FetchedValue, ForeignKey, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,14 +24,28 @@ class Notebook(Base):
     parent_id: Mapped[UUID | None] = mapped_column(ForeignKey("notebooks.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    tags: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
+    tags: Mapped[list[str]] = mapped_column(
+        ARRAY(Text),
+        nullable=False,
+        default=list,
+        server_default=text("ARRAY[]::text[]"),
+    )
     source: Mapped[str | None] = mapped_column(Text)
     visibility: Mapped[NotebookVisibility] = mapped_column(
-        Enum(NotebookVisibility, name="notebook_visibility", values_callable=lambda enum_: [item.value for item in enum_]),
+        Enum(
+            NotebookVisibility,
+            name="notebook_visibility",
+            values_callable=lambda enum_: [item.value for item in enum_],
+        ),
         nullable=False,
         default=NotebookVisibility.DRAFT,
     )
-    fork_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fork_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
     search_vector: Mapped[str | None] = mapped_column(
         TSVECTOR,
         server_default=FetchedValue(),

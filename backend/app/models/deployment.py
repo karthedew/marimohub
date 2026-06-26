@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,6 +17,7 @@ class DeploymentStatus(str, enum.Enum):
 
 class Deployment(Base):
     __tablename__ = "deployments"
+    __table_args__ = (UniqueConstraint("notebook_id", name="uq_deployments_notebook_id"),)
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     notebook_id: Mapped[UUID] = mapped_column(ForeignKey("notebooks.id", ondelete="CASCADE"), nullable=False)
