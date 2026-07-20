@@ -1,25 +1,35 @@
+from collections.abc import Sequence
 from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import ColumnElement, func, or_, select, update
+from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, get_current_user_optional
+from app.api.deps import NotebookRead, NotebookWrite, get_current_user, get_current_user_optional
 from app.db.database import get_db
-from app.models import Notebook, NotebookVisibility, User
+from app.models import Notebook, NotebookVisibility, User, Workspace, WorkspaceRole
 from app.schemas import (
     NotebookCreate,
+    NotebookFork,
     NotebookImport,
     NotebookListOut,
     NotebookOut,
     NotebookPublish,
     NotebookUpdate,
 )
+from app.services.access import (
+    Action,
+    authorize_workspace,
+    can_access,
+    get_role,
+    load_notebook_for,
+    visible_notebooks,
+)
 from app.services.embedding_service import EmbeddingService, embedding_service
-from app.services.gitlab_import import GitLabImportError, import_gitlab_notebook
-from app.services.notebook_storage import NotebookStorageService, PostgresNotebookStorage
+from app.services.gitlab_import import import_gitlab_notebook
+from app.services.notebook_storage import NotebookStorageService, get_notebook_storage
 
 router = APIRouter(prefix="/api/notebooks", tags=["notebooks"])
 
@@ -34,29 +44,9 @@ class NotebookListQuery(BaseModel):
     page_size: int = Field(default=20, ge=1, le=100)
 
 
-def get_notebook_storage(db: Annotated[AsyncSession, Depends(get_db)]) -> NotebookStorageService:
-    """Provide notebook source storage bound to the request's session."""
-    return PostgresNotebookStorage(db)
-
-
 def get_embedding_service() -> EmbeddingService:
     """Provide the shared embedding service."""
     return embedding_service
-
-
-def _not_found() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notebook not found")
-
-
-def _is_owner(notebook: Notebook, user: User | None) -> bool:
-    return user is not None and notebook.user_id == user.id
-
-
-def _can_view(notebook: Notebook, user: User | None) -> bool:
-    return notebook.visibility in {
-        NotebookVisibility.UNLISTED,
-        NotebookVisibility.PUBLIC,
-    } or _is_owner(notebook, user)
 
 
 def _embedding_text(notebook: Notebook) -> str:
@@ -64,15 +54,71 @@ def _embedding_text(notebook: Notebook) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+type ParentAttribution = tuple[str, UUID, str]  # title, workspace_id, workspace slug
+
+
+async def _parent_attribution(
+    db: AsyncSession, actor: User | None, parent_id: UUID
+) -> ParentAttribution | None:
+    """Resolve one parent's attribution, or `None` if the actor cannot read it.
+
+    A since-privatized parent or one whose workspace was archived must not leak
+    through a fork's response; `can_access` alone doesn't know about archival,
+    so the join filters it explicitly.
+    """
+    row = (
+        await db.execute(
+            select(Notebook, Workspace.slug)
+            .join(Workspace, Notebook.workspace_id == Workspace.id)
+            .where(Notebook.id == parent_id, Workspace.archived_at.is_(None))
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    parent, parent_slug = row.tuple()
+    role = await get_role(db, parent.workspace_id, actor.id if actor else None)
+    if can_access(parent.visibility, role, Action.READ):
+        return parent.title, parent.workspace_id, parent_slug
+    return None
+
+
+async def _parent_attribution_batch(
+    db: AsyncSession, actor: User | None, notebooks: Sequence[Notebook]
+) -> dict[UUID, ParentAttribution | None]:
+    """Batch-resolve parent attribution for a page of notebooks in one query.
+
+    Per-row lookups here would be an N+1 against forked notebooks; a listing
+    page instead loads every distinct parent it needs up front.
+    """
+    parent_ids = {notebook.parent_id for notebook in notebooks if notebook.parent_id is not None}
+    if not parent_ids:
+        return {}
+    rows = await db.execute(
+        select(Notebook, Workspace.slug)
+        .join(Workspace, Notebook.workspace_id == Workspace.id)
+        .where(Notebook.id.in_(parent_ids), Workspace.archived_at.is_(None))
+    )
+    attribution: dict[UUID, ParentAttribution | None] = dict.fromkeys(parent_ids)
+    for parent, parent_slug in rows:
+        role = await get_role(db, parent.workspace_id, actor.id if actor else None)
+        if can_access(parent.visibility, role, Action.READ):
+            attribution[parent.id] = (parent.title, parent.workspace_id, parent_slug)
+    return attribution
+
+
 async def _notebook_out(
     db: AsyncSession,
     notebook: Notebook,
-    user: User | None,
+    actor: User | None,
     storage: NotebookStorageService,
+    *,
+    include_source: bool,
+    parent_cache: dict[UUID, ParentAttribution | None] | None = None,
 ) -> NotebookOut:
     payload = {
         "id": notebook.id,
-        "user_id": notebook.user_id,
+        "workspace_id": notebook.workspace_id,
+        "created_by": notebook.created_by,
         "parent_id": notebook.parent_id,
         "title": notebook.title,
         "description": notebook.description,
@@ -83,40 +129,25 @@ async def _notebook_out(
         "updated_at": notebook.updated_at,
     }
     if notebook.parent_id is not None:
-        parent_row = (
-            await db.execute(
-                select(Notebook, User.username)
-                .join(User, Notebook.user_id == User.id)
-                .where(Notebook.id == notebook.parent_id)
-            )
-        ).one_or_none()
-        if parent_row is not None:
-            parent, parent_username = parent_row.tuple()
-            if _can_view(parent, user):
-                payload["parent_title"] = parent.title
-                payload["parent_owner_id"] = parent.user_id
-                payload["parent_owner_username"] = parent_username
-    if _is_owner(notebook, user):
+        attribution = (
+            parent_cache.get(notebook.parent_id)
+            if parent_cache is not None
+            else await _parent_attribution(db, actor, notebook.parent_id)
+        )
+        if attribution is not None:
+            parent_title, parent_workspace_id, parent_workspace_slug = attribution
+            payload["parent_title"] = parent_title
+            payload["parent_workspace_id"] = parent_workspace_id
+            payload["parent_workspace_slug"] = parent_workspace_slug
+    if include_source:
         payload["source"] = await storage.get(notebook)
     return NotebookOut.model_validate(payload)
 
 
-async def _get_visible_notebook(db: AsyncSession, notebook_id: UUID, user: User | None) -> Notebook:
-    notebook = await db.scalar(select(Notebook).where(Notebook.id == notebook_id))
-    if notebook is None or not _can_view(notebook, user):
-        raise _not_found()
-    return notebook
-
-
-async def _get_owned_notebook(db: AsyncSession, notebook_id: UUID, user: User) -> Notebook:
-    notebook = await db.scalar(select(Notebook).where(Notebook.id == notebook_id))
-    if notebook is None:
-        raise _not_found()
-    if notebook.user_id != user.id:
-        if notebook.visibility == NotebookVisibility.DRAFT:
-            raise _not_found()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Notebook owner required")
-    return notebook
+async def _resolve_target_workspace(db: AsyncSession, actor: User, requested: UUID) -> UUID:
+    """Require EDITOR in the explicitly selected active target workspace."""
+    await authorize_workspace(db, requested, actor, WorkspaceRole.EDITOR)
+    return requested
 
 
 @router.get("", response_model=NotebookListOut, response_model_exclude_unset=True)
@@ -129,11 +160,8 @@ async def list_notebooks(
 ) -> NotebookListOut:
     """List and search notebooks visible to the caller, with pagination."""
     semantic_query = query.semantic.strip() if query.semantic and query.semantic.strip() else None
-    visibility_filter = Notebook.visibility == NotebookVisibility.PUBLIC
-    if current_user is not None and semantic_query is None:
-        visibility_filter = or_(visibility_filter, Notebook.user_id == current_user.id)
 
-    filters = [visibility_filter]
+    filters = [visible_notebooks(current_user.id if current_user else None)]
     order_by = [Notebook.updated_at.desc()]
     if semantic_query is not None:
         query_embedding = await embeddings.embed(semantic_query)
@@ -153,15 +181,23 @@ async def list_notebooks(
             order_by.insert(0, func.ts_rank(Notebook.search_vector, tsquery).desc())
 
     total = await db.scalar(select(func.count()).select_from(Notebook).where(*filters))
-    result = await db.scalars(
-        select(Notebook)
-        .where(*filters)
-        .order_by(*order_by)
-        .offset((query.page - 1) * query.page_size)
-        .limit(query.page_size)
-    )
+    notebooks = (
+        await db.scalars(
+            select(Notebook)
+            .where(*filters)
+            .order_by(*order_by)
+            .offset((query.page - 1) * query.page_size)
+            .limit(query.page_size)
+        )
+    ).all()
 
-    items = [await _notebook_out(db, notebook, current_user, storage) for notebook in result]
+    parent_cache = await _parent_attribution_batch(db, current_user, notebooks)
+    items = [
+        await _notebook_out(
+            db, notebook, current_user, storage, include_source=False, parent_cache=parent_cache
+        )
+        for notebook in notebooks
+    ]
 
     return NotebookListOut(
         items=items,
@@ -183,20 +219,22 @@ async def create_notebook(
     current_user: Annotated[User, Depends(get_current_user)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> NotebookOut:
-    """Create a new draft notebook owned by the caller."""
+    """Create a new private notebook in the caller's chosen workspace."""
+    workspace_id = await _resolve_target_workspace(db, current_user, payload.workspace_id)
     notebook = Notebook(
-        user_id=current_user.id,
+        workspace_id=workspace_id,
+        created_by=current_user.id,
         title=payload.title,
         description=payload.description,
         tags=payload.tags,
-        visibility=NotebookVisibility.DRAFT,
+        visibility=NotebookVisibility.PRIVATE,
     )
     db.add(notebook)
     await db.flush()
     await storage.put(notebook, payload.source)
     await db.commit()
     await db.refresh(notebook)
-    return await _notebook_out(db, notebook, current_user, storage)
+    return await _notebook_out(db, notebook, current_user, storage, include_source=True)
 
 
 @router.post(
@@ -211,35 +249,32 @@ async def import_notebook(
     current_user: Annotated[User, Depends(get_current_user)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> NotebookOut:
-    """Import a notebook from an external URL as a new draft."""
-    try:
-        imported = await import_gitlab_notebook(payload.url, payload.pat)
-    except GitLabImportError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    """Import a notebook from an external URL into the caller's chosen workspace."""
+    workspace_id = await _resolve_target_workspace(db, current_user, payload.workspace_id)
+    imported = await import_gitlab_notebook(payload.url, payload.pat)
 
     notebook = Notebook(
-        user_id=current_user.id,
+        workspace_id=workspace_id,
+        created_by=current_user.id,
         title=imported.title,
-        visibility=NotebookVisibility.DRAFT,
+        visibility=NotebookVisibility.PRIVATE,
     )
     db.add(notebook)
     await db.flush()
     await storage.put(notebook, imported.source)
     await db.commit()
     await db.refresh(notebook)
-    return await _notebook_out(db, notebook, current_user, storage)
+    return await _notebook_out(db, notebook, current_user, storage, include_source=True)
 
 
 @router.get("/{notebook_id}", response_model=NotebookOut, response_model_exclude_unset=True)
 async def get_notebook(
-    notebook_id: UUID,
+    ctx: NotebookRead,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User | None, Depends(get_current_user_optional)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> NotebookOut:
     """Return a single notebook visible to the caller."""
-    notebook = await _get_visible_notebook(db, notebook_id, current_user)
-    return await _notebook_out(db, notebook, current_user, storage)
+    return await _notebook_out(db, ctx.notebook, ctx.actor, storage, include_source=True)
 
 
 @router.post(
@@ -250,20 +285,23 @@ async def get_notebook(
 )
 async def fork_notebook(
     notebook_id: UUID,
+    payload: NotebookFork,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> NotebookOut:
-    """Fork a visible notebook into a new draft owned by the caller."""
-    source = await _get_visible_notebook(db, notebook_id, current_user)
+    """Fork a readable notebook into a new private notebook in the chosen workspace."""
+    source, _ = await load_notebook_for(db, notebook_id, current_user, Action.READ)
+    target_workspace_id = await _resolve_target_workspace(db, current_user, payload.workspace_id)
     source_code = await storage.get(source)
     fork = Notebook(
-        user_id=current_user.id,
+        workspace_id=target_workspace_id,
+        created_by=current_user.id,
         parent_id=source.id,
         title=source.title,
         description=source.description,
         tags=list(source.tags),
-        visibility=NotebookVisibility.DRAFT,
+        visibility=NotebookVisibility.PRIVATE,
     )
     db.add(fork)
     await db.flush()
@@ -273,19 +311,18 @@ async def fork_notebook(
     )
     await db.commit()
     await db.refresh(fork)
-    return await _notebook_out(db, fork, current_user, storage)
+    return await _notebook_out(db, fork, current_user, storage, include_source=True)
 
 
 @router.put("/{notebook_id}", response_model=NotebookOut, response_model_exclude_unset=True)
 async def update_notebook(
-    notebook_id: UUID,
+    ctx: NotebookWrite,
     payload: NotebookUpdate,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> NotebookOut:
-    """Apply a partial update to a notebook owned by the caller."""
-    notebook = await _get_owned_notebook(db, notebook_id, current_user)
+    """Apply a partial update to a notebook the caller can edit."""
+    notebook = ctx.notebook
     fields = payload.model_fields_set
 
     if "title" in fields and payload.title is not None:
@@ -300,20 +337,18 @@ async def update_notebook(
     db.add(notebook)
     await db.commit()
     await db.refresh(notebook)
-    return await _notebook_out(db, notebook, current_user, storage)
+    return await _notebook_out(db, notebook, ctx.actor, storage, include_source=True)
 
 
 @router.delete("/{notebook_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 async def delete_notebook(
-    notebook_id: UUID,
+    ctx: NotebookWrite,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> Response:
-    """Delete a notebook owned by the caller."""
-    notebook = await _get_owned_notebook(db, notebook_id, current_user)
-    await storage.delete(notebook.id)
-    await db.delete(notebook)
+    """Delete a notebook the caller can edit."""
+    await storage.delete(ctx.notebook.id)
+    await db.delete(ctx.notebook)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -322,23 +357,22 @@ async def delete_notebook(
     "/{notebook_id}/publish", response_model=NotebookOut, response_model_exclude_unset=True
 )
 async def publish_notebook(
-    notebook_id: UUID,
+    ctx: NotebookWrite,
     payload: NotebookPublish,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
     embeddings: Annotated[EmbeddingService, Depends(get_embedding_service)],
 ) -> NotebookOut:
-    """Change a notebook's visibility, computing its embedding when published."""
-    notebook = await _get_owned_notebook(db, notebook_id, current_user)
-    leaving_draft = (
-        notebook.visibility == NotebookVisibility.DRAFT
-        and payload.visibility != NotebookVisibility.DRAFT
+    """Change a notebook's visibility, computing its embedding when leaving private."""
+    notebook = ctx.notebook
+    leaving_private = (
+        notebook.visibility == NotebookVisibility.PRIVATE
+        and payload.visibility != NotebookVisibility.PRIVATE
     )
     notebook.visibility = payload.visibility
-    if leaving_draft:
+    if leaving_private:
         notebook.embedding = await embeddings.embed(_embedding_text(notebook))
     db.add(notebook)
     await db.commit()
     await db.refresh(notebook)
-    return await _notebook_out(db, notebook, current_user, storage)
+    return await _notebook_out(db, notebook, ctx.actor, storage, include_source=True)

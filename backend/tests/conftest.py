@@ -90,7 +90,10 @@ async def db_session(test_database_url: str) -> AsyncGenerator[AsyncSession, Non
 
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE notebook_data, deployments, notebooks, users RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE notebook_data, deployments, notebooks, workspace_members, "
+                "workspaces, identities, local_credentials, users RESTART IDENTITY CASCADE"
+            )
         )
 
     async with sessionmaker() as session:
@@ -99,7 +102,10 @@ async def db_session(test_database_url: str) -> AsyncGenerator[AsyncSession, Non
 
     async with engine.begin() as conn:
         await conn.execute(
-            text("TRUNCATE notebook_data, deployments, notebooks, users RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE notebook_data, deployments, notebooks, workspace_members, "
+                "workspaces, identities, local_credentials, users RESTART IDENTITY CASCADE"
+            )
         )
 
     await engine.dispose()

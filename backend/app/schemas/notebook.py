@@ -13,6 +13,7 @@ class NotebookCreate(BaseModel):
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
     source: str | None = None
+    workspace_id: UUID
 
 
 class NotebookImport(BaseModel):
@@ -20,6 +21,13 @@ class NotebookImport(BaseModel):
 
     url: str = Field(min_length=1)
     pat: str | None = None
+    workspace_id: UUID
+
+
+class NotebookFork(BaseModel):
+    """Request body naming the target workspace for a fork."""
+
+    workspace_id: UUID
 
 
 class NotebookUpdate(BaseModel):
@@ -46,14 +54,15 @@ class NotebookPublish(BaseModel):
 
 
 class NotebookOut(BaseModel):
-    """Public representation of a notebook, including parent/fork metadata."""
+    """Public representation of a notebook."""
 
     id: UUID
-    user_id: UUID
+    workspace_id: UUID
+    created_by: UUID | None
     parent_id: UUID | None
     parent_title: str | None = None
-    parent_owner_id: UUID | None = None
-    parent_owner_username: str | None = None
+    parent_workspace_id: UUID | None = None
+    parent_workspace_slug: str | None = None
     title: str
     description: str | None
     tags: list[str]

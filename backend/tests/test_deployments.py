@@ -1,11 +1,10 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import http.server
 import socket
 import socketserver
 import threading
-from types import SimpleNamespace
 from typing import cast, override
 from uuid import UUID, uuid4
 
@@ -13,34 +12,32 @@ from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deployments as deployments_module
-from app.core.config import Settings
+from app.api.deployments import resolved_status
 from app.db.database import get_db
 from app.main import app
-from app.models import Deployment, DeploymentStatus, Notebook, User
+from app.models import Deployment, DeploymentStatus, Notebook, User, Workspace
 from app.schemas.deployment import SLUG_MESSAGE
 from app.services import marimo_proxy
-from app.services.deployment_lifecycle import (
-    IdleDeploymentReaper,
-    mark_running_deployments_sleeping,
-)
-from app.services.process_manager import (
+from app.services.session_manager import (
     NotebookStartupError,
-    ProcessManager,
     SessionCapacityError,
     SessionInfo,
+    SessionManager,
+    SessionMode,
+    SessionPhase,
     SessionStartError,
     SessionTarget,
-    get_process_manager,
+    get_session_manager,
 )
-from test_notebooks import create_notebook, register_and_login
+from test_notebooks import create_notebook, publish_notebook, register_and_login
 
-# Fake credentials, routed through constants so the values are never string
-# literals at sensitive call sites.
-_FAKE_HASH = "hash"
+# A fake upstream access token, routed through a constant so the value is never a
+# string literal at the sensitive call site below.
 _UPSTREAM_AUTH = "secret"
 
 
@@ -51,7 +48,7 @@ class _UpstreamServer:
     base_url: str
 
 
-class FakeDeploymentProcessManager:
+class FakeDeploymentSessionManager:
     def __init__(self, upstream_base_url: str = "http://127.0.0.1:1") -> None:
         super().__init__()
         self.upstream_base_url = upstream_base_url
@@ -71,8 +68,7 @@ class FakeDeploymentProcessManager:
             id=deployment_id,
             notebook_id=notebook.id,
             mode="deploy",
-            port=9000,
-            pid=123,
+            phase=SessionPhase.READY,
             last_active=datetime.now(UTC),
             creator_id=None,
         )
@@ -85,19 +81,27 @@ class FakeDeploymentProcessManager:
         self.spawned.append((notebook.id, deployment_id, slug))
         return session
 
-    def target(self, session_id: UUID) -> SessionTarget | None:
+    async def spawn(
+        self, notebook: Notebook, mode: SessionMode, creator_id: UUID | None = None
+    ) -> SessionInfo:
+        raise NotImplementedError
+
+    async def target(self, session_id: UUID) -> SessionTarget | None:
         return self.targets.get(session_id)
 
-    def get(self, session_id: UUID) -> SessionInfo | None:
+    async def get(self, session_id: UUID) -> SessionInfo | None:
         return self.sessions.get(session_id)
 
-    def touch(self, session_id: UUID) -> None:
+    async def mark_active(self, session_id: UUID) -> None:
         self.touches.append(session_id)
 
     async def stop(self, session_id: UUID) -> None:
         self.stopped.append(session_id)
         self.sessions.pop(session_id, None)
         self.targets.pop(session_id, None)
+
+    async def shutdown(self) -> None:
+        return None
 
 
 class _ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -202,21 +206,103 @@ def upstream_http_server() -> Iterator[_UpstreamServer]:
 @pytest.fixture
 def fake_deployment_manager(
     upstream_http_server: _UpstreamServer,
-) -> Iterator[FakeDeploymentProcessManager]:
-    manager = FakeDeploymentProcessManager(upstream_http_server.base_url)
-    app.dependency_overrides[get_process_manager] = lambda: manager
+) -> Iterator[FakeDeploymentSessionManager]:
+    manager = FakeDeploymentSessionManager(upstream_http_server.base_url)
+    app.dependency_overrides[get_session_manager] = lambda: manager
     try:
         yield manager
     finally:
-        app.dependency_overrides.pop(get_process_manager, None)
+        app.dependency_overrides.pop(get_session_manager, None)
+
+
+class _ProjectionManager:
+    """A `get`-only `SessionManager` double for `resolved_status` projection tests."""
+
+    def __init__(self, info: SessionInfo | None) -> None:
+        self.info = info
+        self.get_calls: list[UUID] = []
+
+    async def get(self, session_id: UUID) -> SessionInfo | None:
+        self.get_calls.append(session_id)
+        return self.info
+
+
+def _live_info(deployment: Deployment, phase: SessionPhase) -> SessionInfo:
+    return SessionInfo(
+        id=deployment.id,
+        notebook_id=deployment.notebook_id,
+        mode="deploy",
+        phase=phase,
+        last_active=datetime.now(UTC),
+        creator_id=None,
+    )
 
 
 @pytest.mark.asyncio
-async def test_deploy_creation_enforces_owner_and_unique_slug(api_client: AsyncClient) -> None:
-    _, owner_headers = await register_and_login(api_client, "deploy-owner")
-    _, other_headers = await register_and_login(api_client, "deploy-other")
-    owner_notebook = await create_notebook(api_client, owner_headers, "CPU Dashboard", "x = 1")
-    other_notebook = await create_notebook(api_client, other_headers, "Memory Dashboard", "x = 2")
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        (SessionPhase.READY, DeploymentStatus.RUNNING),
+        (SessionPhase.STARTING, DeploymentStatus.SLEEPING),
+        (SessionPhase.SLEEPING, DeploymentStatus.SLEEPING),
+        (SessionPhase.FAILED, DeploymentStatus.SLEEPING),
+    ],
+)
+async def test_resolved_status_reads_through_live_phase(
+    phase: SessionPhase, expected: DeploymentStatus
+) -> None:
+    deployment = Deployment(
+        id=uuid4(), notebook_id=uuid4(), slug="phase-slug", status=DeploymentStatus.SLEEPING
+    )
+    manager = _ProjectionManager(_live_info(deployment, phase))
+
+    result = await resolved_status(cast("SessionManager", manager), deployment)
+
+    assert result == expected
+    assert manager.get_calls == [deployment.id]
+
+
+@pytest.mark.asyncio
+async def test_resolved_status_treats_unknown_runtime_as_sleeping() -> None:
+    deployment = Deployment(
+        id=uuid4(), notebook_id=uuid4(), slug="unknown-slug", status=DeploymentStatus.SLEEPING
+    )
+    manager = _ProjectionManager(None)
+
+    result = await resolved_status(cast("SessionManager", manager), deployment)
+
+    assert result == DeploymentStatus.SLEEPING
+    assert manager.get_calls == [deployment.id]
+
+
+@pytest.mark.asyncio
+async def test_resolved_status_stopped_short_circuits_without_manager_call() -> None:
+    deployment = Deployment(
+        id=uuid4(), notebook_id=uuid4(), slug="stopped-slug", status=DeploymentStatus.STOPPED
+    )
+    manager = _ProjectionManager(_live_info(deployment, SessionPhase.READY))
+
+    result = await resolved_status(cast("SessionManager", manager), deployment)
+
+    assert result == DeploymentStatus.STOPPED
+    assert manager.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_deploy_creation_enforces_write_access_and_unique_slug(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "deploy-owner")
+    _, other_headers, other_ws = await register_and_login(api_client, db_session, "deploy-other")
+    owner_notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "CPU Dashboard", "x = 1"
+    )
+    other_notebook = await create_notebook(
+        api_client, other_headers, other_ws, "Memory Dashboard", "x = 2"
+    )
+    # Published so a non-member's deploy attempt exercises the write-role check (401/403)
+    # rather than the private-notebook existence-hiding check (404).
+    await publish_notebook(api_client, owner_headers, str(owner_notebook["id"]), "public")
 
     anonymous = await api_client.post(
         f"/api/notebooks/{owner_notebook['id']}/deploy", json={"slug": "cpu"}
@@ -249,9 +335,15 @@ async def test_deploy_creation_enforces_owner_and_unique_slug(api_client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_deploy_creation_allows_omitted_body(api_client: AsyncClient) -> None:
-    _, owner_headers = await register_and_login(api_client, "deploy-empty-body")
-    notebook = await create_notebook(api_client, owner_headers, "Empty Body Deploy", "x = 1")
+async def test_deploy_creation_allows_omitted_body(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "deploy-empty-body"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Empty Body Deploy", "x = 1"
+    )
 
     response = await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy", headers=owner_headers
@@ -266,9 +358,11 @@ async def test_deploy_creation_allows_omitted_body(api_client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
-async def test_deploy_rejects_invalid_slug_with_friendly_message(api_client: AsyncClient) -> None:
-    _, owner_headers = await register_and_login(api_client, "deploy-bad-slug")
-    notebook = await create_notebook(api_client, owner_headers, "Bad Slug", "x = 1")
+async def test_deploy_rejects_invalid_slug_with_friendly_message(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "deploy-bad-slug")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Bad Slug", "x = 1")
 
     response = await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
@@ -284,16 +378,19 @@ async def test_deploy_rejects_invalid_slug_with_friendly_message(api_client: Asy
 
 @pytest.mark.asyncio
 async def test_deployment_table_allows_only_one_row_per_notebook(db_session: AsyncSession) -> None:
-    user = User(
+    user = User(id=uuid4(), username="single-deploy-owner", email="single-deploy@example.com")
+    workspace = Workspace(id=uuid4(), slug="single-deploy-ws", name="single-deploy-ws")
+    notebook = Notebook(
         id=uuid4(),
-        username="single-deploy-owner",
-        email="single-deploy@example.com",
-        password_hash=_FAKE_HASH,
+        workspace_id=workspace.id,
+        created_by=user.id,
+        title="Single Deploy",
+        source="x = 1",
     )
-    notebook = Notebook(id=uuid4(), user_id=user.id, title="Single Deploy", source="x = 1")
     db_session.add_all(
         [
             user,
+            workspace,
             notebook,
             Deployment(notebook_id=notebook.id, slug="single-deploy"),
             Deployment(notebook_id=notebook.id, slug="single-deploy-2"),
@@ -305,9 +402,13 @@ async def test_deployment_table_allows_only_one_row_per_notebook(db_session: Asy
 
 
 @pytest.mark.asyncio
-async def test_generated_deployment_slug_is_bounded(api_client: AsyncClient) -> None:
-    _, owner_headers = await register_and_login(api_client, "deploy-long-slug")
-    notebook = await create_notebook(api_client, owner_headers, "A" * 300, "x = 1")
+async def test_generated_deployment_slug_is_bounded(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "deploy-long-slug"
+    )
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "A" * 300, "x = 1")
 
     response = await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy", headers=owner_headers
@@ -322,11 +423,12 @@ async def test_generated_deployment_slug_is_bounded(api_client: AsyncClient) -> 
 @pytest.mark.asyncio
 async def test_first_deployment_request_wakes_and_proxies_original_request(
     api_client: AsyncClient,
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
     upstream_http_server: _UpstreamServer,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "wake-owner")
-    notebook = await create_notebook(api_client, owner_headers, "Wake Notebook", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "wake-owner")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Wake Notebook", "x = 1")
     deploy = await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
         headers=owner_headers,
@@ -359,13 +461,18 @@ async def test_first_deployment_request_wakes_and_proxies_original_request(
 @pytest.mark.asyncio
 async def test_deployment_root_follows_marimo_auth_redirect(
     api_client: AsyncClient,
+    db_session: AsyncSession,
     redirecting_upstream_http_server: _UpstreamServer,
 ) -> None:
-    manager = FakeDeploymentProcessManager(redirecting_upstream_http_server.base_url)
-    app.dependency_overrides[get_process_manager] = lambda: manager
+    manager = FakeDeploymentSessionManager(redirecting_upstream_http_server.base_url)
+    app.dependency_overrides[get_session_manager] = lambda: manager
     try:
-        _, owner_headers = await register_and_login(api_client, "redirect-root-owner")
-        notebook = await create_notebook(api_client, owner_headers, "Redirect Root", "x = 1")
+        _, owner_headers, owner_ws = await register_and_login(
+            api_client, db_session, "redirect-root-owner"
+        )
+        notebook = await create_notebook(
+            api_client, owner_headers, owner_ws, "Redirect Root", "x = 1"
+        )
         await api_client.post(
             f"/api/notebooks/{notebook['id']}/deploy",
             headers=owner_headers,
@@ -374,7 +481,7 @@ async def test_deployment_root_follows_marimo_auth_redirect(
 
         response = await api_client.get("/api/deployments/redirect-root")
     finally:
-        app.dependency_overrides.pop(get_process_manager, None)
+        app.dependency_overrides.pop(get_session_manager, None)
 
     assert response.status_code == 200
     assert response.content == b"deployment-html"
@@ -388,12 +495,17 @@ async def test_deployment_root_follows_marimo_auth_redirect(
 @pytest.mark.asyncio
 async def test_deployment_proxy_forwards_body_for_non_post_methods(
     api_client: AsyncClient,
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
     upstream_http_server: _UpstreamServer,
     method: str,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, f"body-{method.lower()}")
-    notebook = await create_notebook(api_client, owner_headers, "Body Method Deploy", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, f"body-{method.lower()}"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Body Method Deploy", "x = 1"
+    )
     await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
         headers=owner_headers,
@@ -419,16 +531,12 @@ async def test_deployment_proxy_forwards_body_for_non_post_methods(
 
 
 def test_deployment_websocket_wakes_and_relays_to_upstream(
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    fake_deployment_manager: FakeDeploymentSessionManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    user = User(
-        id=uuid4(),
-        username="deploy-ws-owner",
-        email="deploy-ws@example.com",
-        password_hash=_FAKE_HASH,
+    notebook = Notebook(
+        id=uuid4(), workspace_id=uuid4(), title="WebSocket Deploy", source="x = 1"
     )
-    notebook = Notebook(id=uuid4(), user_id=user.id, title="WebSocket Deploy", source="x = 1")
     deployment = Deployment(
         id=uuid4(),
         notebook_id=notebook.id,
@@ -436,30 +544,19 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
         status=DeploymentStatus.SLEEPING,
     )
     relayed: list[str] = []
-    woke: list[UUID] = []
-    fake_deployment_manager.targets[deployment.id] = SessionTarget(
-        http_base_url="http://127.0.0.1:9000/api/deployments/ws-deploy",
-        ws_base_url="ws://127.0.0.1:9000/api/deployments/ws-deploy",
-        access_token=_UPSTREAM_AUTH,
-    )
 
-    async def fake_load_deployment(db: object, slug: str) -> tuple[Deployment, Notebook]:
+    async def fake_load_active_deployment(db: object, slug: str) -> tuple[Deployment, Notebook]:
         assert slug == "ws-deploy"
         return deployment, notebook
-
-    async def fake_wake_deployment(
-        db: object, manager: object, loaded_deployment: Deployment, loaded_notebook: object
-    ) -> None:
-        woke.append(loaded_deployment.id)
 
     async def fake_relay(
         websocket: WebSocket,
         target_url: str,
-        manager: FakeDeploymentProcessManager,
+        manager: FakeDeploymentSessionManager,
         deployment_id: UUID,
     ) -> None:
         relayed.append(target_url)
-        manager.touch(deployment_id)
+        await manager.mark_active(deployment_id)
         await websocket.accept()
         await websocket.close()
 
@@ -470,9 +567,8 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
         async def commit(self) -> None:
             return None
 
-    monkeypatch.setattr(deployments_module, "_load_deployment", fake_load_deployment)
-    monkeypatch.setattr(deployments_module, "_wake_deployment", fake_wake_deployment)
-    monkeypatch.setattr(marimo_proxy, "relay_websocket", fake_relay)
+    monkeypatch.setattr(deployments_module, "_load_active_deployment", fake_load_active_deployment)
+    monkeypatch.setattr(marimo_proxy, "_relay_websocket", fake_relay)
     app.dependency_overrides[get_db] = FakeDb
     client = TestClient(app)
     try:
@@ -481,20 +577,25 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
     finally:
         app.dependency_overrides.pop(get_db, None)
 
-    assert woke == [deployment.id]
+    # No target is registered for the deployment yet, so the resolver's fast-path
+    # probe misses and it wakes via the manager's idempotent spawn_deployment.
+    assert fake_deployment_manager.spawned == [(notebook.id, deployment.id, "ws-deploy")]
     assert relayed == [
         "ws://127.0.0.1:9000/api/deployments/ws-deploy/ws?client=browser&access_token=secret"
     ]
-    assert fake_deployment_manager.touches == [deployment.id]
+    # One mark_active at connect (the gateway's connect edge) plus one from the frame
+    # the fake relay simulates.
+    assert fake_deployment_manager.touches == [deployment.id, deployment.id]
 
 
 @pytest.mark.asyncio
 async def test_deployment_wake_failure_surfaces_actionable_detail(
     api_client: AsyncClient,
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "wake-fail-owner")
-    notebook = await create_notebook(api_client, owner_headers, "Wake Fail", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "wake-fail-owner")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Wake Fail", "x = 1")
     await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
         headers=owner_headers,
@@ -513,10 +614,13 @@ async def test_deployment_wake_failure_surfaces_actionable_detail(
 @pytest.mark.asyncio
 async def test_deployment_wake_startup_failure_is_not_retryable(
     api_client: AsyncClient,
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "wake-startup-owner")
-    notebook = await create_notebook(api_client, owner_headers, "Wake Startup", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "wake-startup-owner"
+    )
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Wake Startup", "x = 1")
     await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
         headers=owner_headers,
@@ -537,34 +641,184 @@ async def test_deployment_wake_startup_failure_is_not_retryable(
 
 
 @pytest.mark.asyncio
-async def test_deployment_wake_capacity_failure_returns_capacity_detail(
+async def test_deployment_wake_capacity_failure_propagates_untouched(
     api_client: AsyncClient,
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "wake-capacity-owner")
-    notebook = await create_notebook(api_client, owner_headers, "Wake Capacity", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "wake-capacity-owner"
+    )
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Wake Capacity", "x = 1")
     await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
         headers=owner_headers,
         json={"slug": "wake-capacity"},
     )
-    fake_deployment_manager.spawn_error = SessionCapacityError("full")
+    fake_deployment_manager.spawn_error = SessionCapacityError(
+        "Maximum concurrent sessions reached"
+    )
 
     response = await api_client.get("/api/deployments/wake-capacity")
 
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Deployment is at capacity. Try again shortly."
+    # The resolver lets SessionManagerError propagate untouched; SessionCapacityError's own
+    # status/detail render via the shared DomainError handler, not a resolver-local remap.
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Maximum concurrent sessions reached"
 
 
 @pytest.mark.asyncio
-async def test_delete_deployment_requires_owner_stops_runtime_and_marks_stopped(
+async def test_failed_wake_never_persists_running(
     api_client: AsyncClient,
     db_session: AsyncSession,
-    fake_deployment_manager: FakeDeploymentProcessManager,
+    fake_deployment_manager: FakeDeploymentSessionManager,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "delete-owner")
-    _, other_headers = await register_and_login(api_client, "delete-other")
-    notebook = await create_notebook(api_client, owner_headers, "Delete Deploy", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "wake-never-running-owner"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Wake Never Running", "x = 1"
+    )
+    await api_client.post(
+        f"/api/notebooks/{notebook['id']}/deploy",
+        headers=owner_headers,
+        json={"slug": "wake-never-running"},
+    )
+    fake_deployment_manager.spawn_error = SessionStartError(
+        "did not become ready", detail="Deployment did not start in time."
+    )
+
+    response = await api_client.get("/api/deployments/wake-never-running")
+    assert response.status_code == 503
+
+    deployment = await db_session.scalar(
+        select(Deployment).where(Deployment.slug == "wake-never-running")
+    )
+    assert deployment is not None
+    assert deployment.status == DeploymentStatus.SLEEPING
+
+    read_model = await api_client.get(
+        f"/api/notebooks/{notebook['id']}/deployment", headers=owner_headers
+    )
+    assert read_model.status_code == 200
+    assert read_model.json()["status"] == "sleeping"
+
+
+@pytest.mark.asyncio
+async def test_get_notebook_deployment_reports_running_after_wake(
+    api_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "read-model-running-owner"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Read Model Running", "x = 1"
+    )
+    await api_client.post(
+        f"/api/notebooks/{notebook['id']}/deploy",
+        headers=owner_headers,
+        json={"slug": "read-model-running"},
+    )
+    await api_client.get("/api/deployments/read-model-running")
+
+    response = await api_client.get(
+        f"/api/notebooks/{notebook['id']}/deployment", headers=owner_headers
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_get_notebook_deployment_reports_stopped_without_waking(
+    api_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "read-model-stopped-owner"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Read Model Stopped", "x = 1"
+    )
+    await api_client.post(
+        f"/api/notebooks/{notebook['id']}/deploy",
+        headers=owner_headers,
+        json={"slug": "read-model-stopped"},
+    )
+    await api_client.delete("/api/deployments/read-model-stopped", headers=owner_headers)
+
+    response = await api_client.get(
+        f"/api/notebooks/{notebook['id']}/deployment", headers=owner_headers
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "stopped"
+    assert fake_deployment_manager.spawned == []
+
+
+@pytest.mark.asyncio
+async def test_get_notebook_deployment_requires_view_access(
+    api_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "read-model-visibility-owner"
+    )
+    _, other_headers, _ = await register_and_login(
+        api_client, db_session, "read-model-visibility-other"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Read Model Visibility", "x = 1"
+    )
+    await api_client.post(
+        f"/api/notebooks/{notebook['id']}/deploy",
+        headers=owner_headers,
+        json={"slug": "read-model-visibility"},
+    )
+
+    anonymous = await api_client.get(f"/api/notebooks/{notebook['id']}/deployment")
+    other = await api_client.get(
+        f"/api/notebooks/{notebook['id']}/deployment", headers=other_headers
+    )
+    owner = await api_client.get(
+        f"/api/notebooks/{notebook['id']}/deployment", headers=owner_headers
+    )
+
+    assert anonymous.status_code == 404
+    assert other.status_code == 404
+    assert owner.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_get_notebook_deployment_404_when_none_exists(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "no-deploy-owner")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "No Deploy", "x = 1")
+
+    response = await api_client.get(
+        f"/api/notebooks/{notebook['id']}/deployment", headers=owner_headers
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_deployment_requires_write_access_stops_runtime_and_marks_stopped(
+    api_client: AsyncClient,
+    db_session: AsyncSession,
+    fake_deployment_manager: FakeDeploymentSessionManager,
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "delete-owner")
+    _, other_headers, _ = await register_and_login(api_client, db_session, "delete-other")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Delete Deploy", "x = 1")
+    # Published so a non-member's delete attempt exercises the write-role check (401/403)
+    # rather than the private-notebook existence-hiding check (404).
+    await publish_notebook(api_client, owner_headers, str(notebook["id"]), "public")
     await api_client.post(
         f"/api/notebooks/{notebook['id']}/deploy",
         headers=owner_headers,
@@ -588,134 +842,23 @@ async def test_delete_deployment_requires_owner_stops_runtime_and_marks_stopped(
 
 
 @pytest.mark.asyncio
-async def test_idle_reaper_sleeps_idle_running_deployments(
+async def test_delete_already_stopped_deployment_is_idempotent(
+    api_client: AsyncClient,
     db_session: AsyncSession,
-    test_database_url: str,
+    fake_deployment_manager: FakeDeploymentSessionManager,
 ) -> None:
-    user = User(
-        id=uuid4(), username="idle-owner", email="idle@example.com", password_hash=_FAKE_HASH
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "double-delete-owner"
     )
-    notebook = Notebook(id=uuid4(), user_id=user.id, title="Idle", source="x = 1")
-    deployment = Deployment(
-        id=uuid4(),
-        notebook_id=notebook.id,
-        slug="idle",
-        status=DeploymentStatus.RUNNING,
-        port=9000,
-        last_active=datetime.now(UTC) - timedelta(minutes=2),
-    )
-    db_session.add_all([user, notebook, deployment])
-    await db_session.commit()
-    manager = FakeDeploymentProcessManager()
-    manager.sessions[deployment.id] = SessionInfo(
-        id=deployment.id,
-        notebook_id=notebook.id,
-        mode="deploy",
-        port=9000,
-        pid=123,
-        last_active=datetime.now(UTC) - timedelta(minutes=2),
-        creator_id=None,
-    )
-    manager.targets[deployment.id] = SessionTarget(
-        http_base_url="http://127.0.0.1:9000/api/deployments/idle",
-        ws_base_url="ws://127.0.0.1:9000/api/deployments/idle",
-        access_token=_UPSTREAM_AUTH,
-    )
-    engine = create_async_engine(test_database_url, pool_pre_ping=True)
-    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-    reaper = IdleDeploymentReaper(
-        sessionmaker=sessionmaker,
-        manager=cast("ProcessManager", manager),
-        settings=cast("Settings", SimpleNamespace(IDLE_TIMEOUT_MINUTES=1)),
-        interval_seconds=0.01,
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Double Delete", "x = 1")
+    await api_client.post(
+        f"/api/notebooks/{notebook['id']}/deploy",
+        headers=owner_headers,
+        json={"slug": "double-delete"},
     )
 
-    await reaper.reap_once()
-    await engine.dispose()
-    await db_session.refresh(deployment)
+    first = await api_client.delete("/api/deployments/double-delete", headers=owner_headers)
+    second = await api_client.delete("/api/deployments/double-delete", headers=owner_headers)
 
-    assert manager.stopped == [deployment.id]
-    assert deployment.status == DeploymentStatus.SLEEPING
-    assert deployment.port is None
-
-
-@pytest.mark.asyncio
-async def test_idle_reaper_keeps_recently_active_live_deployment(
-    db_session: AsyncSession,
-    test_database_url: str,
-) -> None:
-    user = User(
-        id=uuid4(), username="active-owner", email="active@example.com", password_hash=_FAKE_HASH
-    )
-    notebook = Notebook(id=uuid4(), user_id=user.id, title="Active", source="x = 1")
-    deployment = Deployment(
-        id=uuid4(),
-        notebook_id=notebook.id,
-        slug="active",
-        status=DeploymentStatus.RUNNING,
-        port=9000,
-        last_active=datetime.now(UTC) - timedelta(minutes=2),
-    )
-    db_session.add_all([user, notebook, deployment])
-    await db_session.commit()
-    manager = FakeDeploymentProcessManager()
-    manager.sessions[deployment.id] = SessionInfo(
-        id=deployment.id,
-        notebook_id=notebook.id,
-        mode="deploy",
-        port=9000,
-        pid=123,
-        last_active=datetime.now(UTC),
-        creator_id=None,
-    )
-    manager.targets[deployment.id] = SessionTarget(
-        http_base_url="http://127.0.0.1:9000/api/deployments/active",
-        ws_base_url="ws://127.0.0.1:9000/api/deployments/active",
-        access_token=_UPSTREAM_AUTH,
-    )
-    engine = create_async_engine(test_database_url, pool_pre_ping=True)
-    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-    reaper = IdleDeploymentReaper(
-        sessionmaker=sessionmaker,
-        manager=cast("ProcessManager", manager),
-        settings=cast("Settings", SimpleNamespace(IDLE_TIMEOUT_MINUTES=1)),
-        interval_seconds=0.01,
-    )
-
-    await reaper.reap_once()
-    await engine.dispose()
-    await db_session.refresh(deployment)
-
-    assert manager.stopped == []
-    assert deployment.status == DeploymentStatus.RUNNING
-    assert deployment.port == 9000
-    assert deployment.last_active == manager.sessions[deployment.id].last_active
-
-
-@pytest.mark.asyncio
-async def test_startup_marks_running_deployments_sleeping(
-    db_session: AsyncSession, test_database_url: str
-) -> None:
-    user = User(
-        id=uuid4(), username="startup-owner", email="startup@example.com", password_hash=_FAKE_HASH
-    )
-    notebook = Notebook(id=uuid4(), user_id=user.id, title="Startup", source="x = 1")
-    deployment = Deployment(
-        id=uuid4(),
-        notebook_id=notebook.id,
-        slug="startup",
-        status=DeploymentStatus.RUNNING,
-        port=9000,
-        last_active=datetime.now(UTC),
-    )
-    db_session.add_all([user, notebook, deployment])
-    await db_session.commit()
-    engine = create_async_engine(test_database_url, pool_pre_ping=True)
-    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-
-    await mark_running_deployments_sleeping(sessionmaker)
-    await engine.dispose()
-    await db_session.refresh(deployment)
-
-    assert deployment.status == DeploymentStatus.SLEEPING
-    assert deployment.port is None
+    assert first.status_code == 204
+    assert second.status_code == 204

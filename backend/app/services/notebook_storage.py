@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import override
+from typing import Annotated, override
 from uuid import UUID
 
+from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
+from app.db.database import get_db
 from app.models import Notebook
 
 
@@ -52,3 +55,14 @@ class PostgresNotebookStorage(NotebookStorageService):
         if notebook is not None:
             notebook.source = None
             self.db.add(notebook)
+
+
+def get_notebook_storage(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> NotebookStorageService:
+    """Select the configured notebook storage backend for this request."""
+    # NOTEBOOK_STORAGE_BACKEND is a one-value Literal today; the branch grows
+    # when an object-store implementation lands.
+    if get_settings().NOTEBOOK_STORAGE_BACKEND == "postgres":
+        return PostgresNotebookStorage(db)
+    raise AssertionError("unreachable: NOTEBOOK_STORAGE_BACKEND is validated at settings load")

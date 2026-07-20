@@ -1,17 +1,20 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import quote, urlencode
 from uuid import UUID
 
-from fastapi import HTTPException, Request, WebSocket, status
+from fastapi import Request, WebSocket, WebSocketDisconnect, status
 import httpx
 from starlette.background import BackgroundTask
 from starlette.responses import Response, StreamingResponse
 import websockets
 from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
 
-from app.services.process_manager import ProcessManager, SessionTarget
+from app.core.errors import DomainError
+from app.services.session_manager import SessionManager, SessionTarget
 
 # The single method allow-list both routers register, and the set whose request
 # body is streamed upstream (every body-capable method, i.e. everything but GET/HEAD).
@@ -28,6 +31,51 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayRoute:
+    """A resolved, routable session: the mark_active + forward/relay key and its upstream."""
+
+    session_id: UUID
+    target: SessionTarget
+
+
+class Resolver(Protocol):
+    """Map one entry-point key to a routable session, waking it if the backend can sleep.
+
+    Raises a `GatewayError` (or a `SessionManagerError` from a wake attempt) when no
+    routable upstream can be produced.
+    """
+
+    async def resolve(self) -> GatewayRoute:
+        """Return a routable session, waking it first if the backend supports sleep."""
+        ...
+
+
+class GatewayError(DomainError):
+    """Base for every gateway resolution/transport failure."""
+
+
+class UpstreamNotFound(GatewayError):  # noqa: N818 -- named for the resolution outcome, not "Error" noise
+    """The entry-point key does not resolve to a routable session (unknown id/slug, stopped)."""
+
+    # `ws_close_code` must be assigned before `status`: once `status` is bound as a class
+    # attribute it shadows the `fastapi.status` module for the rest of this class body.
+    ws_close_code = status.WS_1008_POLICY_VIOLATION
+    status = status.HTTP_404_NOT_FOUND
+
+
+class UpstreamNotReady(GatewayError):  # noqa: N818 -- named for the resolution outcome, not "Error" noise
+    """The upstream exists but is still not serving after a wake attempt."""
+
+    status = status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+class UpstreamUnreachable(GatewayError):  # noqa: N818 -- named for the resolution outcome, not "Error" noise
+    """A transport error occurred reaching a resolved upstream target."""
+
+    status = status.HTTP_502_BAD_GATEWAY
 
 
 class _RawHeaders(Protocol):
@@ -59,7 +107,7 @@ def _filtered_headers(
     ]
 
 
-def build_target_url(
+def _build_target_url(
     base_url: str, path: str, query_string: bytes, access_token: str | None
 ) -> str:
     """Build the upstream URL, appending the access token to the query if given."""
@@ -87,7 +135,7 @@ async def _close_upstream(client: httpx.AsyncClient, response: httpx.Response) -
     await client.aclose()
 
 
-async def forward_http(
+async def _forward_http(
     request: Request,
     target: SessionTarget,
     path: str,
@@ -101,7 +149,7 @@ async def forward_http(
     query_string = cast("bytes", request.scope.get("query_string", b""))
     upstream_request = client.build_request(
         request.method,
-        build_target_url(
+        _build_target_url(
             target.http_base_url,
             path,
             query_string,
@@ -118,9 +166,7 @@ async def forward_http(
         )
     except httpx.HTTPError as exc:
         await client.aclose()
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail="Notebook process is unreachable"
-        ) from exc
+        raise UpstreamUnreachable("Notebook process is unreachable") from exc
 
     if response_body_callback is not None:
         response_body = upstream_response.content
@@ -145,14 +191,14 @@ async def forward_http(
 
 
 async def _client_to_upstream(
-    websocket: WebSocket, upstream: ClientConnection, manager: ProcessManager, session_id: UUID
+    websocket: WebSocket, upstream: ClientConnection, manager: SessionManager, session_id: UUID
 ) -> None:
     while True:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
             await upstream.close()
             return
-        manager.touch(session_id)
+        await manager.mark_active(session_id)
         if "text" in message:
             await upstream.send(cast("str", message["text"]))
         elif "bytes" in message:
@@ -160,18 +206,18 @@ async def _client_to_upstream(
 
 
 async def _upstream_to_client(
-    websocket: WebSocket, upstream: ClientConnection, manager: ProcessManager, session_id: UUID
+    websocket: WebSocket, upstream: ClientConnection, manager: SessionManager, session_id: UUID
 ) -> None:
     async for message in upstream:
-        manager.touch(session_id)
+        await manager.mark_active(session_id)
         if isinstance(message, str):
             await websocket.send_text(message)
         else:
             await websocket.send_bytes(message)
 
 
-async def relay_websocket(
-    websocket: WebSocket, target_url: str, manager: ProcessManager, session_id: UUID
+async def _relay_websocket(
+    websocket: WebSocket, target_url: str, manager: SessionManager, session_id: UUID
 ) -> None:
     """Bridge the client WebSocket to the upstream notebook WebSocket bidirectionally."""
     await websocket.accept()
@@ -184,3 +230,46 @@ async def relay_websocket(
         for task in pending:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def proxy_http(
+    request: Request,
+    manager: SessionManager,
+    resolver: Resolver,
+    path: str,
+    *,
+    response_body_callback: ResponseBodyCallback | None = None,
+    follow_redirects: bool = False,
+) -> Response:
+    """Resolve-or-wake, mark activity, and forward the HTTP request to the upstream session."""
+    route = await resolver.resolve()
+    await manager.mark_active(route.session_id)
+    return await _forward_http(
+        request,
+        route.target,
+        path,
+        response_body_callback=response_body_callback,
+        follow_redirects=follow_redirects,
+    )
+
+
+async def proxy_websocket(
+    websocket: WebSocket, manager: SessionManager, resolver: Resolver
+) -> None:
+    """Resolve-or-wake, mark connect activity, and relay the WebSocket to the upstream session."""
+    try:
+        route = await resolver.resolve()
+    except DomainError as exc:  # GatewayError or a SessionManagerError from a wake
+        await websocket.close(code=exc.ws_close_code)
+        return
+    await manager.mark_active(route.session_id)  # connect edge; _relay_websocket marks per frame
+    target_url = _build_target_url(
+        route.target.ws_base_url,
+        "ws",
+        cast("bytes", websocket.scope.get("query_string", b"")),
+        route.target.access_token,
+    )
+    try:
+        await _relay_websocket(websocket, target_url, manager, route.session_id)
+    except (ConnectionClosed, WebSocketDisconnect, OSError):
+        return

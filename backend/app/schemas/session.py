@@ -2,7 +2,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.services.process_manager import SessionMode
+from app.services.session_manager import SessionMode
 
 
 class SessionCreate(BaseModel):

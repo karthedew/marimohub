@@ -12,18 +12,21 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import app
 from app.models import Notebook
 from app.services import marimo_proxy
-from app.services.process_manager import (
-    ProcessManager,
+from app.services.session_manager import (
     SessionCapacityError,
     SessionInfo,
     SessionMode,
+    SessionNotFoundError,
+    SessionPhase,
     SessionTarget,
-    get_process_manager,
+    get_session_manager,
 )
+from app.services.subprocess_backend import SubprocessSessionManager
 from test_notebooks import create_notebook, publish_notebook, register_and_login
 
 # Fake upstream access tokens, routed through constants so the values are never
@@ -53,7 +56,7 @@ if __name__ == '__main__':
 """
 
 
-class FakeProcessManager:
+class FakeSessionManager:
     def __init__(self) -> None:
         super().__init__()
         self.sessions: dict[UUID, SessionInfo] = {}
@@ -62,7 +65,6 @@ class FakeProcessManager:
         self.stopped: list[UUID] = []
         self.target_response: SessionTarget | None = None
         self.touches: list[UUID] = []
-        self.source_by_session: dict[UUID, str] = {}
 
     async def spawn(
         self, notebook: Notebook, mode: SessionMode, creator_id: UUID | None = None
@@ -74,8 +76,7 @@ class FakeProcessManager:
             id=uuid4(),
             notebook_id=notebook_id,
             mode=mode,
-            port=9000,
-            pid=123,
+            phase=SessionPhase.READY,
             last_active=datetime.now(UTC),
             creator_id=creator_id,
         )
@@ -83,75 +84,85 @@ class FakeProcessManager:
         self.spawned.append((notebook_id, mode, creator_id))
         return session
 
-    def get(self, session_id: UUID) -> SessionInfo | None:
+    async def get(self, session_id: UUID) -> SessionInfo | None:
         return self.sessions.get(session_id)
 
-    def current_source(self, session_id: UUID) -> str | None:
-        return self.source_by_session.get(session_id)
-
     async def stop(self, session_id: UUID) -> None:
+        if session_id not in self.sessions:
+            raise SessionNotFoundError("Session not found")
         self.stopped.append(session_id)
         self.sessions.pop(session_id, None)
 
-    def target(self, session_id: UUID) -> SessionTarget | None:
+    async def target(self, session_id: UUID) -> SessionTarget | None:
         if session_id not in self.sessions:
             return None
         return self.target_response
 
-    def touch(self, session_id: UUID) -> None:
+    async def mark_active(self, session_id: UUID) -> None:
         self.touches.append(session_id)
+
+    async def spawn_deployment(
+        self, notebook: Notebook, deployment_id: UUID, slug: str
+    ) -> SessionInfo:
+        raise NotImplementedError
+
+    async def shutdown(self) -> None:
+        return None
 
 
 @pytest.fixture
-def fake_process_manager() -> Iterator[FakeProcessManager]:
-    manager = FakeProcessManager()
-    app.dependency_overrides[get_process_manager] = lambda: manager
+def fake_session_manager() -> Iterator[FakeSessionManager]:
+    manager = FakeSessionManager()
+    app.dependency_overrides[get_session_manager] = lambda: manager
     try:
         yield manager
     finally:
-        app.dependency_overrides.pop(get_process_manager, None)
+        app.dependency_overrides.pop(get_session_manager, None)
 
 
 @pytest.mark.asyncio
 async def test_create_session_authorizes_edit_and_run_modes(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    db_session: AsyncSession,
+    fake_session_manager: FakeSessionManager,
 ) -> None:
-    owner, owner_headers = await register_and_login(api_client, "owner")
-    _, other_headers = await register_and_login(api_client, "other")
-    draft = await create_notebook(api_client, owner_headers, "Draft", "x = 1")
-    public = await create_notebook(api_client, owner_headers, "Public", "x = 2")
+    owner, owner_headers, owner_ws = await register_and_login(api_client, db_session, "owner")
+    _, other_headers, _ = await register_and_login(api_client, db_session, "other")
+    private = await create_notebook(api_client, owner_headers, owner_ws, "Private", "x = 1")
+    public = await create_notebook(api_client, owner_headers, owner_ws, "Public", "x = 2")
     await publish_notebook(api_client, owner_headers, str(public["id"]), "public")
 
+    # Private notebooks hide their existence from non-members entirely: an anonymous edit
+    # request is denied for the same reason a missing id would be, not because it lacks auth.
     anonymous_edit = await api_client.post(
-        "/api/sessions", json={"notebook_id": draft["id"], "mode": "edit"}
+        "/api/sessions", json={"notebook_id": private["id"], "mode": "edit"}
     )
     other_edit_public = await api_client.post(
         "/api/sessions",
         headers=other_headers,
         json={"notebook_id": public["id"], "mode": "edit"},
     )
-    anonymous_run_draft = await api_client.post(
-        "/api/sessions", json={"notebook_id": draft["id"], "mode": "run"}
+    anonymous_run_private = await api_client.post(
+        "/api/sessions", json={"notebook_id": private["id"], "mode": "run"}
     )
     owner_edit = await api_client.post(
         "/api/sessions",
         headers=owner_headers,
-        json={"notebook_id": draft["id"], "mode": "edit"},
+        json={"notebook_id": private["id"], "mode": "edit"},
     )
     anonymous_run_public = await api_client.post(
         "/api/sessions", json={"notebook_id": public["id"], "mode": "run"}
     )
 
-    assert anonymous_edit.status_code == 401
+    assert anonymous_edit.status_code == 404
     assert other_edit_public.status_code == 403
-    assert anonymous_run_draft.status_code == 404
+    assert anonymous_run_private.status_code == 404
     assert owner_edit.status_code == 201
     assert owner_edit.json()["mode"] == "edit"
     assert owner_edit.json()["proxy_url"].startswith("http://test/api/proxy/")
     assert anonymous_run_public.status_code == 201
-    assert fake_process_manager.spawned == [
-        (UUID(str(draft["id"])), "edit", UUID(str(owner["id"]))),
+    assert fake_session_manager.spawned == [
+        (UUID(str(private["id"])), "edit", UUID(str(owner["id"]))),
         (UUID(str(public["id"])), "run", None),
     ]
 
@@ -159,10 +170,11 @@ async def test_create_session_authorizes_edit_and_run_modes(
 @pytest.mark.asyncio
 async def test_anonymous_run_allows_visible_unlisted_notebooks(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    db_session: AsyncSession,
+    fake_session_manager: FakeSessionManager,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "owner")
-    notebook = await create_notebook(api_client, owner_headers, "Unlisted", "x = 1")
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "owner")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Unlisted", "x = 1")
     await publish_notebook(api_client, owner_headers, str(notebook["id"]), "unlisted")
 
     response = await api_client.post(
@@ -171,17 +183,18 @@ async def test_anonymous_run_allows_visible_unlisted_notebooks(
 
     assert response.status_code == 201
     assert response.json()["notebook_id"] == notebook["id"]
-    assert fake_process_manager.spawned[0][2] is None
+    assert fake_session_manager.spawned[0][2] is None
 
 
 @pytest.mark.asyncio
-async def test_create_session_maps_capacity_errors_to_503(
+async def test_create_session_capacity_error_renders_429(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    db_session: AsyncSession,
+    fake_session_manager: FakeSessionManager,
 ) -> None:
-    _, owner_headers = await register_and_login(api_client, "owner")
-    notebook = await create_notebook(api_client, owner_headers, "Notebook", "x = 1")
-    fake_process_manager.spawn_error = SessionCapacityError("Maximum concurrent sessions reached")
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "owner")
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Notebook", "x = 1")
+    fake_session_manager.spawn_error = SessionCapacityError("Maximum concurrent sessions reached")
 
     response = await api_client.post(
         "/api/sessions",
@@ -189,136 +202,43 @@ async def test_create_session_maps_capacity_errors_to_503(
         json={"notebook_id": notebook["id"], "mode": "edit"},
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Maximum concurrent sessions reached"
 
 
 @pytest.mark.asyncio
-async def test_delete_session_requires_creator(
+async def test_delete_session_ignores_creator_and_actor(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    db_session: AsyncSession,
+    fake_session_manager: FakeSessionManager,
 ) -> None:
-    owner, owner_headers = await register_and_login(api_client, "owner")
-    _, other_headers = await register_and_login(api_client, "other")
+    owner, _, _ = await register_and_login(api_client, db_session, "owner")
     session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
+    fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
         notebook_id=uuid4(),
         mode="run",
-        port=9000,
-        pid=123,
+        phase=SessionPhase.READY,
         last_active=datetime.now(UTC),
         creator_id=UUID(str(owner["id"])),
     )
 
-    anonymous_delete = await api_client.delete(f"/api/sessions/{session_id}")
-    other_delete = await api_client.delete(f"/api/sessions/{session_id}", headers=other_headers)
-    owner_delete = await api_client.delete(f"/api/sessions/{session_id}", headers=owner_headers)
-
-    assert anonymous_delete.status_code == 401
-    assert other_delete.status_code == 403
-    assert owner_delete.status_code == 204
-    assert fake_process_manager.stopped == [session_id]
-
-
-@pytest.mark.asyncio
-async def test_delete_anonymous_session_by_session_id(
-    api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
-) -> None:
-    session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
-        id=session_id,
-        notebook_id=uuid4(),
-        mode="run",
-        port=9000,
-        pid=123,
-        last_active=datetime.now(UTC),
-        creator_id=None,
-    )
-
+    # Neither anonymous nor logged in as anyone in particular; holding the session
+    # id is the sole authorization, so a non-creator, unauthenticated caller succeeds.
     response = await api_client.delete(f"/api/sessions/{session_id}")
 
     assert response.status_code == 204
-    assert fake_process_manager.stopped == [session_id]
+    assert fake_session_manager.stopped == [session_id]
 
 
 @pytest.mark.asyncio
-async def test_ending_edit_session_persists_autosaved_source(
+async def test_delete_unknown_session_returns_404(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    fake_session_manager: FakeSessionManager,
 ) -> None:
-    owner, owner_headers = await register_and_login(api_client, "owner")
-    notebook = await create_notebook(api_client, owner_headers, "Draft", "x = 1")
-    session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
-        id=session_id,
-        notebook_id=UUID(str(notebook["id"])),
-        mode="edit",
-        port=9000,
-        pid=123,
-        last_active=datetime.now(UTC),
-        creator_id=UUID(str(owner["id"])),
-    )
-    fake_process_manager.source_by_session[session_id] = "x = 2  # edited in marimo"
+    response = await api_client.delete(f"/api/sessions/{uuid4()}")
 
-    response = await api_client.delete(f"/api/sessions/{session_id}", headers=owner_headers)
-    assert response.status_code == 204
-
-    reloaded = await api_client.get(f"/api/notebooks/{notebook['id']}", headers=owner_headers)
-    assert reloaded.json()["source"] == "x = 2  # edited in marimo"
-
-
-@pytest.mark.asyncio
-async def test_save_edit_session_persists_without_stopping(
-    api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
-) -> None:
-    owner, owner_headers = await register_and_login(api_client, "save-owner")
-    notebook = await create_notebook(api_client, owner_headers, "Draft", "x = 1")
-    session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
-        id=session_id,
-        notebook_id=UUID(str(notebook["id"])),
-        mode="edit",
-        port=9000,
-        pid=123,
-        last_active=datetime.now(UTC),
-        creator_id=UUID(str(owner["id"])),
-    )
-    fake_process_manager.source_by_session[session_id] = "x = 3  # saved while editing"
-
-    response = await api_client.post(f"/api/sessions/{session_id}/save", headers=owner_headers)
-
-    assert response.status_code == 204
-    assert fake_process_manager.stopped == []
-    reloaded = await api_client.get(f"/api/notebooks/{notebook['id']}", headers=owner_headers)
-    assert reloaded.json()["source"] == "x = 3  # saved while editing"
-
-
-@pytest.mark.asyncio
-async def test_ending_run_session_does_not_modify_source(
-    api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
-) -> None:
-    owner, owner_headers = await register_and_login(api_client, "owner")
-    notebook = await create_notebook(api_client, owner_headers, "Draft", "x = 1")
-    session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
-        id=session_id,
-        notebook_id=UUID(str(notebook["id"])),
-        mode="run",
-        port=9000,
-        pid=123,
-        last_active=datetime.now(UTC),
-        creator_id=UUID(str(owner["id"])),
-    )
-    fake_process_manager.source_by_session[session_id] = "tampered = True"
-
-    response = await api_client.delete(f"/api/sessions/{session_id}", headers=owner_headers)
-    assert response.status_code == 204
-
-    reloaded = await api_client.get(f"/api/notebooks/{notebook['id']}", headers=owner_headers)
-    assert reloaded.json()["source"] == "x = 1"
+    assert response.status_code == 404
 
 
 class _ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -403,20 +323,19 @@ def upstream_http_server() -> Iterator[_UpstreamServer]:
 @pytest.mark.asyncio
 async def test_http_proxy_preserves_query_headers_body_and_touches_session(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    fake_session_manager: FakeSessionManager,
     upstream_http_server: _UpstreamServer,
 ) -> None:
     session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
+    fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
         notebook_id=uuid4(),
         mode="run",
-        port=upstream_http_server.port,
-        pid=123,
+        phase=SessionPhase.READY,
         last_active=datetime.now(UTC),
         creator_id=None,
     )
-    fake_process_manager.target_response = SessionTarget(
+    fake_session_manager.target_response = SessionTarget(
         http_base_url=f"http://127.0.0.1:{upstream_http_server.port}",
         ws_base_url=f"ws://127.0.0.1:{upstream_http_server.port}",
         access_token=_SPACED_AUTH,
@@ -448,27 +367,26 @@ async def test_http_proxy_preserves_query_headers_body_and_touches_session(
         "header": "post-header",
         "body": b"payload",
     }
-    assert fake_process_manager.touches == [session_id, session_id]
+    assert fake_session_manager.touches == [session_id, session_id]
 
 
 @pytest.mark.asyncio
 async def test_http_proxy_preserves_marimo_auth_redirect_and_cookie_headers(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    fake_session_manager: FakeSessionManager,
     upstream_http_server: _UpstreamServer,
 ) -> None:
     session_id = uuid4()
     proxy_base = f"/api/proxy/{session_id}"
-    fake_process_manager.sessions[session_id] = SessionInfo(
+    fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
         notebook_id=uuid4(),
         mode="run",
-        port=upstream_http_server.port,
-        pid=123,
+        phase=SessionPhase.READY,
         last_active=datetime.now(UTC),
         creator_id=None,
     )
-    fake_process_manager.target_response = SessionTarget(
+    fake_session_manager.target_response = SessionTarget(
         http_base_url=f"http://127.0.0.1:{upstream_http_server.port}{proxy_base}",
         ws_base_url=f"ws://127.0.0.1:{upstream_http_server.port}{proxy_base}",
         access_token=_PLAIN_AUTH,
@@ -487,28 +405,27 @@ async def test_http_proxy_preserves_marimo_auth_redirect_and_cookie_headers(
         "path": f"{proxy_base}/?access_token=secret",
         "header": None,
     }
-    assert fake_process_manager.touches == [session_id]
+    assert fake_session_manager.touches == [session_id]
 
 
 @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
 @pytest.mark.asyncio
 async def test_http_proxy_forwards_body_for_non_post_methods(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    fake_session_manager: FakeSessionManager,
     upstream_http_server: _UpstreamServer,
     method: str,
 ) -> None:
     session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
+    fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
         notebook_id=uuid4(),
         mode="edit",
-        port=upstream_http_server.port,
-        pid=123,
+        phase=SessionPhase.READY,
         last_active=datetime.now(UTC),
         creator_id=None,
     )
-    fake_process_manager.target_response = SessionTarget(
+    fake_session_manager.target_response = SessionTarget(
         http_base_url=f"http://127.0.0.1:{upstream_http_server.port}",
         ws_base_url=f"ws://127.0.0.1:{upstream_http_server.port}",
         access_token=_SPACED_AUTH,
@@ -529,28 +446,30 @@ async def test_http_proxy_forwards_body_for_non_post_methods(
         "header": "header-value",
         "body": b"payload",
     }
-    assert fake_process_manager.touches == [session_id]
+    assert fake_session_manager.touches == [session_id]
 
 
 @pytest.mark.asyncio
 async def test_http_proxy_persists_marimo_save_response(
     api_client: AsyncClient,
-    fake_process_manager: FakeProcessManager,
+    db_session: AsyncSession,
+    fake_session_manager: FakeSessionManager,
     upstream_http_server: _UpstreamServer,
 ) -> None:
-    owner, owner_headers = await register_and_login(api_client, "proxy-save-owner")
-    notebook = await create_notebook(api_client, owner_headers, "Draft", "x = 1")
+    owner, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "proxy-save-owner"
+    )
+    notebook = await create_notebook(api_client, owner_headers, owner_ws, "Untitled", "x = 1")
     session_id = uuid4()
-    fake_process_manager.sessions[session_id] = SessionInfo(
+    fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
         notebook_id=UUID(str(notebook["id"])),
         mode="edit",
-        port=upstream_http_server.port,
-        pid=123,
+        phase=SessionPhase.READY,
         last_active=datetime.now(UTC),
         creator_id=UUID(str(owner["id"])),
     )
-    fake_process_manager.target_response = SessionTarget(
+    fake_session_manager.target_response = SessionTarget(
         http_base_url=f"http://127.0.0.1:{upstream_http_server.port}",
         ws_base_url=f"ws://127.0.0.1:{upstream_http_server.port}",
         access_token=_PLAIN_AUTH,
@@ -569,18 +488,20 @@ async def test_http_proxy_persists_marimo_save_response(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_run_session_proxy_url_loads_real_marimo_session(api_client: AsyncClient) -> None:
+async def test_run_session_proxy_url_loads_real_marimo_session(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
     if shutil.which("marimo") is None:
         pytest.skip("marimo executable is not available")
 
-    port = _free_port()
-    manager = ProcessManager(port_range=f"{port}-{port}", max_concurrent_sessions=1)
-    app.dependency_overrides[get_process_manager] = lambda: manager
+    manager = SubprocessSessionManager()
+    app.dependency_overrides[get_session_manager] = lambda: manager
     try:
-        _, owner_headers = await register_and_login(api_client, "browser")
+        _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "browser")
         notebook = await create_notebook(
             api_client,
             owner_headers,
+            owner_ws,
             "Browser Load",
             _BROWSER_NB_SOURCE,
         )
@@ -599,28 +520,27 @@ async def test_run_session_proxy_url_loads_real_marimo_session(api_client: Async
         assert b"marimo" in load_response.content.lower()
         assert load_response.url.path.startswith(f"/api/proxy/{session_response.json()['id']}")
     finally:
-        app.dependency_overrides.pop(get_process_manager, None)
+        app.dependency_overrides.pop(get_session_manager, None)
         await manager.shutdown()
 
 
 def test_websocket_proxy_relays_frames_and_touches_session(
-    fake_process_manager: FakeProcessManager,
+    fake_session_manager: FakeSessionManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_id = uuid4()
     sent_messages: list[str | bytes] = []
     connected_urls: list[str] = []
 
-    fake_process_manager.sessions[session_id] = SessionInfo(
+    fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
         notebook_id=uuid4(),
         mode="run",
-        port=9000,
-        pid=123,
+        phase=SessionPhase.READY,
         last_active=datetime.now(UTC),
         creator_id=None,
     )
-    fake_process_manager.target_response = SessionTarget(
+    fake_session_manager.target_response = SessionTarget(
         http_base_url="http://127.0.0.1:9000",
         ws_base_url="ws://127.0.0.1:9000",
         access_token=_PLAIN_AUTH,
@@ -669,4 +589,6 @@ def test_websocket_proxy_relays_frames_and_touches_session(
 
     assert connected_urls == ["ws://127.0.0.1:9000/ws?client=browser&access_token=secret"]
     assert sent_messages == ["hello"]
-    assert fake_process_manager.touches == [session_id, session_id]
+    # One mark_active at connect (the gateway's connect edge) plus one per relayed frame
+    # (client->upstream and upstream->client).
+    assert fake_session_manager.touches == [session_id, session_id, session_id]

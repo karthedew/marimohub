@@ -6,17 +6,22 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 
+from app.core.errors import DomainError
+
 MAX_IMPORT_BYTES = 1_000_000
 
 
-class GitLabImportError(Exception):
-    """Raised when importing a notebook from a URL fails."""
+class GitLabImportError(DomainError):
+    """Raised when importing a notebook from a URL fails.
+
+    Unlike other domain errors, the HTTP status is genuinely dynamic (it
+    mirrors whatever the upstream returned), so it rides on the instance.
+    """
 
     def __init__(self, status_code: int, detail: str) -> None:
         """Capture the HTTP status and client-safe detail for the failure."""
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
+        super().__init__(detail, detail=detail)
+        self.status = status_code
 
 
 @dataclass(frozen=True)

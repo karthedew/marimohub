@@ -1,0 +1,153 @@
+from dataclasses import dataclass
+from datetime import datetime
+import enum
+from typing import Literal, Protocol, runtime_checkable
+from uuid import UUID
+
+from fastapi import status
+
+from app.core.config import SessionBackend, get_settings
+from app.core.errors import DomainError
+from app.models import Notebook
+
+SessionMode = Literal["edit", "run"]
+RuntimeMode = Literal["edit", "run", "deploy"]
+
+
+class SessionPhase(enum.StrEnum):
+    """Backend-neutral lifecycle phase of a session."""
+
+    STARTING = "starting"
+    READY = "ready"
+    SLEEPING = "sleeping"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInfo:
+    """Backend-neutral snapshot of a session's identity and lifecycle state."""
+
+    id: UUID
+    notebook_id: UUID
+    mode: RuntimeMode
+    phase: SessionPhase
+    last_active: datetime | None
+    creator_id: UUID | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTarget:
+    """Upstream URLs and access token for proxying to a session."""
+
+    http_base_url: str
+    ws_base_url: str
+    access_token: str
+
+
+@runtime_checkable
+class SessionManager(Protocol):
+    """The seam every caller depends on instead of a concrete backend."""
+
+    async def spawn(
+        self, notebook: Notebook, mode: SessionMode, creator_id: UUID | None = None
+    ) -> SessionInfo:
+        """Spawn an edit or run session for a notebook and return its info once ready."""
+        ...
+
+    async def spawn_deployment(
+        self, notebook: Notebook, deployment_id: UUID, slug: str
+    ) -> SessionInfo:
+        """Spawn (or return the existing) deploy session for a deployment, idempotently."""
+        ...
+
+    async def get(self, session_id: UUID) -> SessionInfo | None:
+        """Return a snapshot of the session, or ``None`` if it is unknown."""
+        ...
+
+    async def target(self, session_id: UUID) -> SessionTarget | None:
+        """Return proxy URLs and token for the session, or ``None`` if not serving."""
+        ...
+
+    async def mark_active(self, session_id: UUID) -> None:
+        """Record activity for the session; a no-op for an unknown session."""
+        ...
+
+    async def stop(self, session_id: UUID) -> None:
+        """Stop and remove a session, raising ``SessionNotFoundError`` if unknown."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Tear down every session this manager is responsible for."""
+        ...
+
+
+class SessionManagerError(DomainError):
+    """Base for every session-manager failure."""
+
+
+class SessionCapacityError(SessionManagerError):
+    """Raised when the backend has no room to start another session."""
+
+    status = status.HTTP_429_TOO_MANY_REQUESTS
+
+
+class SessionStartError(SessionManagerError):
+    """A session never reached a ready state.
+
+    Carries a client-safe ``detail`` so the API layer can return an actionable
+    message without leaking server internals (raw stderr stays in the log).
+    """
+
+    DEFAULT_DETAIL = "Deployment failed to wake"
+    status = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    def __init__(self, message: str, *, detail: str | None = None) -> None:
+        """Store the log message and the client-safe detail for the failure."""
+        super().__init__(message, detail=detail or self.DEFAULT_DETAIL)
+
+
+class NotebookStartupError(SessionStartError):
+    """The runtime exited during startup.
+
+    A deterministic failure (e.g. the source is not a runnable marimo notebook)
+    that retrying won't fix.
+    """
+
+    status = status.HTTP_502_BAD_GATEWAY
+
+
+class SessionNotFoundError(SessionManagerError):
+    """Raised when an operation references a session that does not exist."""
+
+    status = status.HTTP_404_NOT_FOUND
+
+
+_manager_state: dict[str, SessionManager | None] = {"instance": None}
+
+
+def get_session_manager() -> SessionManager:
+    """Return the process-wide session manager, creating it on first use."""
+    manager = _manager_state["instance"]
+    if manager is None:
+        settings = get_settings()
+        # Imported lazily: both backends import this module for the protocol,
+        # value objects, and errors they implement, so a top-level import here
+        # would be circular.
+        if settings.SESSION_BACKEND is SessionBackend.KUBE:
+            from app.services.kube_session_manager import KubeSessionManager  # noqa: PLC0415
+
+            manager = KubeSessionManager.from_settings(settings)
+        else:
+            from app.services.subprocess_backend import SubprocessSessionManager  # noqa: PLC0415
+
+            manager = SubprocessSessionManager.from_settings(settings)
+        _manager_state["instance"] = manager
+    return manager
+
+
+async def shutdown_session_manager() -> None:
+    """Shut down and clear the process-wide session manager, if any."""
+    manager = _manager_state["instance"]
+    if manager is not None:
+        await manager.shutdown()
+        _manager_state["instance"] = None

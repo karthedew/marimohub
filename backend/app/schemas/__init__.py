@@ -3,6 +3,7 @@ from app.schemas.data import NotebookDataCreated, NotebookDataOut
 from app.schemas.deployment import DeploymentCreate, DeploymentOut
 from app.schemas.notebook import (
     NotebookCreate,
+    NotebookFork,
     NotebookImport,
     NotebookListOut,
     NotebookOut,
@@ -11,6 +12,15 @@ from app.schemas.notebook import (
 )
 from app.schemas.session import SessionCreate, SessionOut
 from app.schemas.user import UserOut
+from app.schemas.workspace import (
+    WorkspaceArchiveOut,
+    WorkspaceCreate,
+    WorkspaceMemberCreate,
+    WorkspaceMemberOut,
+    WorkspaceMemberUpdate,
+    WorkspaceOut,
+    WorkspaceUpdate,
+)
 
 __all__ = [
     "DeploymentCreate",
@@ -19,6 +29,7 @@ __all__ = [
     "NotebookCreate",
     "NotebookDataCreated",
     "NotebookDataOut",
+    "NotebookFork",
     "NotebookImport",
     "NotebookListOut",
     "NotebookOut",
@@ -29,4 +40,11 @@ __all__ = [
     "Token",
     "UserCreate",
     "UserOut",
+    "WorkspaceArchiveOut",
+    "WorkspaceCreate",
+    "WorkspaceMemberCreate",
+    "WorkspaceMemberOut",
+    "WorkspaceMemberUpdate",
+    "WorkspaceOut",
+    "WorkspaceUpdate",
 ]
