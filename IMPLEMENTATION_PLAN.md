@@ -413,7 +413,11 @@ with the backend selector.
   `grep -rn "MAX_CONCURRENT_SESSIONS\|MARIMO_PORT_RANGE\|IDLE_TIMEOUT" backend/app` matches only
   what DT-12 keeps.
 - **Dependencies**: M2, M4, M8.
-- **Status**: pending
+- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 246 passed + 2 integration,
+  all greps empty, uv lock consistent; the "without SESSION_NAMESPACE" wording resolved as
+  kube+invalid-namespace → ValidationError per DT-12's default. M10 sweep additions: strengthen
+  the wake-ordering test to enforce a global secret-before-annotation timeline; validate the kube
+  test fixtures' CR shapes against deploy/crd/marimosession.yaml once it lands (risk #4))
 
 ## M10 — CRD & namespace manifests, final sweep
 
@@ -434,7 +438,18 @@ close out global acceptance.
   (no design-task references in code), plus every per-milestone deletion grep re-run;
   `LINT`; `TYPES`; `TEST`; `uv run alembic upgrade head` from scratch DB.
 - **Dependencies**: M9.
-- **Status**: pending
+- **Status**: complete (impl ×1 — ruff 0, ty 0, pytest 247 passed + 2 integration, all sweep greps
+  empty, yaml-parse check exits 0, `alembic upgrade head` exits 0 against the already-baseline-
+  stamped dev DB (a `DROP DATABASE`/recreate was blocked by the session's permission policy on
+  destructive local-state actions — report this to the user before retrying that step). `.tuple()`
+  swept to `._tuple()` at deployments.py:82,111 and notebooks.py:78 — no SADeprecationWarning in
+  the suite. Kube wake-ordering test now asserts a single shared event log across both fake
+  clients; a new test parses `deploy/crd/marimosession.yaml` and asserts every CR body the manager
+  builds carries all required `spec` fields (risk #4), via a `pyyaml` dev-group dependency. Found
+  in the sweep: the M4 deletion grep `read_source\|read_current_source` is no longer empty —
+  DT-8/M8 intentionally names the internal source-fetch endpoint `read_source`
+  (`app/api/internal.py`), a deliberate new symbol reusing the old protocol method's name, not a
+  leftover.)
 
 ---
 

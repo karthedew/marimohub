@@ -1,12 +1,14 @@
 import base64
 from collections.abc import Generator, Mapping
 import copy
-from typing import Any
+import pathlib
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
 import pytest
+import yaml
 
 from app.core.config import get_settings
 from app.models import Notebook
@@ -43,14 +45,21 @@ class FakeCustomObjectsApi:
     Patching the wake annotation flips the stored phase to `Ready`, standing
     in for the controller's reconcile loop so a poll immediately after a wake
     observes a resolved session without real cluster timing.
+
+    An optional shared `events` list, handed to both this fake and a
+    `FakeCoreV1Api`, lets a test observe the *global* call order across the
+    two clients (each fake's own `patch_calls` only orders calls against
+    itself, which can't tell a secret-refresh-then-annotate timeline from an
+    annotate-then-refresh one).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.objects: dict[str, dict[str, Any]] = {}
         self.create_calls: list[dict[str, Any]] = []
         self.patch_calls: list[tuple[str, dict[str, Any]]] = []
         self.delete_calls: list[str] = []
         self.on_create: Any = None
+        self.events: list[str] = events if events is not None else []
 
     async def create_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, body: Mapping[str, Any]
@@ -91,6 +100,7 @@ class FakeCustomObjectsApi:
         cr.setdefault("metadata", {}).setdefault("annotations", {}).update(annotations)
         if kube_module._WAKE_ANNOTATION in annotations:
             cr["status"]["phase"] = "Ready"
+            self.events.append(f"wake_annotation:{name}")
         return copy.deepcopy(cr)
 
     async def delete_namespaced_custom_object(
@@ -103,12 +113,16 @@ class FakeCustomObjectsApi:
 
 
 class FakeCoreV1Api:
-    """Fake `CoreV1Api` that mirrors the server's stringData -> base64 data move."""
+    """Fake `CoreV1Api` that mirrors the server's stringData -> base64 data move.
 
-    def __init__(self) -> None:
+    See `FakeCustomObjectsApi`'s docstring for the shared `events` list.
+    """
+
+    def __init__(self, events: list[str] | None = None) -> None:
         self.secrets: dict[str, client.V1Secret] = {}
         self.create_calls: list[client.V1Secret] = []
         self.patch_calls: list[tuple[str, dict[str, Any]]] = []
+        self.events: list[str] = events if events is not None else []
 
     @staticmethod
     def _encode(string_data: dict[str, str]) -> dict[str, str]:
@@ -142,6 +156,8 @@ class FakeCoreV1Api:
         data = dict(secret.data or {})
         data.update(self._encode(body.get("stringData", {})))
         secret.data = data
+        if "SESSION_TOKEN" in body.get("stringData", {}):
+            self.events.append(f"secret_refresh:{name}")
         return secret
 
 
@@ -225,7 +241,13 @@ async def test_spawn_creates_secret_with_owner_ref_and_both_tokens() -> None:
 
 @pytest.mark.asyncio
 async def test_spawn_deployment_wake_refreshes_token_then_annotates_then_polls_ready() -> None:
-    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    # A single shared event log (rather than each fake's own `patch_calls`) is
+    # what actually proves *global* ordering: two independent per-client
+    # lists can't distinguish "secret refreshed, then annotated" from
+    # "annotated, then secret refreshed" when both happen to be index 0 in
+    # their own list.
+    events: list[str] = []
+    custom, core = FakeCustomObjectsApi(events), FakeCoreV1Api(events)
     notebook = _notebook()
     deployment_id = uuid4()
     name = str(deployment_id)
@@ -257,7 +279,10 @@ async def test_spawn_deployment_wake_refreshes_token_then_annotates_then_polls_r
 
     assert session.id == deployment_id
     assert session.phase == SessionPhase.READY
-    # token refreshed before the wake annotation was patched
+    # The shared event log orders across *both* clients, so this actually
+    # pins the secret-refresh-before-wake-annotation timeline the wake
+    # contract requires (a restarted pod must never boot with a stale token).
+    assert events == [f"secret_refresh:msess-{name}-env", f"wake_annotation:{name}"]
     assert core.patch_calls[0][0] == f"msess-{name}-env"
     assert "SESSION_TOKEN" in core.patch_calls[0][1]["stringData"]
     wake_patch_name, wake_patch_body = custom.patch_calls[0]
@@ -432,3 +457,36 @@ async def test_shutdown_is_a_no_op() -> None:
     manager = _manager(FakeCustomObjectsApi(), FakeCoreV1Api())
 
     await manager.shutdown()
+
+
+# Risk register #4: kube backend correctness is unprovable without a real
+# cluster, so this parses the checked-in operator contract
+# (deploy/crd/marimosession.yaml) directly rather than hardcoding a
+# duplicate required-field list, and fails the moment the manager's CR
+# bodies drift from it.
+_CRD_PATH = pathlib.Path(__file__).resolve().parents[2] / "deploy" / "crd" / "marimosession.yaml"
+
+
+def _crd_required_spec_fields() -> list[str]:
+    crd = yaml.safe_load(_CRD_PATH.read_text())
+    schema = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+    required = schema["properties"]["spec"]["required"]
+    return cast("list[str]", required)
+
+
+@pytest.mark.asyncio
+async def test_spawned_cr_bodies_carry_every_required_crd_spec_field() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    manager = _manager(custom, core)
+    required = _crd_required_spec_fields()
+    assert required  # sanity: the CRD actually declares required fields
+
+    await manager.spawn(_notebook(), "edit")
+    await manager.spawn_deployment(_notebook(), uuid4(), "plasma-dashboard")
+
+    assert custom.create_calls, "expected at least one CR create"
+    for created in custom.create_calls:
+        spec = created["spec"]
+        missing = [field for field in required if spec.get(field) is None]
+        assert not missing, f"CR spec missing required field(s) {missing}: {spec}"

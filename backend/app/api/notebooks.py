@@ -75,7 +75,7 @@ async def _parent_attribution(
     ).one_or_none()
     if row is None:
         return None
-    parent, parent_slug = row.tuple()
+    parent, parent_slug = row._tuple()
     role = await get_role(db, parent.workspace_id, actor.id if actor else None)
     if can_access(parent.visibility, role, Action.READ):
         return parent.title, parent.workspace_id, parent_slug

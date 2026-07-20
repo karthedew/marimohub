@@ -79,7 +79,7 @@ async def _load_deployment_by_slug(db: AsyncSession, slug: str) -> tuple[Deploym
     ).one_or_none()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deployment not found")
-    return row.tuple()
+    return row._tuple()
 
 
 async def _deployment_out_after_conflict(
@@ -108,7 +108,7 @@ async def _load_active_deployment(db: AsyncSession, slug: str) -> tuple[Deployme
     ).one_or_none()
     if row is None:
         raise UpstreamNotFound("Deployment not found")
-    deployment, notebook = row.tuple()
+    deployment, notebook = row._tuple()
     if deployment.status == DeploymentStatus.STOPPED:
         raise UpstreamNotFound("Deployment not found")
     return deployment, notebook
