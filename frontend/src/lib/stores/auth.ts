@@ -1,88 +1,102 @@
 import { browser } from '$app/environment';
-import type { User } from '$lib/api';
 import { writable } from 'svelte/store';
 
-export type AuthUser = Pick<User, 'username'> & Partial<User>;
+// There is no "get current user" endpoint (see CONTEXT.md: no user directory),
+// so identity beyond the JWT subject is only ever what register/login handed
+// back in the moment — never re-fetched, never verified again client-side.
+export type AuthUser = {
+	id: string;
+	username: string;
+	email?: string;
+	created_at?: string;
+};
 
 type AuthState = {
 	token: string | null;
 	currentUser: AuthUser | null;
 };
 
-const storageKey = 'molab-auth';
-const emptyAuthState: AuthState = { token: null, currentUser: null };
+const STORAGE_KEY = 'marimohub-auth';
+const SIGNED_OUT: AuthState = { token: null, currentUser: null };
 
-function userIdFromToken(token: string | null) {
-	if (!browser || !token) return undefined;
-
+// Decodes the JWT `sub` claim for display and client-side identity checks
+// only (e.g. "is this my notebook") — it is never a substitute for backend
+// authorization, which re-verifies the token's signature on every request.
+function subjectFromToken(token: string): string | null {
 	const payload = token.split('.')[1];
-	if (!payload) return undefined;
-
+	if (!payload) return null;
 	try {
 		const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
 		const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
 		const decoded = JSON.parse(atob(padded)) as { sub?: unknown };
-		return typeof decoded.sub === 'string' && decoded.sub.length > 0 ? decoded.sub : undefined;
+		return typeof decoded.sub === 'string' && decoded.sub.length > 0 ? decoded.sub : null;
 	} catch {
-		return undefined;
+		return null;
 	}
 }
 
-function withTokenIdentity(token: string | null, currentUser: AuthUser | null) {
-	const id = userIdFromToken(token);
-	if (!currentUser) return id ? { id, username: id } : null;
-	return id ? { ...currentUser, id } : currentUser;
+// A session is only ever `{token, currentUser}` with a currentUser.id derived
+// from the token itself. A token that cannot yield an id is not a usable
+// session, so this always resolves to fully signed-in or fully signed-out —
+// never a half-authenticated state that callers would have to special-case.
+function deriveState(token: string | null, partialUser: Partial<AuthUser> | null): AuthState {
+	if (!token) return SIGNED_OUT;
+	const id = subjectFromToken(token);
+	if (!id) return SIGNED_OUT;
+	return { token, currentUser: { ...partialUser, id, username: partialUser?.username ?? id } };
 }
 
-function initialState(): AuthState {
-	if (!browser) return emptyAuthState;
+function readStoredState(): AuthState {
+	if (!browser) return SIGNED_OUT;
+	const raw = localStorage.getItem(STORAGE_KEY);
+	if (!raw) return SIGNED_OUT;
+
 	try {
-		const stored = localStorage.getItem(storageKey);
-		if (!stored) return emptyAuthState;
-		const parsed = JSON.parse(stored) as AuthState;
-		const token = parsed.token ?? null;
-		return { token, currentUser: withTokenIdentity(token, parsed.currentUser ?? null) };
+		const parsed = JSON.parse(raw) as Partial<AuthState>;
+		const state = deriveState(parsed.token ?? null, parsed.currentUser ?? null);
+		if (state === SIGNED_OUT && parsed.token) localStorage.removeItem(STORAGE_KEY);
+		return state;
 	} catch {
-		localStorage.removeItem(storageKey);
-		return emptyAuthState;
+		localStorage.removeItem(STORAGE_KEY);
+		return SIGNED_OUT;
 	}
 }
 
 function persistState(state: AuthState) {
 	if (!browser) return;
-	try {
-		if (!state.token && !state.currentUser) {
-			localStorage.removeItem(storageKey);
-			return;
-		}
-		localStorage.setItem(storageKey, JSON.stringify(state));
-	} catch {
+	if (!state.token) {
+		localStorage.removeItem(STORAGE_KEY);
 		return;
 	}
+	localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
-let authSnapshot = initialState();
+let snapshot = readStoredState();
 
 function createAuthStore() {
-	const store = writable<AuthState>(authSnapshot);
+	const store = writable<AuthState>(snapshot);
 
 	store.subscribe((value) => {
-		authSnapshot = value;
+		snapshot = value;
 		persistState(value);
 	});
 
 	return {
 		subscribe: store.subscribe,
-		setSession: (token: string, currentUser: AuthUser | null) =>
-			store.set({ token, currentUser: withTokenIdentity(token, currentUser) }),
-		setToken: (token: string | null) => store.update((state) => ({ ...state, token })),
-		setCurrentUser: (currentUser: AuthUser | null) => store.update((state) => ({ ...state, currentUser })),
-		clear: () => store.set(emptyAuthState)
+		setSession: (token: string, user: Partial<AuthUser> | null = null) => store.set(deriveState(token, user)),
+		clear: () => store.set(SIGNED_OUT)
 	};
 }
 
 export const auth = createAuthStore();
 
+// Synchronous snapshots for call sites that can't subscribe to the store:
+// the API client (every outgoing request needs the current token) and
+// client-only route guards (`+page.ts` load functions run once, not reactively).
 export function getAuthToken() {
-	return authSnapshot.token;
+	return snapshot.token;
+}
+
+export function isAuthenticated() {
+	return snapshot.token !== null && snapshot.currentUser !== null;
 }

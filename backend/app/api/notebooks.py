@@ -40,6 +40,7 @@ class NotebookListQuery(BaseModel):
     q: str | None = None
     semantic: str | None = None
     tags: Annotated[list[str] | None, Query()] = None
+    workspace_id: UUID | None = None
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=20, ge=1, le=100)
 
@@ -162,6 +163,8 @@ async def list_notebooks(
     semantic_query = query.semantic.strip() if query.semantic and query.semantic.strip() else None
 
     filters = [visible_notebooks(current_user.id if current_user else None)]
+    if query.workspace_id is not None:
+        filters.append(Notebook.workspace_id == query.workspace_id)
     order_by = [Notebook.updated_at.desc()]
     if semantic_query is not None:
         query_embedding = await embeddings.embed(semantic_query)

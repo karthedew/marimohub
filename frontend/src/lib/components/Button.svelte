@@ -35,10 +35,10 @@
 
 	const intents: Record<Intent, string> = {
 		primary:
-			'bg-hub-700 text-white shadow-lg shadow-hub-950/15 hover:bg-hub-800 dark:bg-hub-500 dark:text-hub-950 dark:shadow-black/30 dark:hover:bg-hub-400',
+			'bg-hub-700 text-white shadow-sm hover:bg-hub-800 dark:bg-hub-600 dark:text-white dark:hover:bg-hub-500',
 		secondary:
-			'border border-hub-700/25 bg-hub-50 text-hub-900 hover:bg-hub-100 dark:border-hub-300/20 dark:bg-hub-500/10 dark:text-hub-100 dark:hover:bg-hub-500/20',
-		ghost: 'text-hub-900 hover:bg-hub-700/10 dark:text-hub-100 dark:hover:bg-hub-400/10'
+			'border border-slate-300 bg-white text-slate-700 shadow-sm hover:bg-slate-50 hover:text-slate-950 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800 dark:hover:text-white',
+		ghost: 'text-slate-600 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-white/5 dark:hover:text-white'
 	};
 
 	const onDarkIntents: Record<Intent, string> = {

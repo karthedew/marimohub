@@ -32,7 +32,8 @@
 			</p>
 			<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Browse notebooks</h1>
 			<p class="max-w-2xl text-slate-700 dark:text-slate-300">
-				Find public and unlisted marimo notebooks ready to run, fork, and deploy.
+				Discover shows every Public Notebook, plus every Notebook in a Workspace you belong to, whatever its
+				Visibility. An Unlisted Notebook outside your Workspaces stays reachable only by direct link.
 			</p>
 		</div>
 	</div>

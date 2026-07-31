@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { ApiError, api } from '$lib/api';
+	import { safeNextPath } from '$lib/safeNextPath';
 	import { auth } from '$lib/stores/auth';
 	import Button from '$lib/components/Button.svelte';
 
@@ -11,6 +13,10 @@
 	let password = $state('');
 	let errors = $state<RegisterErrors>({});
 	let submitting = $state(false);
+
+	const nextParam = $derived(page.url.searchParams.get('next'));
+	const nextPath = $derived(safeNextPath(nextParam));
+	const loginHref = $derived(nextParam ? `/auth/login?next=${encodeURIComponent(nextParam)}` : '/auth/login');
 
 	function validate() {
 		const nextErrors: RegisterErrors = {};
@@ -34,7 +40,7 @@
 			const user = await api.auth.register({ username: username.trim(), email: email.trim(), password });
 			const token = await api.auth.login({ username: username.trim(), password });
 			auth.setSession(token.access_token, user);
-			await goto('/');
+			await goto(nextPath);
 		} catch (error) {
 			errors = { server: error instanceof ApiError ? error.detail : 'Unable to create your account. Please try again.' };
 		} finally {
@@ -54,7 +60,7 @@
 		</p>
 		<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Create your MarimoHub account.</h1>
 		<p class="max-w-xl text-lg leading-8 text-slate-700 dark:text-slate-300">
-			Save private drafts, publish notebooks, and prepare your marimo work for sharing.
+			Create private notebooks, collaborate inside a workspace, and prepare your marimo work for sharing.
 		</p>
 	</div>
 
@@ -73,7 +79,7 @@
 					bind:value={username}
 				/>
 				{#if errors.username}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="username-error">{errors.username}</p>
+					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="username-error" role="alert">{errors.username}</p>
 				{/if}
 			</div>
 
@@ -90,7 +96,7 @@
 					bind:value={email}
 				/>
 				{#if errors.email}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="email-error">{errors.email}</p>
+					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="email-error" role="alert">{errors.email}</p>
 				{/if}
 			</div>
 
@@ -107,12 +113,12 @@
 					bind:value={password}
 				/>
 				{#if errors.password}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="password-error">{errors.password}</p>
+					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="password-error" role="alert">{errors.password}</p>
 				{/if}
 			</div>
 
 			{#if errors.server}
-				<p class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200">{errors.server}</p>
+				<p class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{errors.server}</p>
 			{/if}
 
 			<Button class="w-full" type="submit" disabled={submitting}>
@@ -121,7 +127,7 @@
 
 			<p class="text-center text-sm text-slate-600 dark:text-slate-300">
 				Already have an account?
-				<a class="font-bold text-hub-700 hover:text-hub-950 dark:text-hub-300 dark:hover:text-hub-200" href="/auth/login">Sign in</a>
+				<a class="font-bold text-hub-700 hover:text-hub-950 dark:text-hub-300 dark:hover:text-hub-200" href={loginHref}>Sign in</a>
 			</p>
 		</div>
 	</form>

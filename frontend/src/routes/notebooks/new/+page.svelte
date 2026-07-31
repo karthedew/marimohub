@@ -1,13 +1,23 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { ApiError, api, normalizeTagInput, type NotebookCreateRequest } from '$lib/api';
+	import { getActiveWorkspaceId } from '$lib/stores/activeWorkspace';
 	import { auth } from '$lib/stores/auth';
 	import Button from '$lib/components/Button.svelte';
+	import WorkspaceTargetPicker from '$lib/components/WorkspaceTargetPicker.svelte';
 
 	type Tab = 'blank' | 'upload' | 'gitlab';
 	type FieldErrors = Partial<Record<'title' | 'file' | 'url' | 'server', string>>;
 
 	const blankSource = 'import marimo as mo\n\napp = mo.App()\n\n\n@app.cell\ndef _():\n    mo.md("# Untitled notebook")\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n';
+
+	// One target survives every tab switch below because this state lives
+	// above all three forms and the picker is rendered once, not per-tab.
+	// A `?workspace=` param seeds the initial choice (e.g. arriving from a
+	// workspace's own page); the picker itself still validates it against the
+	// caller's actual writable list before treating it as a real selection.
+	let workspaceId = $state(page.url.searchParams.get('workspace') ?? getActiveWorkspaceId() ?? '');
 
 	let activeTab = $state<Tab>('blank');
 	let title = $state('Untitled notebook');
@@ -24,7 +34,7 @@
 
 	const isAuthenticated = $derived(Boolean($auth.token));
 
-	function metadata(baseTitle: string, baseDescription: string, baseTags: string): NotebookCreateRequest {
+	function metadata(baseTitle: string, baseDescription: string, baseTags: string): Omit<NotebookCreateRequest, 'workspace_id'> {
 		return {
 			title: baseTitle.trim(),
 			description: baseDescription.trim() || null,
@@ -40,16 +50,20 @@
 		errors = { server: error instanceof ApiError ? error.detail : fallback };
 	}
 
-	async function createNotebook(body: NotebookCreateRequest) {
+	async function createNotebook(body: Omit<NotebookCreateRequest, 'workspace_id'>) {
 		if (!isAuthenticated) {
 			authError();
+			return;
+		}
+		if (!workspaceId) {
+			errors = { server: 'Choose a workspace to create this notebook in.' };
 			return;
 		}
 
 		submitting = true;
 		errors = {};
 		try {
-			const notebook = await api.notebooks.create(body);
+			const notebook = await api.notebooks.create({ ...body, workspace_id: workspaceId });
 			await goto(`/notebooks/${notebook.id}/edit`);
 		} catch (error) {
 			serverError(error, 'Unable to create notebook. Please try again.');
@@ -101,6 +115,10 @@
 			authError();
 			return;
 		}
+		if (!workspaceId) {
+			errors = { server: 'Choose a workspace to import this notebook into.' };
+			return;
+		}
 
 		const url = gitlabUrl.trim();
 		if (!url) {
@@ -111,13 +129,16 @@
 		submitting = true;
 		errors = {};
 		try {
-			const notebook = await api.notebooks.import({ url, pat: gitlabPat.trim() || undefined });
-			gitlabPat = '';
+			const notebook = await api.notebooks.import({ url, pat: gitlabPat.trim() || undefined, workspace_id: workspaceId });
 			await goto(`/notebooks/${notebook.id}/edit`);
 		} catch (error) {
 			serverError(error, 'Unable to import that GitLab notebook. Please check the URL and try again.');
 		} finally {
 			submitting = false;
+			// Cleared once this request is settled either way: the token is only
+			// ever needed for the one fetch inside `import_gitlab_notebook`, and
+			// must never persist in this page's state afterward.
+			gitlabPat = '';
 		}
 	}
 
@@ -146,7 +167,8 @@
 			</p>
 			<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Start a marimo notebook.</h1>
 			<p class="max-w-2xl text-lg leading-8 text-slate-700 dark:text-slate-300">
-				Create a private draft from a blank notebook, a local Python file, or a GitLab raw file URL.
+				Every new notebook starts as a Private Notebook in the Workspace you choose below, built from a blank
+				notebook, a local Python file, or a GitLab raw file URL.
 			</p>
 		</div>
 
@@ -162,6 +184,12 @@
 		{/if}
 	</div>
 
+	{#if isAuthenticated}
+		<div class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-5 shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
+			<WorkspaceTargetPicker bind:value={workspaceId} id="workspace" />
+		</div>
+	{/if}
+
 	<div class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-4 shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20 sm:p-6">
 		<div class="grid gap-2 rounded-[1.5rem] bg-slate-100 p-2 dark:bg-slate-950/40 sm:grid-cols-3" role="tablist" aria-label="Notebook creation method">
 			<button class="rounded-full px-4 py-3 text-sm font-black transition {activeTab === 'blank' ? 'bg-white text-slate-950 shadow-sm dark:bg-white dark:text-slate-950' : 'text-slate-600 hover:bg-white/60 dark:text-slate-300 dark:hover:bg-white/10'}" type="button" role="tab" aria-selected={activeTab === 'blank'} onclick={() => switchTab('blank')}>Blank</button>
@@ -170,7 +198,7 @@
 		</div>
 
 		{#if errors.server}
-			<p class="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200">{errors.server}</p>
+			<p class="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{errors.server}</p>
 		{/if}
 
 		{#if activeTab === 'blank'}
@@ -190,7 +218,7 @@
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="description">Description</label>
 					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="description" bind:value={description}></textarea>
 				</div>
-				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Creating...' : 'Create blank notebook'}</Button>
+				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}>{submitting ? 'Creating...' : 'Create blank notebook'}</Button>
 			</form>
 		{:else if activeTab === 'upload'}
 			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitUpload(); }} novalidate>
@@ -215,7 +243,7 @@
 					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-description">Description</label>
 					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-description" bind:value={uploadDescription}></textarea>
 				</div>
-				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Uploading...' : 'Create from file'}</Button>
+				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}>{submitting ? 'Uploading...' : 'Create from file'}</Button>
 			</form>
 		{:else}
 			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitGitLab(); }} novalidate>
@@ -229,7 +257,7 @@
 					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-pat" type="password" autocomplete="off" bind:value={gitlabPat} placeholder="Only needed for private files" />
 					<p class="mt-2 text-sm font-semibold text-slate-600 dark:text-slate-300">The token is sent once to fetch this file and is never stored by MarimoHub.</p>
 				</div>
-				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated}>{submitting ? 'Importing...' : 'Import from GitLab'}</Button>
+				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}>{submitting ? 'Importing...' : 'Import from GitLab'}</Button>
 			</form>
 		{/if}
 	</div>

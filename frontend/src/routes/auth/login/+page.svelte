@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { ApiError, api } from '$lib/api';
+	import { safeNextPath } from '$lib/safeNextPath';
 	import { auth } from '$lib/stores/auth';
 	import Button from '$lib/components/Button.svelte';
 
@@ -11,12 +12,10 @@
 	let password = $state('');
 	let errors = $state<LoginErrors>({});
 	let submitting = $state(false);
-	const nextPath = $derived(safeNextPath(page.url.searchParams.get('next')));
 
-	function safeNextPath(value: string | null) {
-		if (!value || !value.startsWith('/') || value.startsWith('//')) return '/';
-		return value;
-	}
+	const nextParam = $derived(page.url.searchParams.get('next'));
+	const nextPath = $derived(safeNextPath(nextParam));
+	const registerHref = $derived(nextParam ? `/auth/register?next=${encodeURIComponent(nextParam)}` : '/auth/register');
 
 	function validate() {
 		const nextErrors: LoginErrors = {};
@@ -54,7 +53,7 @@
 		</p>
 		<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Sign in to your notebooks.</h1>
 		<p class="max-w-xl text-lg leading-8 text-slate-700 dark:text-slate-300">
-			Continue building drafts, publishing demos, and launching marimo sessions from your workspace.
+			Continue building notebooks, publishing demos, and launching marimo sessions from your workspaces.
 		</p>
 	</div>
 
@@ -73,7 +72,7 @@
 					bind:value={username}
 				/>
 				{#if errors.username}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="username-error">{errors.username}</p>
+					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="username-error" role="alert">{errors.username}</p>
 				{/if}
 			</div>
 
@@ -90,12 +89,12 @@
 					bind:value={password}
 				/>
 				{#if errors.password}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="password-error">{errors.password}</p>
+					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="password-error" role="alert">{errors.password}</p>
 				{/if}
 			</div>
 
 			{#if errors.server}
-				<p class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200">{errors.server}</p>
+				<p class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{errors.server}</p>
 			{/if}
 
 			<Button class="w-full" type="submit" disabled={submitting}>
@@ -104,7 +103,7 @@
 
 			<p class="text-center text-sm text-slate-600 dark:text-slate-300">
 				New to MarimoHub?
-				<a class="font-bold text-hub-700 hover:text-hub-950 dark:text-hub-300 dark:hover:text-hub-200" href="/auth/register">Create an account</a>
+				<a class="font-bold text-hub-700 hover:text-hub-950 dark:text-hub-300 dark:hover:text-hub-200" href={registerHref}>Create an account</a>
 			</p>
 		</div>
 	</form>

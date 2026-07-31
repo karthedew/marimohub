@@ -202,6 +202,30 @@ async def test_list_notebooks_shows_public_and_callers_own_notebooks(
 
 
 @pytest.mark.asyncio
+async def test_list_notebooks_filters_visible_results_to_one_workspace(
+    api_client: AsyncClient,
+    db_session: AsyncSession,
+) -> None:
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "workspacefilter")
+    _, other_headers, other_ws = await register_and_login(api_client, db_session, "workspaceother")
+    owner_private = await create_notebook(
+        api_client, owner_headers, owner_ws, "Workspace Private", "print('private')"
+    )
+    other_public = await create_notebook(
+        api_client, other_headers, other_ws, "Other Public", "print('public')"
+    )
+    await publish_notebook(api_client, other_headers, str(other_public["id"]), "public")
+
+    response = await api_client.get(
+        "/api/notebooks", params={"workspace_id": str(owner_ws)}, headers=owner_headers
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert [item["id"] for item in response.json()["items"]] == [str(owner_private["id"])]
+
+
+@pytest.mark.asyncio
 async def test_list_notebooks_full_text_search_matches_title_description_and_tags(
     api_client: AsyncClient,
     db_session: AsyncSession,

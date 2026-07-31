@@ -1,57 +1,104 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { untrack } from 'svelte';
 	import { ApiError, api, deploymentProxyUrl } from '$lib/api';
+	import { decideWakeStep, nextWakeDelay, type WakeAttemptResult } from '$lib/deploymentWake';
 	import Button from '$lib/components/Button.svelte';
 
 	let { params } = $props();
 	let ready = $state(false);
 	let frameLoaded = $state(false);
 	let error = $state<string | null>(null);
+	let capacityExhausted = $state(false);
 	let attempts = $state(0);
-	let cancelled = false;
 
 	const iframeSrc = $derived(deploymentProxyUrl(params.slug));
 
+	const WAKE_TIMEOUT_MS = 20_000;
+
+	// Bumped by every new attempt (a slug change or a manual Retry) so a
+	// superseded attempt's in-flight request and pending backoff timer both
+	// become inert instead of overwriting state a newer attempt already moved
+	// past — the same discard discipline the notebook detail page's
+	// deployment polling uses.
+	let generation = 0;
+	let pendingTimeout: ReturnType<typeof setTimeout> | undefined;
+
 	function sleep(ms: number) {
-		return new Promise((resolve) => setTimeout(resolve, ms));
+		return new Promise<void>((resolve) => {
+			pendingTimeout = setTimeout(() => {
+				pendingTimeout = undefined;
+				resolve();
+			}, ms);
+		});
 	}
 
-	async function wakeDeployment() {
+	async function wakeDeployment(slug: string) {
+		const requestId = ++generation;
 		ready = false;
 		frameLoaded = false;
 		error = null;
+		capacityExhausted = false;
 		attempts = 0;
 
-		for (let attempt = 1; attempt <= 12 && !cancelled; attempt += 1) {
-			attempts = attempt;
+		const startedAt = Date.now();
+		let delayMs = 1000;
+
+		for (;;) {
+			attempts += 1;
+			let result: WakeAttemptResult;
 			try {
-				await api.deployments.get(params.slug);
-				if (!cancelled) {
-					ready = true;
-					frameLoaded = false;
-				}
-				return;
+				await api.deployments.get(slug);
+				result = { ok: true };
 			} catch (caught) {
-				if (cancelled) return;
-				if (caught instanceof ApiError && caught.status !== 503 && caught.status !== 504) {
-					error = caught.detail;
-					return;
-				}
-				if (attempt === 12) {
-					error = caught instanceof ApiError ? caught.detail : 'Deployment did not wake up in time.';
-					return;
-				}
-				await sleep(1500);
+				result = caught instanceof ApiError
+					? { ok: false, status: caught.status, detail: caught.detail }
+					: { ok: false, status: 0, detail: 'Deployment did not wake up in time.' };
 			}
+			if (requestId !== generation) return;
+
+			const decision = decideWakeStep(result, {
+				elapsedMs: Date.now() - startedAt,
+				timeoutMs: WAKE_TIMEOUT_MS,
+				nextDelayMs: delayMs
+			});
+
+			if (decision.action === 'ready') {
+				ready = true;
+				return;
+			}
+			if (decision.action === 'capacity') {
+				error = decision.message;
+				capacityExhausted = true;
+				return;
+			}
+			if (decision.action === 'stop') {
+				error = decision.message;
+				return;
+			}
+
+			delayMs = nextWakeDelay(delayMs);
+			await sleep(decision.delayMs);
+			if (requestId !== generation) return;
 		}
 	}
 
-	onMount(() => {
-		void wakeDeployment();
-	});
-
-	onDestroy(() => {
-		cancelled = true;
+	$effect(() => {
+		const slug = params.slug;
+		// `wakeDeployment` reads and writes `$state` (`attempts`, `ready`, ...) in
+		// its own synchronous prefix, before its first `await`. Left tracked,
+		// that read-after-write inside an effect's own execution makes Svelte
+		// treat the effect as dependent on state the effect itself just changed
+		// and rerun it immediately, forever. `untrack` scopes the dependency
+		// suppression to exactly that synchronous prefix — this effect's only
+		// real dependency is `slug`.
+		untrack(() => void wakeDeployment(slug));
+		return () => {
+			generation++;
+			if (pendingTimeout !== undefined) {
+				clearTimeout(pendingTimeout);
+				pendingTimeout = undefined;
+			}
+		};
 	});
 </script>
 
@@ -81,8 +128,12 @@
 				{#if error}
 					<p class="text-sm font-semibold uppercase tracking-[0.3em] text-red-200">Deployment unavailable</p>
 					<h1 class="mt-5 text-3xl font-black tracking-tight sm:text-5xl">Unable to open this app.</h1>
-					<p class="mt-4 text-sm leading-6 text-slate-300">{error}</p>
-					<Button intent="primary" onDark class="mt-7" type="button" onclick={() => void wakeDeployment()}>
+					{#if capacityExhausted}
+						<p class="mt-4 text-sm leading-6 text-slate-300">This deployment is at capacity right now. Wait a moment and try again.</p>
+					{:else}
+						<p class="mt-4 text-sm leading-6 text-slate-300">{error}</p>
+					{/if}
+					<Button intent="primary" onDark class="mt-7" type="button" onclick={() => void wakeDeployment(params.slug)}>
 						Try again
 					</Button>
 				{:else}
