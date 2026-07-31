@@ -1,42 +1,83 @@
-# sv
+# MarimoHub Frontend
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+SvelteKit SPA for MarimoHub. It renders entirely in the browser (`ssr = false`) because the bearer
+token that authenticates every API request lives in `localStorage`, which a server render cannot
+see.
 
-## Creating a project
+## Install
 
-If you're seeing this, you've probably already done this step. Congrats!
-
-```sh
-# create a new project
-npx sv create my-app
+```bash
+npm ci
 ```
 
-To recreate this project with the same configuration:
+## Configure
 
-```sh
-# recreate this project
-npx sv@0.16.1 create --template minimal --types ts --no-install frontend
+Copy `.env.example` to `.env` and point it at a running backend:
+
+```bash
+cp .env.example .env
 ```
 
-## Developing
+`PUBLIC_API_URL` is the only environment variable this app reads. It must be an absolute
+`http(s)` URL with no trailing slash.
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+## Develop
 
-```sh
+```bash
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
 
-## Building
+Runs the Vite dev server (default `http://localhost:5173`) against whatever `PUBLIC_API_URL`
+points at — typically a backend started from `../backend` or via `podman-compose up` from the
+repo root.
 
-To create a production version of your app:
+## Type-check
 
-```sh
+```bash
+npm run check
+```
+
+## Test
+
+Unit tests (Vitest, jsdom environment):
+
+```bash
+npm run test:unit
+npm run test:unit:watch
+```
+
+Browser tests (Playwright) require a dedicated backend, database, and built frontend — see
+`e2e/global-setup.ts`. They are never pointed at a shared or development database:
+`E2E_DATABASE_URL` must name the `molab_e2e` database, and setup refuses to run otherwise, since
+it downgrades and re-upgrades that database's schema on every run.
+
+```bash
+E2E_DATABASE_URL=postgresql+asyncpg://molab:molab@localhost:5432/molab_e2e npm run test:e2e
+npm run test:e2e:ui
+```
+
+The suite runs a `chromium` project at desktop viewport plus a `mobile` project, scoped to
+`e2e/mobile.spec.ts`, at a phone viewport. It starts its own backend and frontend on fixed ports
+(`8100` and `5173`) bound to `localhost`, matching the backend's single allowed CORS origin, so it
+cannot run at the same time as `npm run dev` on the same machine.
+
+## Build And Run
+
+Production uses `@sveltejs/adapter-node`, so the build output is a standalone Node server rather
+than static files:
+
+```bash
 npm run build
+PUBLIC_API_URL=http://localhost:8000 node build
 ```
 
-You can preview the production build with `npm run preview`.
+`HOST`, `PORT`, and `ORIGIN` configure the Node server the same way for any adapter-node app.
+`PUBLIC_API_URL` is read at request time via `$env/dynamic/public`, so the same build can be
+retargeted at a different backend without rebuilding — see `../Containerfile.frontend`, which
+builds once and lets the container runtime supply `PUBLIC_API_URL`.
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+## Known Auth Limitations
+
+Local authentication stores a JWT access token in `localStorage`, with no refresh token and no
+token-refresh protocol: an expired token requires signing in again. There is no OIDC UI; the
+backend has no provider-discovery endpoint and does not hand a token back to this SPA.

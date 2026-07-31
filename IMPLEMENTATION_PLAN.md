@@ -1,540 +1,769 @@
-# MarimoHub Backend — Implementation Plan
+# MarimoHub Frontend Implementation Plan
 
-Source design: `DESIGN.md` (all sections DT-1…DT-13 complete). Every task references design
-sections by heading; implementers read the design there — this plan never restates it.
+## Status
+
+Complete. All six milestones landed and pass the gates in each milestone section.
 
 ## Goal
 
-Redesign the backend around clear domain boundaries: workspace/collaborator model, notebook
-visibility and forking, and Kubernetes-native session management via the MarimoSession CRD,
-with a clean seam for swapping local JWT auth for OIDC/SAML.
+Replace the frontend's obsolete user-owned notebook contract with the backend's current workspace,
+membership, visibility, session, and deployment contract. Deliver complete local registration,
+login, logout, expiry recovery, workspace collaboration, notebook management, and automated frontend
+verification.
 
-## Non-goals
+This is a clean frontend alignment. Remove obsolete behavior instead of preserving it.
 
-- **Frontend**: no changes under `frontend/` are planned or verified here.
-- **The Go operator implementation**: per *DT-8 Design → Controller component layout (outside
-  `backend/app`)*, the reconciler is a separate component (`marimohub-operator/`, kubebuilder).
-  This plan delivers the CRD/manifest YAMLs, the backend's internal endpoints, and the
-  `KubeSessionManager` client half; writing the Go controller is out of scope.
-- **Object-store (MinIO) storage backend**: the seam stays swap-ready per *DT-11 Design →
-  Target design — storage seam (unchanged surface, the swap point)*; no MinIO implementation.
-- **OIDC live integration tests against a real IdP**: provisioning and resolve/JIT logic is
-  unit-tested against the DB; token verification is isolated per *DT-4 Design → OIDC HTTP flow
-  + verification seam (`api/auth.py`)* and mocked in tests.
+## Scope
 
-## Conventions
+- Update `frontend/` to the current backend API.
+- Add active workspace management and member administration UI.
+- Add workspace targeting to notebook create, import, and fork flows.
+- Replace notebook ownership checks with workspace role capabilities.
+- Add Notebook Visibility and permanent notebook deletion controls.
+- Remove the deleted explicit session-save flow.
+- Display deployment state to readers and management controls to writers.
+- Complete local registration/login/logout and expired-session recovery.
+- Disable SSR while bearer authentication remains in browser storage.
+- Use `adapter-node` and provide a production frontend container.
+- Add Vitest and Playwright coverage.
+- Update frontend-facing documentation.
 
-- All commands run from `backend/` unless stated. Test DB per existing `tests/conftest.py`.
-- `LINT` = `uv run ruff check .` — must exit 0.
-- `TYPES` = `uv run ty check` — must exit 0 (or introduce no new diagnostics vs. the previous
-  milestone if the type-check baseline is nonzero; record the count in the task completion note).
-- `TEST` = `uv run pytest` — full suite green.
-- Milestones are the green checkpoints: **every milestone ends compiling, LINT/TYPES clean,
-  TEST green.** Tasks are the per-subagent units (30k–50k tokens each). All milestones are
-  single-task except M5, which is physically indivisible below five tasks (the squashed schema
-  baseline and ORM/API ownership flip must land together); within M5, only the
-  milestone boundary guarantees a green suite, and per-task verification is stated per task.
+## Non-Goals
 
----
+- No backend code, schema, endpoint, authorization, or deployment-lifecycle changes.
+- No compatibility for `draft`, `notebook.user_id`, old lineage fields, body-less forks, old data
+  methods, or the old `molab-auth` localStorage value.
+- No OIDC UI. The backend has no provider-discovery endpoint and its callback does not hand a token
+  back to the SPA.
+- No cookie-backed SSR, refresh tokens, or token refresh protocol.
+- No user directory. Members are added by raw User ID because that is the frozen API contract.
+- No attempt to resolve backend lifecycle defects from the old frontend plan.
 
-## Milestone sequence
+## Current Backend Contract
 
-1. **M1 — Error taxonomy & slug foundations** (DT-13 core, DT-5 workspace slugs)
-2. **M2 — Session-manager seam & subprocess decomposition** (DT-7, subprocess half)
-3. **M3 — Gateway consolidation & single edit-save path** (DT-9, DT-11)
-4. **M4 — Lifecycle source-of-truth & legacy lifecycle deletions** (DT-10, non-schema half)
-5. **M5 — Domain schema flip: workspaces, identities, visibility** (DT-1, DT-2, DT-3, DT-4, DT-6 core)
-6. **M6 — Workspace & membership management API** (DT-5)
-7. **M7 — Notebook API completion: forking, discovery, attribution** (DT-6 remainder)
-8. **M8 — Internal API & service-token auth** (DT-8 backend half, DT-6 data-write decision)
-9. **M9 — Kube session backend & configuration surface** (DT-7 kube half, DT-12)
-10. **M10 — CRD & namespace manifests, final sweep** (DT-8 manifests, global cleanup)
+### Authentication
 
-Dependency chain: M1 → M2 → M3 → M4 → M5 → M6/M7 (either order, M6 before M7 preferred) →
-M8 → M9 → M10. Deletions land at the earliest point their callers are gone: `process_manager.py`
-in M2, duplicated proxy bodies in M3, reaper/boot-reset in M4, per-router authz copies and
-`users.password_hash` in M5, public data POST in M8, obsolete settings keys in M2/M4/M9.
+- `POST /api/auth/register` with `{username, email, password}` returns a User.
+- `POST /api/auth/login` with `{username, password}` returns `{access_token, token_type}`.
+- `POST /api/auth/logout` validates the bearer token and returns 204; JWT invalidation remains local.
+- JWT `sub` is the User ID used by the frontend for identity comparisons and the copyable User ID.
 
----
+### Workspaces
 
-## M1 — Error taxonomy & slug foundations
+- `GET /api/workspaces` returns the caller's active workspaces and role.
+- `POST /api/workspaces` creates a workspace; the caller becomes Owner.
+- `GET /api/workspaces/{id}` and `GET /api/workspaces/{id}/members` require membership.
+- Rename, archive, restore, and member mutations use the existing backend role checks unchanged.
+- `GET /api/workspaces/archived` returns archived workspaces owned by the caller.
+- Member creation requires `{user_id, role}`; there is no username/email lookup endpoint.
 
-**Intent**: land the cross-cutting contracts every later milestone raises errors through, plus
-the shared DNS-label slug module, before anything depends on them.
+### Notebooks
 
-- **Design**: *DT-13 Design → Target design — new module `backend/app/core/errors.py`*,
-  *→ Domain error hierarchies (signatures unchanged)*,
-  *→ `main.py` wiring — the whole seam*,
-   *→ Explicit contracts*, *→ Deletions (by file / symbol)*; *DT-5 Design → Pydantic schemas*
-   (shared `app/services/slug.py`); *DT-5 Design → Policy reuse…* names `to_dns_label`/
-  `unique_slug`/`DNS_LABEL_RE` as the slug surface.
-- **Create**: `backend/app/core/errors.py`; `backend/app/services/slug.py`;
-  `backend/tests/test_errors.py` (handler renders status/detail per contract; WS close-code
-  mapping unit-tested at the mapping function); slug unit tests (DNS-label sanitisation,
-  truncation, collision suffixing) in `backend/tests/test_slug.py`.
-- **Modify**: `backend/app/main.py` (register exception handlers); existing service exception
-  classes re-rooted onto the new base (`services/process_manager.py`, `services/gitlab_import.py`,
-  `services/auth_service.py`); routers listed in *DT-13 Design → Mapping — every current inline
-  `HTTPException` raise → new model* lose the raises that the mapping migrates now (those tied
-  to not-yet-built modules migrate in their own milestones).
-- **Delete**: per *DT-13 Design → Deletions (by file / symbol)* — the per-router try/except
-  translation blocks whose exceptions are now handler-rendered.
-- **Decision (closes DT-13's blanket-handler open question)**: `register_error_handlers`
-  installs the catch-all `Exception` handler unconditionally — no test-off settings flag. Any
-  existing test that relied on `raise_server_exceptions=True` propagation is rewritten here to
-  assert the rendered `500 {"detail": "Internal server error"}` response instead.
-- **Verification**: `LINT`; `TYPES`; `TEST`. New tests pin: each taxonomy class → expected
-  HTTP status and client-safe detail; unknown `MarimoHubError` subclass → 500 without detail
-  leak; slug properties above.
-- **Dependencies**: none.
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 94 passed)
+- Create, import, and fork require an explicit target `workspace_id`.
+- A Notebook has `workspace_id` and nullable `created_by`; it has no owner `user_id`.
+- Visibility is `private | unlisted | public`.
+- Write capability is Workspace role `owner | editor`.
+- Read capability and discovery filtering are enforced by the backend.
+- `PUT`, visibility change, permanent delete, deploy, and stop endpoints already exist.
+- `GET /api/notebooks/{id}/deployment` returns the current deployment or 404 when none exists.
 
-## M2 — Session-manager seam & subprocess decomposition
+### Sessions And Deployments
 
-**Intent**: put the `SessionManager` protocol in front of all callers and decompose the
-609-line `process_manager.py` into the subprocess backend package, deleting the port-range
-and capacity machinery.
+- Session create accepts `{notebook_id, mode}`.
+- Session delete is capability-scoped and requires no bearer token.
+- The explicit session-save endpoint no longer exists; persistence follows proxied marimo autosave.
+- Deployment serving by slug is public and independent of Notebook Visibility.
+- Deployment wake responses use 503 while unavailable; 429 represents capacity exhaustion.
 
-- **Design**: *DT-7 Design → Target design — the seam (`backend/app/services/session_manager.py`)*,
-  *→ Value-object construction rule (both backends)*, *→ Module decomposition
-  (`process_manager.py` → cohesive concerns)*, *→ How callers change*, *→ Explicit contracts*,
-  *→ Deletions (by symbol / file)*. Error base definitions per *DT-13 Design → Domain error
-  hierarchies (signatures unchanged)*. Include `read_source` in the protocol for now (mapping
-  `current_source → await read_source` per *DT-7 Design → Deletions*): its sole caller
-  `_persist_edit_session` survives until M4, which deletes both together per *DT-11 Design →
-  Deletions (by symbol / file)*.
-- **Create**: `backend/app/services/session_manager.py` (protocol + value objects +
-  `get_session_manager()` selector, subprocess-only for now);
-  `backend/app/services/subprocess_backend/{__init__,manager,registry,runtime,workdir,readiness}.py`;
-  `backend/tests/test_session_manager.py` (rewritten from `test_process_manager.py`).
-- **Modify**: `backend/app/api/sessions.py`, `backend/app/api/deployments.py`,
-  `backend/app/api/proxy.py`, `backend/app/services/marimo_proxy.py` — depend on the protocol,
-  async accessors, `touch`→`mark_active`, `current_source`→`read_source`; `backend/app/schemas/session.py`
-  per *DT-7 Design → How callers change*; `backend/app/core/config.py` — remove `MARIMO_PORT_RANGE`
-  per *DT-12 Design → Deletions (settings keys + related code)* (only this key; the rest wait
-  for their milestones — in particular the readiness code keeps reading the still-present
-  `MARIMO_READY_TIMEOUT_SECONDS` until M9 renames it to `SESSION_READY_TIMEOUT_SECONDS`);
-  `backend/app/main.py` lifespan shutdown call rename;
-  `backend/app/services/deployment_lifecycle.py` — survives until M4 but imports
-  `ProcessManager`/`SessionNotFoundError`/`get_process_manager` and calls sync `manager.get()`:
-  rewire onto the seam (`session_manager` imports, `SessionManager` type,
-  `await manager.get(...)` in `reap_once`) so M2's grep gate can pass.
-- **Delete**: `backend/app/services/process_manager.py`; `_reserved_ports`, port allocator,
-  `PortAllocationError`; `backend/tests/test_process_manager.py`.
-- **Verification**: `LINT`; `TYPES`; `TEST` (including rewritten session-manager tests and
-  `-m integration` subprocess spawn test). `grep -rn "process_manager\|MARIMO_PORT_RANGE" app tests`
-  returns nothing.
-- **Dependencies**: M1.
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 94 passed incl. integration;
-  carry-forwards: drop caller-less `registry.snapshot()` in M4; sessions.py capacity 503 catch dies
-  in M4 per DT-10)
+### Errors
 
-## M3 — Gateway consolidation & single edit-save path
+- Error bodies use `detail`.
+- Domain errors generally use a string detail.
+- FastAPI validation errors use an array detail.
+- `readError()` must continue normalizing both forms.
+- A request that actually sent a bearer token and receives 401 clears the local session and sends the
+  user through login with a safe `next` path.
 
-**Intent**: collapse the duplicated HTTP/WS proxy paths into one gateway with resolver seams,
-and make the proxied `api/kernel/save` interception the only edit-persistence path.
+## Product Decisions
 
-- **Design**: *DT-9 Design → Target design — the gateway (`backend/app/services/marimo_proxy.py`)*,
-  *→ Resolvers — the isolated entry-point difference*, *→ The routers after consolidation*,
-  *→ Serving-access decision (DT-3 handoff, recorded)*, *→ Explicit contracts*, *→ Deletions
-  (by file / symbol)*; *DT-11 Design → Target design — the one edit-save persistence path*,
-  *→ Explicit contracts*, *→ Deletions (by symbol / file)*.
-- **Create**: `GatewayError` hierarchy in the gateway module (rooted per DT-13);
-  gateway tests in `backend/tests/test_gateway.py` pinning: resolve-or-wake ordering,
-  `mark_active` call points (per HTTP request; WS connect + frame), error→status and →WS-close
-  mapping, save-callback guard conditions (2xx/3xx + edit mode) and swallow-on-failure.
-- **Modify**: `backend/app/services/marimo_proxy.py` (gateway + private transport helpers);
-  `backend/app/api/proxy.py` (SessionResolver + `edit_save_callback` beside its injection
-  site); `backend/app/api/deployments.py` (DeploymentResolver; two-line proxy bodies);
-  `backend/app/main.py` if handler registration shifts per *DT-13 Design → `main.py` wiring*;
-  `backend/tests/test_deployments.py` — rewrite/remove the serving-path and wake assertions
-  that pin the deleted DB writes (`status==RUNNING` after wake, serving-path `last_active`
-  mirror); the reaper-unit tests that drive `reap_once` directly with hand-built rows stay
-  until M4 deletes the reaper.
-- **Delete**: duplicated `deployment_ws`/`deployment_http` and `proxy_ws`/`proxy_http` bodies,
-  `_wake_deployment`, `persist_marimo_save`'s old hardcoded-storage form, per the two Deletions
-  headings above.
-- **Accepted transient (M3→M4)**: with `_wake_deployment`'s DB writes gone, nothing writes
-  `deployments.status=RUNNING` or serving-path `last_active` anymore, so the reaper (deleted in
-  M4) no longer matches gateway-woken deployments and the row may read `sleeping` while a
-  session serves. No API surface reads that status between M3 and M4 (the read-model endpoint
-  arrives in M4); recorded as accepted, not worked around.
-- **Verification**: `LINT`; `TYPES`; `TEST`. `grep -n "relay_websocket\|forward_http" app/api`
-  shows no direct router calls (gateway-only).
-- **Dependencies**: M2.
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 112 passed incl. 2 integration;
-  carry-forward: relocate `get_notebook_storage` out of `api/notebooks.py` when M9 adds the
-  `NOTEBOOK_STORAGE_BACKEND` selector)
+- The app runs as a client-rendered SPA with root `ssr = false`.
+- `adapter-node` is the production adapter.
+- Local bearer auth uses a new `marimohub-auth` storage value with no migration from old state.
+- Registration without a `next` path lands on `/workspaces`.
+- Protected routes redirect to login and preserve `next`.
+- The active workspace list is owned by one client store, not duplicated in route data.
+- Capability UI waits for workspace-store hydration instead of briefly treating the user as a
+  non-member.
+- Workspace roles refresh after local mutations and on window focus.
+- The Workspaces page shows the current User ID with a copy action so it can be shared out of band.
+- Notebook create uses one workspace selector shared across Blank, Upload, and GitLab tabs.
+- Fork always confirms its target workspace, even when only one writable workspace exists.
+- Notebook actions use the term Visibility, not Publish, and never use Draft.
+- Notebook deletion is permanent and requires explicit confirmation.
+- A Deployment is clearly labeled public even when its Notebook is Private or Unlisted.
+- Every reader can see an active Deployment link/status; only Editors and Owners can manage it.
+- Deployment 429 stops automatic retries and offers manual Retry.
+- Normal in-app navigation waits for session deletion; browser teardown remains best-effort.
+- Unit and browser tests are part of this implementation, not a follow-up.
 
-## M4 — Lifecycle source-of-truth & legacy lifecycle deletions
+## Conventions And Gates
 
-**Intent**: make runtime phase live only behind the seam (read-through projection), and delete
-the reaper, boot reset, explicit save endpoint, and persist-on-delete.
+Run frontend commands from `frontend/`.
 
-- **Design**: *DT-10 Design → Source-of-truth statement*, *→ Read-model projection rule
-  (resolves DT-9 handoff #1)*, *→ Per-endpoint changes*, *→ Wake / idle-sleep / stop flows
-  (against the DT-7 seam)*, *→ Explicit contracts*, *→ Handoff resolutions*, *→ Deletions
-  (files / symbols)*. Note the `deployments.port` column is absent from M5's squashed baseline;
-  `DeploymentOut` already has no port field. Everything else lands here.
-- **Create**: `resolved_status(...)` projection helper and its unit tests; test for the new
-  `GET /api/notebooks/{id}/deployment` read-model endpoint per *DT-10 Design → Per-endpoint
-  changes*; tests pinning: failed wake never persists `running`; `stopped` short-circuits.
-- **Authz carve-out (ordering)**: DT-10's per-endpoint table names DT-3 deps
-  (`NotebookRead`/`NotebookWrite`, `load_notebook_for`) that do not exist until M5·T3. M4
-  implements the lifecycle/flow changes against the *existing* user_id authz helpers
-  (`_load_owned_notebook`, `_authorize_create`, `_can_view`); the swap onto DT-3 deps is
-  M5·T5's re-keying. The capability-scoped session delete (drop `_authorize_session`) has no
-  DT-3 dependency and lands here.
-- **Modify**: `backend/app/api/deployments.py`, `backend/app/api/sessions.py` (endpoint set and
-  flows per the per-endpoint table; capability-scoped session delete per *DT-10 Design →
-  Handoff resolutions*); `backend/app/main.py` lifespan (remove reaper start/stop);
-  `backend/app/core/config.py` — remove `IDLE_TIMEOUT_MINUTES` per *DT-12 Design → Deletions*;
-  `backend/tests/test_sessions.py`, `backend/tests/test_deployments.py` fallout.
-- **Delete**: `backend/app/services/deployment_lifecycle.py` (`IdleDeploymentReaper`,
-  `mark_running_deployments_sleeping`); `POST /api/sessions/{id}/save`; `_persist_edit_session`;
-  persist-on-delete in `delete_session`; `read_source` from the `SessionManager` protocol and
-  the subprocess backend (now caller-less) per *DT-11 Design → Deletions (by symbol / file)*,
-  including `workdir.read_current_source`.
-- **Verification**: `LINT`; `TYPES`; `TEST`.
-  `grep -rn "deployment_lifecycle\|IdleDeploymentReaper\|IDLE_TIMEOUT" app tests` returns nothing.
-- **Dependencies**: M3.
-- **Status**: complete (impl ×2, verify ×2 — attempt 1 FAIL on a comment-only DT reference, fixed;
-  attempt 2 PASS — ruff 0, ty 0, pytest 118 passed incl. 2 integration)
+- `CHECK`: `npm run check`
+- `UNIT`: `npm run test:unit`
+- `BUILD`: `npm run build`
+- `E2E`: `npm run test:e2e`
+- `ALL`: `npm run check && npm run test:unit && npm run build`
 
-## M5 — Domain schema flip: workspaces, identities, visibility
+Every milestone must leave `CHECK`, `UNIT`, and `BUILD` green. Milestones that introduce or change a
+browser flow also run the relevant Playwright spec. The final milestone runs the full suite.
 
-**Intent**: land the workspace/identity data model, the squashed schema baseline, the shared
-access-policy module, the split-credential auth services, and the mechanical re-keying of every
-router and test from `user_id` ownership to workspace ownership — one green checkpoint.
+Use existing frontend conventions unless a milestone explicitly changes them:
 
-This milestone is the plan's one multi-task exception (see Conventions). Tasks run in order;
-the suite is only green after T5. Each task still has a mechanical gate.
+- Svelte 5 runes.
+- Tailwind v4 and the existing `hub-*` palette.
+- `Button.svelte` for actions.
+- Inline `role="alert"` errors.
+- `ApiError` for request failures.
+- No new runtime component library.
 
-### M5·T1 — Models package (DT-1)
-- **Design**: *DT-1 Design → Target ERD*, *→ Model-file layout — decision*, *→ Enums*,
-  *→ Provider value scheme (`identities.provider`)*, *→ Workspace lifecycle and user deletion*,
-  *→ ORM `Mapped` definitions (new / changed)*, *→ Explicit contracts*, *→ Deletions (by
-  symbol / file)*.
-- **Create/modify**: split `backend/app/models/__init__.py` into the per-aggregate package with
-  re-export facade; new `Workspace`, `WorkspaceMember`, `Identity`, `LocalCredential`,
-  `WorkspaceRole`; slim `User`; workspace `archived_at`/`purge_after` (no personal subtype);
-  restrictive membership→user FK; one-local-identity partial unique index;
-  `Notebook.workspace_id`/`created_by`; scalar `Notebook.deployment`; `NotebookVisibility`
-  created as `PRIVATE/UNLISTED/PUBLIC`; no `Deployment.port`; `enum_values` public in `models/base.py`.
-- **Verification**: `uv run python -c "import app.models"`; `LINT` scoped to `app/models`.
-  (Suite red is expected until T5.)
-- **Status**: complete (impl ×1, verify ×1 PASS — configure_mappers 0, ruff/ty scoped 0; suite red as designed)
+## Milestone 1: Test, Rendering, And Packaging Foundation
 
-### M5·T2 — Squashed baseline + conftest (DT-2)
-- **Design**: *DT-2 Design → Baseline decision*, *→ Target `upgrade()` contract*,
-  *→ Explicit contracts*, *→ Deletions*, *→ Downgrade strategy*.
-- **Delete**: the two existing revision files `20260615_0001_initial_schema.py` and
-  `20260625_0002_unique_deployment_notebook.py`.
-- **Create**: `backend/app/db/migrations/versions/20260713_0001_initial_schema.py`
-  (`down_revision = None`) containing the final schema directly, with no data backfill, personal
-  workspace columns, `notebooks.user_id`, `users.password_hash`, `draft`, or deployment port.
-  **Modify**: `backend/tests/conftest.py` TRUNCATE lists gain the four new tables.
-- **Verification**: recreate the test database; `uv run alembic upgrade head` exits 0;
-  `uv run alembic downgrade base && uv run alembic upgrade head` exits 0; schema inspection tests
-  pin archive columns, restrictive membership FK, local-identity partial unique index, required
-  notebook workspace FK, and unique deployment notebook FK.
-- **Dependencies**: M5·T1.
-- **Status**: complete (impl ×1, verify ×1 PASS — alembic round-trip 0, 8 inspection tests green,
-  ruff/ty scoped 0; note: hand-named unique constraints will show phantom drift under any future
-  `alembic revision --autogenerate`)
+**Intent:** establish the execution and test environment before behavior changes.
 
-### M5·T3 — Access-policy module + deps (DT-3)
-- **Design**: *DT-3 Design → Target design — module `backend/app/services/access.py`*,
-  *→ Access matrix → read/write mapping (encoded by `can_access`)*, *→ Centralised
-  hide-vs-forbid (the one 401/403/404 rule)*, *→ Explicit contracts*; *DT-5 Design → Policy
-  reuse — `services/access.py`*.
-- **Create**: `backend/app/services/access.py`; `require_notebook` dep factory and annotated
-  deps in `backend/app/api/deps.py`; `backend/tests/test_access.py` pinning the full
-  visibility×role×action matrix and denial selection as pure-function tests, plus DB-backed tests
-  for membership lookup, active-workspace filtering, missing/hidden notebook equivalence, and final
-  workspace denial behavior (missing/archived/non-member → 404; under-role member → 403).
-- **Verification**: `uv run pytest tests/test_access.py` green; `LINT`.
-- **Dependencies**: M5·T2.
-- **Status**: complete (impl ×1, verify ×1 PASS — 41 access tests + 8 migration tests green,
-  ruff clean, ty scoped 0; full 24-cell matrix pinned)
+### 1.1 Add Dependencies And Scripts
 
-### M5·T4 — Auth services on split credentials (DT-4)
-- **Design**: *DT-4 Design → Target design — module `backend/app/services/auth_service.py`*,
-  *→ OIDC HTTP flow + verification seam (`api/auth.py`)*, *→ SAML decision*, *→ Explicit
-  contracts*, *→ Impact on adjacent modules*, *→ Deletions (by symbol)*. Registration creates no
-  workspace; `local` identity subject = `str(user.id)` exactly. Identity misses use trusted,
-  verified, normalized-email linking only when the provider explicitly enables it, else JIT.
-- **Modify**: `backend/app/services/auth_service.py` (`_provision`, `BasicAuthService`,
-  `OIDCAuthService`); `backend/app/api/auth.py` (OIDC routes); `backend/pyproject.toml` +
-  `uv lock` — add `authlib>=1.3.0` per *DT-12 Design → Dependency additions —
-  `backend/pyproject.toml`* (the OIDC verification adapter builds on it); `core/security.py`
-  and the JWT seam untouched — assert no diff.
-- **Verification**: `uv run pytest tests/test_auth.py` green after its rewrite here (register
-  → user + local identity + credentials, no workspace, one transaction; one-local-identity DB guard;
-  authenticate against `local_credentials`; OIDC resolve/link/JIT with trusted verified and
-  untrusted/unverified email cases mocked);
-  `git diff --stat backend/app/core/security.py` is empty.
-- **Dependencies**: M5·T2, M5·T3.
-- **Status**: complete (impl ×1, verify ×1 PASS — 64 tests green across auth/access/migrations,
-  security.py byte-identical; M9 carry-forwards: declare `joserfc>=1.6.0` in pyproject, pin an
-  algorithms allow-list in `oidc_verifier.verify_callback`, replace `_lookup_oidc_provider`'s
-  always-404 body with the `OIDC_PROVIDERS` settings lookup + wire `trusted_email_linking`)
+Modify `frontend/package.json` and lockfile:
 
-### M5·T5 — Router re-keying + schema surface + test-suite green (DT-6 core)
-- **Design**: *DT-6 Design → Per-endpoint target design*, *→ Shared target-workspace resolver —
-  `notebooks.py`*, *→ Response shaping — `_notebook_out`* (scoped to the `user_id` removal:
-  rewrite the owner join onto `workspace_id`/`created_by` and stub parent attribution; the
-  readability-gated `parent_workspace_id`/`parent_workspace_slug` fields finish in M7),
-  *→ Revised schemas — `backend/app/schemas/notebook.py`* (ownership fields
-  only; attribution/fork fields finish in M7), *→ Deletions (by file / symbol)*; *DT-1 Design →
-  Affected pydantic schemas*; *DT-10 Design → Schema changes* (`DeploymentOut` is already port-free;
-  only the ORM column/writers disappear).
-- **Modify**: `backend/app/api/{notebooks,sessions,deployments,data}.py` onto DT-3 deps
-  (delete every `_is_owner`/`_can_view`/`_get_owned_notebook`/`_load_owned_notebook`/
-  `_authorize_*` copy); `backend/app/schemas/{notebook,deployment}.py`; rewrite affected
-  fixtures/assertions in `backend/tests/{test_notebooks,test_data,test_sessions,test_deployments}.py`.
-  Notebook create/import/fork schemas require `workspace_id`; no route infers a default workspace.
-  If the test rewrite exceeds this task's budget, split at the file boundary (notebooks+data /
-  sessions+deployments) into T5a/T5b — record the split in this file.
-- **Verification**: `LINT`; `TYPES`; `TEST` — **full suite green closes M5**.
-  `grep -rn "user_id" backend/app/api backend/app/schemas` shows no notebook-ownership use;
-  `grep -rn "draft" backend/app backend/tests` returns nothing.
-- **Dependencies**: M5·T4.
-- **Status**: complete (impl ×1 — thrice infra-interrupted, no fix passes needed; verify ×1 PASS —
-  ruff 0, ty 0, pytest 179 passed + 2 integration, all greps empty; no T5a/T5b split needed.
-  M5 milestone closed. M7 note: `_notebook_out` currently does NO parent lookup — the attribution
-  join + readability gating is net-new work there, not a tweak)
+- Replace `@sveltejs/adapter-auto` with `@sveltejs/adapter-node`.
+- Add `vitest`, `jsdom`, and `@playwright/test` as development dependencies; reuse the existing
+  Svelte Vite plugin.
+- Add scripts:
 
-## M6 — Workspace & membership management API
+```json
+{
+  "test:unit": "vitest run",
+  "test:unit:watch": "vitest",
+  "test:e2e": "playwright test",
+  "test:e2e:ui": "playwright test --ui"
+}
+```
 
-**Intent**: expose workspace lifecycle and collaboration endpoints, including hidden/restorable
-archives and safe user/workspace deletion behavior.
+### 1.2 Configure The Node Adapter
 
-- **Design**: *DT-5 Design → Endpoint surface*, *→ Pydantic schemas —
-  `backend/app/schemas/workspace.py`*, *→ FastAPI dependency pair — `backend/app/api/deps.py`
-  (additions, mirrors DT-3)*, *→ Router module — `backend/app/api/workspaces.py` (concrete
-  signatures)*, *→ Wiring — `backend/app/main.py`*, *→ Explicit contracts*.
-- **Create**: `backend/app/api/workspaces.py`; `backend/app/schemas/workspace.py`;
-  `backend/app/services/workspace_service.py`; a scheduler-agnostic
-  `backend/app/commands/purge_archived_workspaces.py` CLI entrypoint;
-  `backend/tests/test_workspaces.py` pinning: explicit create + owner membership, last-owner
-  protection, non-member 404 hide, owner-only member management, active "my workspaces" listing,
-  non-empty archive, hidden archived resources, owner archive listing, restore, fixed purge deadline,
-  due-only idempotent purge, sole-member hard-delete on user deletion, and shared last-owner block.
-- **Modify**: `backend/app/api/deps.py` (`require_workspace` pair using DT-3's active filtering);
-  `backend/app/services/access.py` only for the archived-workspace owner loader used by list/restore;
-  `backend/app/core/config.py` + `.env.example` (add positive
-  `WORKSPACE_ARCHIVE_RETENTION_DAYS`, default 30); `backend/app/main.py`.
-- **Verification**: `LINT`; `TYPES`; `TEST`.
-- **Dependencies**: M5.
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 197 passed + 2 integration,
-  purge CLI executed clean; carry-forward to M7: add the delete_user combined-ordering test —
-  sole-member workspace A survives when sole-owner-of-shared workspace B triggers the 409)
+Modify `frontend/svelte.config.js`:
 
-## M7 — Notebook API completion: forking, discovery, attribution
+```js
+import adapter from '@sveltejs/adapter-node';
 
-**Intent**: finish DT-6 — fork semantics, discovery predicate, parent attribution, publish
-transitions, and the `data.py` read rule.
+const config = {
+  preprocess: vitePreprocess(),
+  kit: { adapter: adapter() }
+};
+```
 
-- **Design**: *DT-6 Design → Per-endpoint target design*, *→ Discovery query (replaces the
-  inline `visibility_filter`)*, *→ Response shaping — `_notebook_out`*, *→ Revised schemas —
-  `backend/app/schemas/notebook.py`* (remainder), *→ `data.py` access rules & the runtime-write
-  decision (resolves DT-3 open question)* (GET rule only; POST moves in M8), *→ Explicit
-  contracts*, *→ Data flow — fork*.
-- **Modify**: `backend/app/api/notebooks.py` (fork endpoint semantics: private, `parent_id`,
-  `fork_count` increment in one transaction; target-workspace resolver; discovery/search onto
-  `visible_notebooks`); `backend/app/api/data.py` (GET = notebook READ); schemas
-  (`NotebookFork`, attribution fields `parent_title`/`parent_workspace_id`/`parent_workspace_slug`
-  gated on parent readability).
-- **Create/extend tests**: fork lands private in chosen workspace and bumps `fork_count`;
-  create/import/fork reject missing `workspace_id`; discovery excludes every archived-workspace
-  notebook plus private non-member notebooks and includes active membership ones; attribution
-  hidden when parent unreadable; publish/unpublish embedding behavior per *DT-6 Design →
-  Explicit contracts*.
-- **Verification**: `LINT`; `TYPES`; `TEST`.
-- **Dependencies**: M5 (M6 for fork-into-shared-workspace test fixtures).
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 210 passed + 2 integration;
-  M10 sweep note: replace deprecated `row.tuple()` with `._tuple()` repo-wide — notebooks.py
-  `_parent_attribution` + deployments.py:82,111)
+Create `frontend/src/routes/+layout.ts`:
 
-## M8 — Internal API & service-token auth
+```ts
+export const ssr = false;
+```
 
-**Intent**: add the NetworkPolicy-scoped internal endpoints (source fetch, data write/read-back)
-with per-session token binding, and remove the public data POST.
+### 1.3 Configure Vitest
 
-- **Design**: *DT-8 Design → Internal endpoint surface — `backend/app/api/internal.py`*,
-  *→ Service-token auth contract (resolves the DT-3/DT-6 open item)*, *→ Explicit contracts*;
-  *DT-6 Design → `data.py` access rules & the runtime-write decision* (public POST removal);
-  *DT-11 Design → Session-start source flow (per backend)* (the source endpoint reads via the
-  storage seam).
-- **Create**: `backend/app/api/internal.py` (`GET /api/internal/notebooks/{id}/source`,
-  `POST /api/internal/notebooks/{id}/data`, internal GET read-back); token issuance/binding per
-  the auth contract; `backend/tests/test_internal.py` pinning: valid token for notebook A cannot
-  read/write notebook B; expired/absent token → contract's error; source body matches storage.
-- **Modify**: `backend/app/main.py` (router registration); `backend/app/api/data.py` (delete
-  public POST); `backend/tests/test_data.py`; `backend/app/core/security.py` — **additive
-  only**: `create_session_token`/`decode_session_token` beside the untouched user-token helpers
-  per *DT-8 Design → Service-token auth contract* (M5·T4's no-diff assertion was task-scoped
-  and is not violated by this later addition). `SESSION_TOKEN_TTL_SECONDS` does not exist until
-  M9's DT-12 layout — use a module-level default constant here; M9 replaces it with the setting.
-- **Verification**: `LINT`; `TYPES`; `TEST`. `grep -n "post" backend/app/api/data.py` shows no
-  public write route.
-- **Dependencies**: M5, M3 (gateway), M7 (data GET rule in place).
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 221 passed + 2 integration;
-  token-confusion pinned in all four directions. Deliberately NOT done: an explicit typ-absence
-  check in the user `decode_token` — the wall is already airtight since session tokens carry no
-  `sub`, and DT-4's user-JWT seam guarantee stays intact)
+Extend `frontend/vite.config.ts` with a jsdom test environment and a setup file. Create
+`frontend/src/test/setup.ts`. Do not add a component-testing library until a test needs DOM-level
+component rendering; pure API/store tests are sufficient initially.
 
-## M9 — Kube session backend & configuration surface
+### 1.4 Configure Playwright
 
-**Intent**: implement `KubeSessionManager` against the CRD contract and rationalise settings
-with the backend selector.
+Create `frontend/playwright.config.ts` and `frontend/e2e/`.
 
-- **Design**: *DT-7 Design → KubeSessionManager — CR/Secret/Service mapping*, *→ Value-object
-  construction rule (both backends)*, *→ Explicit contracts*, *→ Dependency to add*;
-  *DT-10 Design → Handoff resolutions* (QuotaExceeded sentinel → `SessionCapacityError`);
-  *DT-12 Design → Target design — `backend/app/core/config.py`*, *→ Target design —
-  `.env.example` (rewritten)*, *→ `mark_active` coalescing window — handoff decision (DT-7/DT-8)*,
-  *→ Explicit contracts*, *→ Deletions (settings keys + related code)*, *→ Dependency additions —
-  `backend/pyproject.toml`*.
-- **Create**: `backend/app/services/kube_session_manager.py`;
-  `backend/tests/test_kube_session_manager.py` with a faked `kubernetes_asyncio` client pinning:
-  CR name rule (deployment id vs uuid4), label list/get, wake = token refresh + annotation +
-  poll, `SessionTarget` from `status.serviceName` + Secret, QuotaExceeded → 429-class error,
-  ready-timeout → 503-class error.
-- **Modify**: `backend/app/core/config.py` (full DT-12 layout: `SESSION_BACKEND`, kube-only
-  settings with conditional validation, `NOTEBOOK_STORAGE_BACKEND`, OIDC settings including
-  per-provider `trusted_email_linking`, retain `WORKSPACE_ARCHIVE_RETENTION_DAYS`, new
-  `PUBLIC_API_URL`, the `MARIMO_READY_TIMEOUT_SECONDS`→`SESSION_READY_TIMEOUT_SECONDS` rename,
-  `MAX_CONCURRENT_SESSIONS` disposition per DT-12); `get_session_manager()` selector;
-  `backend/pyproject.toml` + `uv lock` (`kubernetes-asyncio>=32.0.0`); `.env.example` rewritten.
-- **Verification**: `LINT`; `TYPES`; `TEST` (kube tests run against fakes; no cluster needed).
-  `SESSION_BACKEND=kube` without `SESSION_NAMESPACE` fails settings validation (pinned test);
-  `grep -rn "MAX_CONCURRENT_SESSIONS\|MARIMO_PORT_RANGE\|IDLE_TIMEOUT" backend/app` matches only
-  what DT-12 keeps.
-- **Dependencies**: M2, M4, M8.
-- **Status**: complete (impl ×1, verify ×1 PASS — ruff 0, ty 0, pytest 246 passed + 2 integration,
-  all greps empty, uv lock consistent; the "without SESSION_NAMESPACE" wording resolved as
-  kube+invalid-namespace → ValidationError per DT-12's default. M10 sweep additions: strengthen
-  the wake-ordering test to enforce a global secret-before-annotation timeline; validate the kube
-  test fixtures' CR shapes against deploy/crd/marimosession.yaml once it lands (risk #4))
+- Require `E2E_DATABASE_URL` to name the dedicated `molab_e2e` database.
+- Refuse to run destructive setup for any other database name.
+- Run Alembic downgrade/upgrade against only that database.
+- Start the backend with `SESSION_BACKEND=subprocess` on a dedicated port.
+- Build and start the adapter-node frontend on a dedicated port.
+- Run browser tests serially until fixtures prove safe for parallel execution.
 
-## M10 — CRD & namespace manifests, final sweep
+Example guard in Playwright global setup:
 
-**Intent**: check in the cluster-side contracts the operator and platform team consume, and
-close out global acceptance.
+```ts
+const databaseUrl = process.env.E2E_DATABASE_URL ?? '';
+if (!databaseUrl.includes('/molab_e2e')) {
+  throw new Error('E2E_DATABASE_URL must target molab_e2e');
+}
+```
 
-- **Design**: *DT-8 Design → Finalised CRD schema*, *→ Per-session manifests (restricted-v2 SCC
-  compliant)*, *→ Namespace guardrails (`marimohub-sessions`)*, *→ Reconcile loop (create /
-  ready / fail / idle / wake / delete)* (checked in as the operator's spec, not implemented).
-- **Create**: `deploy/crd/marimosession.yaml`; `deploy/namespace/{namespace,networkpolicy,
-  resourcequota,limitrange}.yaml`; `deploy/README.md` pointing the operator implementer at the
-  DT-8 reconcile pseudocode section.
-- **Modify**: none beyond stragglers found by the sweep below.
-- **Verification**: from `backend/`: `uv run --with pyyaml python -c "import pathlib,yaml;
-  [list(yaml.safe_load_all(p.read_text())) for p in pathlib.Path('../deploy').rglob('*.yaml')]"`
-  exits 0; global sweep greps return nothing:
-  `grep -rn "TODO\|XXX\|FIXME" backend/app`, `grep -rniE "\bDT-[0-9]" backend/app backend/tests`
-  (no design-task references in code), plus every per-milestone deletion grep re-run;
-  `LINT`; `TYPES`; `TEST`; `uv run alembic upgrade head` from scratch DB.
-- **Dependencies**: M9.
-- **Status**: complete (impl ×1 — ruff 0, ty 0, pytest 247 passed + 2 integration, all sweep greps
-  empty, yaml-parse check exits 0, `alembic upgrade head` exits 0 against the already-baseline-
-  stamped dev DB (a `DROP DATABASE`/recreate was blocked by the session's permission policy on
-  destructive local-state actions — report this to the user before retrying that step). `.tuple()`
-  swept to `._tuple()` at deployments.py:82,111 and notebooks.py:78 — no SADeprecationWarning in
-  the suite. Kube wake-ordering test now asserts a single shared event log across both fake
-  clients; a new test parses `deploy/crd/marimosession.yaml` and asserts every CR body the manager
-  builds carries all required `spec` fields (risk #4), via a `pyyaml` dev-group dependency. Found
-  in the sweep: the M4 deletion grep `read_source\|read_current_source` is no longer empty —
-  DT-8/M8 intentionally names the internal source-fetch endpoint `read_source`
-  (`app/api/internal.py`), a deliberate new symbol reusing the old protocol method's name, not a
-  leftover.)
+### 1.5 Add The Production Frontend Container
 
----
+Create `Containerfile.frontend`:
 
-## Risk register
+```dockerfile
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
 
-1. **Squashed baseline coordination** (M5·T2). Symptom: a developer or shared environment is still
-   stamped with one of the deleted revision ids and cannot upgrade. Watch: announce the reset and
-   recreate every development/CI database at the M5 boundary. Fallback: restore the old chain and use
-   a destructive `0003` only if an environment unexpectedly requires revision continuity.
-2. **Test-rewrite volume underestimate** (M5·T5). Symptom: the task blows its token budget
-   before the suite is green. Fallback: split at the documented T5a/T5b file boundary; do not
-   merge M5 partially.
-3. **Gateway consolidation regressions in WS relay** (M3). Symptom: edit sessions disconnect,
-   saves stop persisting, or deployment apps hang after idle. Watch: the M3 gateway tests plus
-   a manual smoke (edit → autosave → reload; deploy → idle → wake). Fallback: keep the milestone
-   unmerged; do not reintroduce the duplicated bodies.
-4. **Kube backend correctness unprovable without a cluster** (M9). Symptom: fakes pass but CR
-   shapes drift from the checked-in CRD. Watch: validate test fixtures against
-   `deploy/crd/marimosession.yaml` required fields in the test itself. Fallback decision point:
-   if drift is found after M10, the CRD YAML is the contract — fix the manager, never the CRD,
-   unless the operator team agrees.
-5. **`ty` type-checker instability** (all milestones). Symptom: `uv run ty check` fails on
-   pre-existing or upstream issues unrelated to the change. Fallback: record the baseline count
-   at M1 and hold milestones to "no new diagnostics" instead of zero.
-6. **Archive filtering or purge omissions** (M6+). Symptom: archived notebooks remain discoverable,
-   runtimes stay live, or due workspaces never purge. Watch: policy/query tests cover every read path;
-   archive tests assert runtime stop and due-only idempotent purge; deployment runs the purge CLI on a
-   schedule. Fallback: disable archive deletion until filtering and scheduling are corrected.
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000
+COPY --from=build /app/build ./build
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/package.json ./package.json
+EXPOSE 3000
+CMD ["node", "build"]
+```
 
-## Definition of done
+Use `$env/dynamic/public` so `PUBLIC_API_URL` remains configurable at container runtime.
 
-- All milestones `complete`; every task's Status updated in this file.
-- From `backend/`: `uv run ruff check .`, `uv run ty check` (per the M1 baseline rule),
-  `uv run pytest` (full suite incl. `-m integration`), and `uv run alembic upgrade head` on a
-  fresh database all pass.
-- Every deletion listed in DESIGN.md's per-task "Deletions" headings is gone: the per-milestone
-  greps in this plan all return empty.
-- New contracts are pinned by named tests: access matrix (test_access), provisioning/linking atomicity
-  and subject scheme (test_auth), workspace archive/restore/purge and deletion guards (test_workspaces), fork/discovery/attribution
-  (test_notebooks), internal token binding (test_internal), gateway resolve-or-wake and error
-  mapping (test_gateway), kube CR mapping (test_kube_session_manager), error taxonomy
-  (test_errors), squashed-baseline up/down smoke and schema constraints.
-- `deploy/` manifests parse and match the DT-8 schema; `.env.example` matches DT-12's layout.
-- No TODOs, commented-out code, compatibility shims, or references to this plan in the code.
+### 1.6 Document Frontend Environment
 
----
+Create `frontend/.env.example` with:
 
-## Verification
+```dotenv
+PUBLIC_API_URL=http://localhost:8000
+```
 
-**COMPLETE (2026-07-15, cycle 3).** All-DT conflict assessment and milestone-order verification
-performed against the post-revision DESIGN.md (DT-1…DT-13 all `complete`, including the DT-1/DT-2
-revisions: no personal-workspace subtype, explicit workspace targets, archive/restore/purge, safe
-user deletion, trusted verified-email linking, scalar deployments, squashed baseline).
+Replace the generated `frontend/README.md` with project-specific install, dev, test, build, and
+adapter-node run commands.
 
-Checks performed and passed:
+### Verification
 
-- **Coverage** — every DT maps to exactly one owning milestone (or a stated split: DT-6 core in
-  M5·T5 / remainder in M7; DT-7 subprocess half in M2 / kube half in M9; DT-8 backend half in M8 /
-  manifests in M10); no DT is orphaned and no milestone cites a pending DT.
-- **Milestone ordering vs. design dependencies** — the M1→M10 chain respects the DESIGN.md
-  dependency sketch. The one forward reference found (M4 consuming DT-10's table, which names
-  DT-3 deps that arrive in M5·T3) is resolved by M4's recorded authz carve-out.
-- **Deletion timing** — every deletion lands at or after the point its last caller is removed.
-  Fixed in this cycle: `deployment_lifecycle.py` survives M2's `process_manager.py` deletion but
-  imported it — M2 now rewires it onto the seam. `MAX_CONCURRENT_SESSIONS` staying unused
-  M2→M9 is a deliberate staging choice, gated by M9's grep.
-- **Current-state accuracy** — DESIGN.md's file map, importer list, and reaper behavior verified
-  against the working tree (importers of `process_manager`: `main`, `schemas/session`,
-  `api/{sessions,deployments,proxy}`, `services/{deployment_lifecycle,marimo_proxy}` — all now in
-  M2's Modify set; `reap_once` matches on DB `status==RUNNING`, confirming the recorded M3→M4
-  transient).
-- **Spec-doc consistency** — `marimohub-schema-redesign.md` and `marimosession-crd-spec.md` agree
-  with DT-1/DT-2 and DT-7/DT-8 respectively; DESIGN.md's deliberate extensions (finalizer, wake
-  annotation, TCP readiness probe, backend-authored Secret) are recorded as decisions, not drift.
-- **Test-gate integrity** — each milestone's green requirement is achievable: M3 now carries the
-  `test_deployments.py` serving-path fallout; M1 pins the blanket-`Exception`-handler decision the
-  DT-13 open question left to the test rewrite.
+```bash
+npm ci
+npm run check
+npm run test:unit
+npm run build
+PUBLIC_API_URL=http://localhost:8000 node build
+```
 
-Resolutions recorded in this cycle: M1 blanket-handler decision; M2 `deployment_lifecycle.py`
-rewiring; M3 test fallout + accepted M3→M4 status transient; M4 authz carve-out; M8 additive
-`core/security.py` change + TTL-constant-until-M9 note; DT-6 fork flowchart's stale
-optional/personal workspace-target references corrected in DESIGN.md.
+**Status:** complete
 
-Known accepted gaps (not blockers): 429 capacity fidelity depends on the out-of-repo operator
-emitting the `QuotaExceeded:` sentinel (503 fallback documented in DT-10/M9); kube correctness is
-proven against fakes only until a cluster is available (risk register #4).
+## Milestone 2: API Contract And Authentication
 
-The plan is approved for implementation starting at M1.
+**Intent:** make the client accurately represent the backend and provide one complete local-auth flow.
+
+### 2.1 Replace Obsolete API Types
+
+Modify `frontend/src/lib/api.ts`.
+
+- Replace `draft` with `private`.
+- Replace Notebook `user_id` with `workspace_id` and nullable `created_by`.
+- Replace parent owner fields with `parent_workspace_id` and `parent_workspace_slug`.
+- Type `source` as optional and nullable because list rows omit it while detail rows may return null.
+- Add Workspace, WorkspaceArchive, WorkspaceMember, and WorkspaceRole types.
+- Give update its own type; never advertise workspace reassignment.
+
+Example:
+
+```ts
+export type WorkspaceRole = 'owner' | 'editor' | 'viewer';
+export type NotebookVisibility = 'private' | 'unlisted' | 'public';
+
+export type Notebook = {
+  id: string;
+  workspace_id: string;
+  created_by: string | null;
+  parent_id: string | null;
+  parent_title?: string | null;
+  parent_workspace_id?: string | null;
+  parent_workspace_slug?: string | null;
+  title: string;
+  description: string | null;
+  tags: string[];
+  visibility: NotebookVisibility;
+  fork_count: number;
+  source?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type NotebookUpdateRequest = {
+  title?: string;
+  description?: string | null;
+  tags?: string[];
+  source?: string | null;
+};
+```
+
+### 2.2 Replace Obsolete API Methods
+
+- Require `workspace_id` in create/import bodies.
+- Change fork to `fork(id, {workspace_id})`.
+- Add all existing Workspace endpoints.
+- Add `notebooks.getDeployment(id)`.
+- Delete `sessions.save`, `notebooks.postData`, `notebooks.getData`, and their dead types.
+- Let session delete accept request options needed by teardown and call it with `auth: false`.
+
+### 2.3 Fix Query Serialization
+
+Serialize arrays as repeated parameters:
+
+```ts
+if (Array.isArray(value)) {
+  for (const item of value) url.searchParams.append(key, item);
+} else {
+  url.searchParams.set(key, String(value));
+}
+```
+
+Keep `normalizeTagInput()` responsible only for splitting and trimming form input.
+
+### 2.4 Replace The Auth Store Cleanly
+
+Modify `frontend/src/lib/stores/auth.ts`.
+
+- Use storage key `marimohub-auth`.
+- Do not read or migrate `molab-auth`.
+- Store `{token, currentUser}` in one versionless current shape.
+- Require `currentUser.id` whenever authenticated.
+- Derive the ID from JWT `sub`; this is display/client-state data, not authorization.
+- Expose synchronous token/state snapshots for API calls and client route guards.
+- Make logout clear local state even if backend logout fails.
+
+### 2.5 Complete Register, Login, Logout, And Expiry
+
+Modify both auth pages and root layout.
+
+- Share one `safeNextPath()` helper.
+- Preserve `next` between Login and Register links.
+- Registration logs in and uses `next ?? '/workspaces'`.
+- Login uses `next ?? '/workspaces'`.
+- Logout clears auth and workspace state before navigating home.
+- The logout request bypasses centralized 401 redirect handling; its `finally` path clears local
+  state, so an expired token cannot race a redirect back to the page being logged out from.
+- Only a 401 from a request that sent a token expires the local session.
+- Expiry redirects to `/auth/login?next=<current path and query>`.
+- Prevent redirect loops on auth routes.
+
+Example safe return-path helper:
+
+```ts
+export function safeNextPath(value: string | null, fallback = '/workspaces') {
+  if (!value || !value.startsWith('/') || value.startsWith('//')) return fallback;
+  return value;
+}
+```
+
+### 2.6 Add Protected Route Guards
+
+Create a small client-only guard helper and `+page.ts` guards for:
+
+- `/workspaces`
+- `/workspaces/archived`
+- `/workspaces/[id]`
+- `/notebooks/new`
+- `/notebooks/[id]/edit`
+
+Do not guard notebook detail or run routes globally; backend visibility controls them.
+
+### 2.7 Pin API And Auth Behavior With Unit Tests
+
+Add tests for:
+
+- string and array error detail normalization;
+- repeated tag parameters;
+- exact current request bodies;
+- no obsolete API methods;
+- JWT User ID extraction;
+- invalid stored auth removal;
+- safe `next` handling;
+- token-bearing versus anonymous 401 behavior.
+
+### Verification
+
+Run `ALL`. Grep `frontend/src` for `draft`, notebook `user_id`, `parent_owner`, `sessions.save`,
+`postData`, and `getData`; only WorkspaceMember `user_id` may remain.
+
+**Status:** complete
+
+## Milestone 3: Workspace State And Management UI
+
+**Intent:** add the active ownership/collaboration surface that all notebook writes depend on.
+
+### 3.1 Add The Active Workspace Store
+
+Create `frontend/src/lib/stores/workspaces.ts` as the sole owner of `GET /api/workspaces` state.
+
+```ts
+type WorkspaceState =
+  | { status: 'anonymous'; items: [] }
+  | { status: 'loading'; items: Workspace[] }
+  | { status: 'ready'; items: Workspace[] }
+  | { status: 'error'; items: Workspace[]; error: string };
+```
+
+Expose:
+
+- `refresh()`;
+- `clear()`;
+- `roleFor(workspaceId)`;
+- `canWrite(workspaceId)`;
+- writable workspaces (`owner | editor`).
+
+Guard against stale responses after logout or a newer refresh:
+
+```ts
+const request = ++generation;
+const token = getAuthToken();
+const items = await api.workspaces.list();
+if (request !== generation || token !== getAuthToken()) return;
+state.set({ status: 'ready', items });
+```
+
+### 3.2 Synchronize Workspace State
+
+In the root layout:
+
+- refresh after stored auth hydration;
+- refresh after login/register;
+- clear on logout/expiry;
+- refresh on window focus while authenticated;
+- never issue a protected workspace request while anonymous.
+
+### 3.3 Add Workspace Navigation And User ID
+
+- Add Workspaces navigation for authenticated users.
+- Show the authenticated User ID with a copy button on the Workspaces page.
+- Explain that a user shares this ID with a Workspace Owner to be added.
+
+### 3.4 Build The Workspace List/Create Route
+
+Create `frontend/src/routes/workspaces/+page.svelte`.
+
+- Consume the store rather than loading a duplicate list.
+- Render loading, retryable error, empty, and ready states.
+- Show name, immutable slug, caller role, and creation date.
+- Add name and optional slug creation form.
+- Validate slug format client-side and show backend 409 inline.
+- Refresh the store after successful creation.
+
+### 3.5 Build The Workspace Detail Route
+
+Create `frontend/src/routes/workspaces/[id]/+page.ts` and `+page.svelte`.
+
+- Load workspace detail and member list once.
+- Show rename controls only for Owner.
+- Show member User ID, username, email, role, and join date.
+- Add members by raw User ID and role.
+- Show role-change and remove controls only where the current backend permits them.
+- Handle duplicate member, unknown user, and last-owner errors inline.
+- Refresh the active store after every mutation.
+- If focus refresh shows the current workspace disappeared, redirect to `/workspaces` with a notice.
+
+Do not add viewer/editor self-leave UI; the frozen backend's delete-member route is Owner-only.
+
+### 3.6 Build The Archive Route
+
+Create `frontend/src/routes/workspaces/archived/+page.ts` and `+page.svelte`.
+
+- Show archive and purge timestamps.
+- Archive uses explicit confirmation and then returns to `/workspaces`.
+- Restore refreshes the archived list and active workspace store.
+- Present archive as reversible and purge as permanent.
+- Do not claim stronger expiration or runtime guarantees than the backend currently provides.
+
+### 3.7 Test Workspace State And UI
+
+Vitest:
+
+- auth hydration and clear;
+- stale refresh suppression;
+- role and writable-workspace derivation;
+- retry behavior.
+
+Playwright:
+
+- register lands on Workspaces;
+- create success and slug conflict;
+- User ID copy;
+- two-user add/promote/demote/remove flow;
+- last-owner conflict;
+- archive and restore;
+- hard refresh of every workspace route.
+
+### Verification
+
+Run `ALL` and the workspace Playwright spec.
+
+**Status:** complete
+
+## Milestone 4: Notebook Workspace Alignment
+
+**Intent:** repair create/import/fork/detail flows and expose current notebook management features.
+
+### 4.1 Add A Shared Workspace Target Picker
+
+Create `frontend/src/lib/components/WorkspaceTargetPicker.svelte`.
+
+- Consume writable workspaces from the store.
+- Show loading and retry states.
+- Preselect the sole writable workspace.
+- Require a deliberate selection when multiple exist.
+- Label duplicate names with immutable slugs.
+- With zero writable workspaces, link to `/workspaces`.
+
+### 4.2 Rework Notebook Creation
+
+Modify `frontend/src/routes/notebooks/new/+page.svelte`.
+
+- Put one target picker above the Blank/Upload/GitLab tabs.
+- Preserve the selected target while switching tabs.
+- Include `workspace_id` in every request.
+- Replace all Draft copy with Private Notebook.
+- Keep GitLab PAT ephemeral and clear it after submission.
+
+### 4.3 Replace Ownership With Capability
+
+Modify notebook detail.
+
+- Subscribe to workspace state so role changes are reactive.
+- Treat `loading` separately from no role.
+- `owner | editor`: Edit, Visibility, Delete, Deploy, Stop.
+- `viewer`: read/run/fork only.
+- non-member reader: read/run/fork only when backend allows read.
+- Show Workspace name and slug only when it is available from the caller's active workspace list.
+- Label this field Workspace, never Owner.
+
+Avoid a helper/name collision such as `const canWrite = $derived(canWrite(...))`; name the derived
+value `mayWriteNotebook` or similar.
+
+### 4.4 Add Visibility Controls
+
+- Use a select containing Private, Unlisted, and Public.
+- Label the operation Visibility.
+- Explain discovery/direct-link semantics.
+- Apply via the existing visibility endpoint and update page state from its response.
+
+### 4.5 Add Permanent Notebook Delete
+
+- Show only to Editors and Owners.
+- Require confirmation naming the Notebook and state that deletion cannot be undone.
+- On success navigate to `/discover`.
+- On 403/404 refresh workspace/auth state before presenting the backend error.
+
+### 4.6 Rework Fork
+
+- Anonymous users go to login with `next`.
+- Authenticated users always see target confirmation.
+- Preselect the sole writable target but still require confirmation.
+- Zero writable targets links to Workspace creation.
+- Submit `{workspace_id}` and navigate to the new fork's edit route.
+- Show backend source/target access errors inline.
+
+### 4.7 Correct Attribution And Discovery Copy
+
+- Render parent title and readable parent Workspace slug.
+- If parent attribution is hidden, say it is unavailable rather than exposing IDs.
+- Replace `draft` badge styling with `private`.
+- State that Discover shows Public Notebooks plus all Notebooks in the signed-in user's Workspaces;
+  Unlisted Notebooks remain direct-link-only for non-members.
+
+### 4.8 Test Notebook Flows
+
+Vitest:
+
+- target picker state rules;
+- role capability derivation;
+- visibility labels and request body.
+
+Playwright:
+
+- all three create methods send the selected workspace;
+- zero/one/multiple target behavior;
+- fork always confirms target;
+- viewer has no write controls, Editor does;
+- visibility transitions Private -> Unlisted -> Public -> Private;
+- permanent delete;
+- authenticated hard refresh of a Private Notebook;
+- multi-tag filtering sends repeated parameters and returns intersection results.
+
+### Verification
+
+Run `ALL`, notebook Playwright specs, and the obsolete-symbol grep from Milestone 2.
+
+**Status:** complete
+
+## Milestone 5: Deployment And Session Lifecycle UI
+
+**Intent:** align status, public-app, and editor teardown behavior with existing backend endpoints.
+
+### 5.1 Load Deployment Read State
+
+On Notebook detail:
+
+- fetch `GET /api/notebooks/{id}/deployment` after the Notebook loads;
+- treat deployment 404 as no deployment without turning it into a page error;
+- show an active public app link/status to every Notebook reader;
+- show stopped state and management actions only to Editors/Owners;
+- state that the app URL is public regardless of Notebook Visibility.
+
+### 5.2 Keep Deployment State Fresh
+
+- Re-fetch after deploy and stop.
+- Re-fetch on window focus.
+- Poll about every 15 seconds only while the document is visible and an active deployment exists.
+- Use one abortable/revisioned request path so older responses cannot overwrite newer state.
+- Preserve last-known state on transient failures; clear only on confirmed no-deployment 404.
+
+### 5.3 Correct Public Deployment Wake UX
+
+Modify `frontend/src/routes/deploy/[slug]/+page.svelte`.
+
+- Keep existing immediate failure for 404 and other terminal responses.
+- Retry 503/504 with a bounded timeout.
+- Stop on 429, explain capacity exhaustion, and show manual Retry.
+- Prevent overlapping attempts and cancel timers when the component is destroyed.
+
+### 5.4 Remove Explicit Session Save
+
+Modify `frontend/src/lib/components/SessionFrame.svelte`.
+
+- Delete the timer, delay, `saving` state, and `sessions.save` call.
+- Retain the user-facing statement that marimo autosaves automatically.
+- Treat session DELETE 404 as already ended.
+
+### 5.5 Make Normal Navigation Cleanup Deterministic
+
+- Intercept in-app navigation with SvelteKit `beforeNavigate`.
+- Cancel once, await session DELETE, then continue navigation.
+- Guard against navigation recursion.
+- The End Session button uses the same cleanup function.
+- On `pagehide`, send one unauthenticated best-effort DELETE with `keepalive: true`.
+- Do not await or promise unload cleanup.
+
+Example teardown request:
+
+```ts
+void api.sessions.delete(sessionId, {
+  auth: false,
+  keepalive: true
+});
+```
+
+### 5.6 Surface Session Authorization Failures
+
+- Anonymous edit 401 redirects to login with `next`.
+- Viewer edit 403 explains that Editor role is required and links back to Notebook detail.
+- Hidden/missing Notebook 404 uses the existing not-found presentation.
+- Run remains available anonymously when backend visibility permits it.
+
+### 5.7 Test Lifecycle UI
+
+Vitest:
+
+- deployment status request revision handling;
+- 404/no-deployment versus transient error;
+- 429 manual retry and bounded 503 retry;
+- session DELETE option construction.
+
+Playwright:
+
+- readers see active app, writers see controls;
+- Private Notebook deployment displays the public-access warning;
+- focus/poll observes running/sleeping changes;
+- 429 requires user Retry;
+- edit autosave persists after navigation without a save endpoint call;
+- in-app navigation waits for DELETE;
+- hard refresh and teardown do not produce duplicate session deletes.
+
+### Verification
+
+Run `ALL`, lifecycle Playwright specs, and:
+
+```bash
+grep -R "sessions.save\|postData\|getData\|/save" src
+```
+
+The grep returns no matches.
+
+**Status:** complete
+
+## Milestone 6: Full Browser Verification And Documentation
+
+**Intent:** prove the integrated frontend against the real frozen backend and close all stale docs/copy.
+
+### 6.1 Run The Dedicated E2E Stack
+
+- Start PostgreSQL with a separate `molab_e2e` database.
+- Apply the current backend Alembic migrations to it.
+- Start backend with subprocess sessions and E2E-only configuration.
+- Start the built adapter-node frontend, not Vite dev mode.
+- Verify CORS and runtime `PUBLIC_API_URL` before running tests.
+
+### 6.2 Run The Complete Two-User Journey
+
+Automate and manually smoke:
+
+1. Register User A; verify default Workspaces landing.
+2. Create Workspace Alpha and a Private Notebook in it.
+3. Open Edit, change source, wait for marimo autosave, navigate away, and reopen.
+4. Change Visibility to Public and verify Discover.
+5. Register User B, create Workspace Beta, and fork A's Notebook into Beta through confirmation.
+6. Add B to Alpha by copied User ID; verify Viewer then Editor capability changes.
+7. Exercise last-owner conflict and owner-only controls.
+8. Deploy A's Notebook and verify every reader sees the public app while only writers manage it.
+9. Stop and redeploy; verify status refresh on focus/poll.
+10. Archive and restore a scratch Workspace through the current backend behavior.
+11. Verify anonymous public read/run, login return path, and no write controls.
+12. Verify hard refreshes on every new route and both desktop/mobile viewports.
+
+### 6.3 Run Production Artifact Checks
+
+```bash
+npm run build
+PUBLIC_API_URL=http://localhost:8000 ORIGIN=http://localhost:3000 node build
+```
+
+- Request `/`, `/discover`, `/workspaces`, and a nested Notebook route from the Node server.
+- Confirm SPA deep links return the app shell.
+- Build `Containerfile.frontend` and pass the same smoke checks against the container.
+
+### 6.4 Finish Documentation And Copy Sweep
+
+- Replace the generated frontend README.
+- Link root `README.md` to `CONTEXT.md` and this plan.
+- Ensure all frontend copy uses Workspace ownership, Private visibility, and Archive terminology.
+- Document local auth limitations: localStorage JWT, no refresh token, no OIDC UI.
+- Document the dedicated E2E database safety rule.
+- Do not add ADRs.
+
+### 6.5 Final Gates
+
+```bash
+cd frontend
+npm ci
+npm run check
+npm run test:unit
+npm run build
+npm run test:e2e
+```
+
+Final greps:
+
+```bash
+grep -R "'draft'\|\"draft\"\|parent_owner\|sessions.save\|postData\|getData" src
+grep -R "notebook.user_id" src
+```
+
+Both return no matches. `user_id` remains only where it denotes a Workspace Member or copied User ID.
+
+**Status:** complete
+
+## Definition Of Done
+
+- All six milestones are complete and independently green.
+- Frontend types and request bodies match the frozen backend contract.
+- Local registration, login, logout, safe return paths, and expired-token recovery work.
+- Workspace create/list/detail/member/archive/restore UI works within current backend authorization.
+- Every notebook create/import/fork names a target Workspace.
+- No obsolete user-owned Notebook, Draft, old lineage, explicit save, or public data-client code remains.
+- Notebook Visibility and permanent delete controls are capability-gated.
+- Deployment read state is visible to readers and management is limited to Editors/Owners.
+- Session navigation cleanup and marimo autosave behavior are verified.
+- Vitest, Playwright, Svelte check, adapter-node build, and frontend container smoke all pass.
+- Desktop and mobile browser flows pass against the dedicated real-backend E2E stack.
+- `CONTEXT.md`, root README, frontend README, and environment examples agree with the shipped UI.
