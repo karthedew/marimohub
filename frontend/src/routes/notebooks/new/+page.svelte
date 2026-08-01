@@ -10,7 +10,7 @@
 	type Tab = 'blank' | 'upload' | 'gitlab';
 	type FieldErrors = Partial<Record<'title' | 'file' | 'url' | 'server', string>>;
 
-	const blankSource = 'import marimo as mo\n\napp = mo.App()\n\n\n@app.cell\ndef _():\n    mo.md("# Untitled notebook")\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n';
+	const blankSource = 'import marimo\n\napp = marimo.App()\n\n\n@app.cell\ndef _():\n    import marimo as mo\n    # Update the Notebook title from its MarimoHub settings.\n    return (mo,)\n\n\nif __name__ == "__main__":\n    app.run()\n';
 
 	// One target survives every tab switch below because this state lives
 	// above all three forms and the picker is rendered once, not per-tab.

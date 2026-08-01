@@ -41,6 +41,9 @@
 
 	let visibilityBusy = $state(false);
 	let visibilityError = $state<string | null>(null);
+	let titleValue = $state('');
+	let titleBusy = $state(false);
+	let titleError = $state<string | null>(null);
 
 	let confirmingDelete = $state(false);
 	let deleteBusy = $state(false);
@@ -89,6 +92,11 @@
 			document.removeEventListener('visibilitychange', handleVisibility);
 			window.removeEventListener('focus', handleFocus);
 		};
+	});
+
+	$effect(() => {
+		titleValue = notebook.title;
+		titleError = null;
 	});
 
 	// Poll only while there is a running/sleeping deployment to observe and the
@@ -185,6 +193,26 @@
 			visibilityError = caught instanceof ApiError ? caught.detail : 'Unable to update visibility.';
 		} finally {
 			visibilityBusy = false;
+		}
+	}
+
+	async function updateTitle() {
+		const title = titleValue.trim();
+		if (!title) {
+			titleError = 'Enter a Notebook title.';
+			return;
+		}
+		if (title === notebook.title) return;
+
+		titleBusy = true;
+		titleError = null;
+		try {
+			await api.notebooks.update(notebook.id, { title });
+			await invalidateAll();
+		} catch (caught) {
+			titleError = caught instanceof ApiError ? caught.detail : 'Unable to update the Notebook title.';
+		} finally {
+			titleBusy = false;
 		}
 	}
 
@@ -326,26 +354,48 @@
 				</div>
 			{:else if mayWriteNotebook}
 				<div class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-5 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
-					<label class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300" for="visibility">Visibility</label>
-					<select
-						class="mt-4 w-full rounded-2xl border border-slate-300/80 bg-white/80 px-4 py-3 text-sm text-slate-950 outline-none transition focus:border-hub-400 focus:ring-4 focus:ring-hub-200/60 dark:border-white/15 dark:bg-slate-950/60 dark:text-white"
-						id="visibility"
-						value={notebook.visibility}
-						disabled={visibilityBusy}
-						onchange={(event) => void changeVisibility(event.currentTarget.value as NotebookVisibility)}
-					>
-						{#each VISIBILITY_ORDER as option}
-							<option value={option}>{VISIBILITY_LABELS[option]}</option>
-						{/each}
-					</select>
-					<ul class="mt-3 space-y-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-						{#each VISIBILITY_ORDER as option}
-							<li><span class="font-semibold text-slate-700 dark:text-slate-200">{VISIBILITY_LABELS[option]}</span> — {VISIBILITY_EXPLANATIONS[option]}</li>
-						{/each}
-					</ul>
-					{#if visibilityError}
-						<p class="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{visibilityError}</p>
+					<p class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300">Notebook settings</p>
+					<form class="mt-5 grid gap-3" onsubmit={(event) => { event.preventDefault(); void updateTitle(); }}>
+						<label class="grid gap-2 text-sm font-semibold text-slate-700 dark:text-slate-200" for="notebook-title">
+							Notebook title
+							<input
+								class="rounded-2xl border border-slate-300/80 bg-white/80 px-4 py-3 text-sm text-slate-950 outline-none transition focus:border-hub-400 focus:ring-4 focus:ring-hub-200/60 dark:border-white/15 dark:bg-slate-950/60 dark:text-white dark:focus:ring-hub-400/15"
+								id="notebook-title"
+								bind:value={titleValue}
+								disabled={titleBusy}
+								aria-invalid={Boolean(titleError)}
+							/>
+						</label>
+						<Button intent="secondary" size="sm" type="submit" disabled={titleBusy || !titleValue.trim() || titleValue.trim() === notebook.title}>
+							{titleBusy ? 'Saving...' : 'Save title'}
+						</Button>
+					</form>
+					{#if titleError}
+						<p class="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{titleError}</p>
 					{/if}
+
+					<div class="mt-6 border-t border-slate-900/10 pt-5 dark:border-white/10">
+						<label class="text-sm font-semibold text-slate-700 dark:text-slate-200" for="visibility">Visibility</label>
+						<select
+							class="mt-2 w-full rounded-2xl border border-slate-300/80 bg-white/80 px-4 py-3 text-sm text-slate-950 outline-none transition focus:border-hub-400 focus:ring-4 focus:ring-hub-200/60 dark:border-white/15 dark:bg-slate-950/60 dark:text-white"
+							id="visibility"
+							value={notebook.visibility}
+							disabled={visibilityBusy}
+							onchange={(event) => void changeVisibility(event.currentTarget.value as NotebookVisibility)}
+						>
+							{#each VISIBILITY_ORDER as option}
+								<option value={option}>{VISIBILITY_LABELS[option]}</option>
+							{/each}
+						</select>
+						<ul class="mt-3 space-y-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
+							{#each VISIBILITY_ORDER as option}
+								<li><span class="font-semibold text-slate-700 dark:text-slate-200">{VISIBILITY_LABELS[option]}</span> — {VISIBILITY_EXPLANATIONS[option]}</li>
+							{/each}
+						</ul>
+						{#if visibilityError}
+							<p class="mt-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{visibilityError}</p>
+						{/if}
+					</div>
 				</div>
 
 				{#if !activeDeployment}

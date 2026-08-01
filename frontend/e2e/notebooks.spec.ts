@@ -31,8 +31,11 @@ test('a caller with exactly one writable Workspace gets it preselected, and crea
 	await expect(workspaceSelect).toHaveValue(/.+/);
 
 	const id = await createBlankNotebook(page, unique('Blank Notebook'));
+	const firstCell = page.frameLocator('iframe').locator('.cm-content').first();
+	await expect(firstCell.locator('.cm-line').first()).toHaveText('import marimo as mo', { timeout: 20_000 });
+	await expect(firstCell).toContainText('Update the Notebook title from its MarimoHub settings.');
 	await page.goto(`/notebooks/${id}`);
-	await expect(page.getByText('Solo Space')).toBeVisible();
+	await expect(page.getByRole('complementary').getByText('Solo Space', { exact: true })).toBeVisible();
 });
 
 test('zero writable Workspaces blocks creation and links to Workspace creation', async ({ page }) => {
@@ -168,6 +171,7 @@ test('a Viewer sees no write controls; promoting to Editor reveals them', async 
 		await memberPage.goto(`/notebooks/${notebookId}`);
 		await expect(memberPage.getByRole('link', { name: 'Run' })).toBeVisible();
 		await expect(memberPage.getByRole('link', { name: 'Edit' })).toHaveCount(0);
+		await expect(memberPage.getByLabel('Notebook title')).toHaveCount(0);
 		await expect(memberPage.getByLabel('Visibility', { exact: true })).toHaveCount(0);
 		await expect(memberPage.getByRole('button', { name: 'Delete notebook' })).toHaveCount(0);
 
@@ -177,12 +181,29 @@ test('a Viewer sees no write controls; promoting to Editor reveals them', async 
 
 		await memberPage.reload();
 		await expect(memberPage.getByRole('link', { name: 'Edit' })).toBeVisible();
+		await expect(memberPage.getByLabel('Notebook title')).toBeVisible();
 		await expect(memberPage.getByLabel('Visibility', { exact: true })).toBeVisible();
 		await expect(memberPage.getByRole('button', { name: 'Delete notebook' })).toBeVisible();
 	} finally {
 		await ownerContext.close();
 		await memberContext.close();
 	}
+});
+
+test('an Editor can rename a Notebook from its settings', async ({ page }) => {
+	await register(page, unique('renamer'));
+	await createWorkspace(page, 'Rename Space');
+	const id = await createBlankNotebook(page, unique('Original Notebook'));
+	const renamed = unique('Renamed Notebook');
+	await page.goto(`/notebooks/${id}`);
+
+	await page.getByLabel('Notebook title').fill(renamed);
+	await page.getByRole('button', { name: 'Save title' }).click();
+
+	await expect(page.getByRole('heading', { level: 1, name: renamed })).toBeVisible();
+	await expect(page).toHaveTitle(`${renamed} | MarimoHub`);
+	await page.reload();
+	await expect(page.getByRole('heading', { level: 1, name: renamed })).toBeVisible();
 });
 
 test('Visibility moves Private -> Unlisted -> Public -> Private and Discover reflects it', async ({ page }) => {
