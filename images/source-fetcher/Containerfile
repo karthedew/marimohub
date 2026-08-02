@@ -1,0 +1,37 @@
+# Red Hat UBI 9 minimal, pinned by digest rather than the floating "latest"
+# tag so the image a release actually ships can never silently change
+# underneath it. Refresh by re-resolving and updating both the digest and
+# the date below:
+#   docker pull registry.access.redhat.com/ubi9/ubi-minimal:latest
+#   docker inspect registry.access.redhat.com/ubi9/ubi-minimal:latest --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from registry.access.redhat.com/ubi9/ubi-minimal:latest.
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:17fd831ced9434de0a984d60b3fbe61008308261ba98bbc348d6fbdef05fa7c0
+
+# bash and curl already ship in ubi-minimal; nothing is installed here, so
+# there is no package manager output to keep out of the image history and no
+# additional CVE surface to scan beyond the base image itself.
+COPY --chmod=0755 fetch-source.sh /usr/local/bin/fetch-source.sh
+
+# /work is normally a mounted emptyDir the Pod builder supplies, which
+# Kubernetes creates writable by any UID; chgrp/chmod here only matters when
+# this image is run directly without that mount present, e.g. local
+# docker-run verification. GID 0 is the group every MarimoHub image
+# standardizes on: OpenShift replaces the container's UID with an
+# arbitrary one from the namespace's allocated range but leaves GID 0
+# alone, so "group-writable, owned by group 0" is what actually survives
+# that substitution.
+RUN mkdir -p /work && chgrp -R 0 /work && chmod -R g=u /work
+
+# HOME is set even though curl does not strictly need it, so nothing this
+# script's dependencies do implicitly (netrc lookups, curl config files)
+# ever tries to touch a root-owned path instead.
+ENV HOME=/work
+
+# 1001 is the fixed non-root UID every MarimoHub image defaults to on
+# vanilla Kubernetes. There is deliberately no /etc/passwd entry for it:
+# OpenShift's own arbitrary-UID injection does not create one either, so a
+# script that depended on username resolution here would break in
+# production even though it worked in this exact image locally.
+USER 1001:0
+
+ENTRYPOINT ["/usr/local/bin/fetch-source.sh"]

@@ -195,6 +195,106 @@ podman-backend-logs:
 podman-refresh-deps:
 	@$(MAKE) refresh-deps ENGINE=podman
 
+# ── Coordinating targets ────────────────────────────────────────────────────
+# The compose targets above remain the direct local dev loop. These targets
+# are the shared surface CI and every contributor call instead of reaching
+# into each component's own tooling by hand. Component tooling (backend's uv,
+# frontend's npm, the operator's own generated Makefile) stays directly
+# runnable from its own directory; nothing here replaces that, it just
+# coordinates it.
+
+OPERATOR_DIR := marimohub-operator
+CHARTS_DIR := charts/marimohub
+GENERATED_CRD := $(OPERATOR_DIR)/config/crd/bases/marimohub.io_marimosessions.yaml
+KIND_SMOKE := hack/smoke/kind/run.sh
+OPENSHIFT_SMOKE := hack/smoke/openshift/run.sh
+
+.PHONY: bootstrap-tools verify-tools generate verify-generated \
+	operator-check operator-test backend-check frontend-check \
+	images helm-check kind-smoke openshift-smoke verify
+
+bootstrap-tools:
+	@hack/tools/bootstrap.sh
+
+verify-tools:
+	@hack/tools/verify.sh
+
+# Regenerates deepcopy/CRD/RBAC from the operator's Go source, then copies
+# the one generated CRD byte-for-byte to every place it must also live.
+# deploy/crd/marimosession.yaml exists today; charts/marimohub/crds is copied
+# to only once the chart directory exists, so this stays a plain conditional
+# rather than a stub that manufactures an empty chart layout ahead of time.
+generate:
+	$(MAKE) -C $(OPERATOR_DIR) generate manifests
+	cp "$(GENERATED_CRD)" deploy/crd/marimosession.yaml
+	@if [ -d "$(CHARTS_DIR)/crds" ]; then \
+		cp "$(GENERATED_CRD)" "$(CHARTS_DIR)/crds/marimohub.io_marimosessions.yaml"; \
+	fi
+
+verify-generated:
+	$(MAKE) generate
+	@git diff --quiet -- $(OPERATOR_DIR) deploy/crd $(CHARTS_DIR)/crds 2>/dev/null || { \
+		echo "verify-generated: generated output changed the worktree"; \
+		git status --short -- $(OPERATOR_DIR) deploy/crd $(CHARTS_DIR)/crds; \
+		exit 1; \
+	}
+
+operator-check:
+	$(MAKE) -C $(OPERATOR_DIR) check
+
+operator-test:
+	$(MAKE) -C $(OPERATOR_DIR) test
+
+backend-check:
+	cd backend && uv run ruff format --check . && uv run ruff check . && uv run ty check && uv run pytest -q
+
+frontend-check:
+	@hack/tools/check-node-version.sh
+	cd frontend && npm run check && npm run test:unit && npm run build
+
+# Builds every production image. Each Runtime flavor and the operator/fetcher
+# build from their own directory so their Containerfile's COPY paths stay
+# relative to the image they actually produce, rather than every image
+# reaching across the repo root's build context for its own sources.
+images:
+	$(ENGINE) build -f Containerfile.backend -t marimohub-backend:dev .
+	$(ENGINE) build -f Containerfile.frontend -t marimohub-frontend:dev .
+	$(ENGINE) build -f $(OPERATOR_DIR)/Containerfile -t marimohub-operator:dev $(OPERATOR_DIR)
+	$(ENGINE) build -f images/source-fetcher/Containerfile -t marimohub-source-fetcher:dev images/source-fetcher
+	$(ENGINE) build -f images/marimo-runtime/Containerfile.ubuntu -t marimohub-runtime-ubuntu:dev images/marimo-runtime
+	$(ENGINE) build -f images/marimo-runtime/Containerfile.ubi -t marimohub-runtime-ubi:dev images/marimo-runtime
+
+helm-check:
+	@if [ -d "$(CHARTS_DIR)" ]; then \
+		.bin/helm lint $(CHARTS_DIR); \
+	else \
+		echo "helm-check: $(CHARTS_DIR) does not exist yet (Phase 6 creates it)"; \
+		exit 1; \
+	fi
+
+kind-smoke:
+	@if [ -x "$(KIND_SMOKE)" ]; then \
+		"$(KIND_SMOKE)"; \
+	else \
+		echo "kind-smoke: $(KIND_SMOKE) does not exist yet (Phase 8 adds it)"; \
+		exit 1; \
+	fi
+
+openshift-smoke:
+	@if [ -x "$(OPENSHIFT_SMOKE)" ]; then \
+		"$(OPENSHIFT_SMOKE)"; \
+	else \
+		echo "openshift-smoke: $(OPENSHIFT_SMOKE) does not exist yet (Phase 9 adds it)"; \
+		exit 1; \
+	fi
+
+# All checks that do not require a live cluster. Working checks run first so
+# a failure further down never hides their result. operator-check and
+# helm-check currently fail because their components do not exist yet
+# (Phases 1 and 6); that is the correct, honest state of this target until
+# those phases land.
+verify: verify-tools verify-generated backend-check frontend-check operator-check helm-check
+
 _require-compose:
 	@if [ "$(ENGINE)" = 'docker' ]; then \
 		command -v docker >/dev/null 2>&1 || { printf '%s\n' 'docker is not installed or not on PATH'; exit 1; }; \

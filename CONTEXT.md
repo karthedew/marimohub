@@ -45,11 +45,14 @@ A Notebook Visibility readable by direct link but excluded from discovery for no
 A Notebook Visibility readable by anyone and included in discovery.
 
 **Deployment**:
-A publicly accessible running application produced from a Notebook, independent of Notebook Visibility.
+A publicly accessible running application produced from a snapshot of a Notebook, independent of Notebook Visibility.
 _Avoid_: Private deployment
 
 **Session**:
 An ephemeral edit or run environment for a Notebook.
+
+**Runtime**:
+An execution environment that serves either one Session or one Deployment.
 
 **Archive**:
 The reversible removal of a Workspace from normal use until its purge deadline.
@@ -69,8 +72,12 @@ _Avoid_: Archive
 - A **Notebook** may be forked from one parent **Notebook**
 - A **Notebook** may have one **Deployment**
 - A **Notebook** may have many ephemeral **Sessions**
+- A **Session** has one ephemeral **Runtime**
+- A **Deployment** has one durable **Runtime**, which may sleep while the Deployment remains active
+- A **Runtime** has an ephemeral filesystem; only Notebook source and explicitly stored Notebook data survive Runtime replacement
 - A **Deployment** is public even when its source **Notebook** is Private or Unlisted
 - An **Archived** Workspace may be restored before it is **Purged**
+- Archiving a **Workspace** stops all of its **Sessions** and **Deployments**
 
 ## Example Dialogue
 
@@ -83,3 +90,5 @@ _Avoid_: Archive
 - "draft" previously meant a private Notebook; resolved: Private is a visibility rule, not a lifecycle state.
 - "publish" was used for every visibility change; resolved: the UI changes Notebook Visibility, including back to Private.
 - "delete workspace" meant a reversible operation; resolved: users Archive a Workspace, while Purge is permanent.
+- "session" was used for both an edit/run Session and a Deployment's execution environment; resolved: Runtime is the shared execution concept, while Session remains specific to edit/run.
+- "deployment source" could mean the current Notebook or the source captured when deployed; resolved: a Deployment runs an immutable deploy-time snapshot until explicitly redeployed.

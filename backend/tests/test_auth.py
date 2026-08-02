@@ -218,9 +218,7 @@ async def test_oidc_resolve_hit_returns_same_user_and_touches_identity(
     )
     first = await service.complete_login(claims)
     identity = await db_session.scalar(
-        select(Identity).where(
-            Identity.provider == "google", Identity.subject == "google-subject"
-        )
+        select(Identity).where(Identity.provider == "google", Identity.subject == "google-subject")
     )
     assert identity is not None
     first_login = identity.last_login_at

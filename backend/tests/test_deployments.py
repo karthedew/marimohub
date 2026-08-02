@@ -534,9 +534,7 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
     fake_deployment_manager: FakeDeploymentSessionManager,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    notebook = Notebook(
-        id=uuid4(), workspace_id=uuid4(), title="WebSocket Deploy", source="x = 1"
-    )
+    notebook = Notebook(id=uuid4(), workspace_id=uuid4(), title="WebSocket Deploy", source="x = 1")
     deployment = Deployment(
         id=uuid4(),
         notebook_id=notebook.id,

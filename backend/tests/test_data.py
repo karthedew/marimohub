@@ -16,9 +16,7 @@ async def test_get_data_returns_404_when_notebook_has_no_data(
     )
     notebook = await create_notebook(api_client, owner_headers, owner_ws, "Empty Data", "x = 1")
 
-    response = await api_client.get(
-        f"/api/notebooks/{notebook['id']}/data", headers=owner_headers
-    )
+    response = await api_client.get(f"/api/notebooks/{notebook['id']}/data", headers=owner_headers)
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Notebook data not found"
@@ -32,9 +30,7 @@ async def test_get_data_hides_private_notebook_from_non_members(
     _, other_headers, _ = await register_and_login(api_client, db_session, "data-priv-other")
     notebook = await create_notebook(api_client, owner_headers, owner_ws, "Private Data", "x = 1")
 
-    other_get = await api_client.get(
-        f"/api/notebooks/{notebook['id']}/data", headers=other_headers
-    )
+    other_get = await api_client.get(f"/api/notebooks/{notebook['id']}/data", headers=other_headers)
 
     assert other_get.status_code == 404
 

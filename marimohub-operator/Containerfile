@@ -1,0 +1,54 @@
+# Pinned to the exact toolchain version go.mod already requests (see its
+# `go 1.26.5` directive), rather than a floating "1.26" tag: GOTOOLCHAIN=auto
+# would otherwise let this build silently pick up whatever Go patch is
+# newest when the base image is refreshed, decoupling what CI/local builds
+# use from what actually compiles the release binary. Refresh by
+# re-resolving and updating both the digest and the date below whenever
+# go.mod's Go version changes:
+#   docker pull golang:1.26-bookworm
+#   docker inspect golang:1.26-bookworm --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from docker.io/library/golang:1.26-bookworm (go1.26.5).
+FROM golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651 AS builder
+
+WORKDIR /src
+
+# Dependency download is its own layer so an application-code change never
+# invalidates it.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# CGO_ENABLED=0 produces a static binary with no libc dependency, which is
+# what makes copying it straight into ubi9-minimal below possible without
+# also carrying a matching glibc. -trimpath and -s -w keep local build paths
+# and debug symbols out of the shipped binary.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/manager ./cmd
+
+# Red Hat UBI 9 minimal, pinned by digest so the floating "latest" tag can
+# never quietly resolve to different bytes than what was scanned and
+# signed. Refresh the same way as the builder stage:
+#   docker pull registry.access.redhat.com/ubi9/ubi-minimal:latest
+#   docker inspect registry.access.redhat.com/ubi9/ubi-minimal:latest --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from registry.access.redhat.com/ubi9/ubi-minimal:latest.
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:17fd831ced9434de0a984d60b3fbe61008308261ba98bbc348d6fbdef05fa7c0
+
+COPY --from=builder /out/manager /manager
+
+# The manager never writes to its own filesystem -- controller-runtime's
+# leader election and status writes all go to the API server, not local
+# disk -- so unlike the Runtime images there is no /work-equivalent volume
+# to prepare here; a read-only root filesystem needs nothing more than the
+# binary itself.
+
+# 1001 is the fixed non-root UID every MarimoHub image defaults to on
+# vanilla Kubernetes. There is deliberately no passwd entry created for it:
+# OpenShift's arbitrary-UID injection does not create one either, and a
+# statically linked Go binary that never calls getpwuid does not need one.
+USER 1001:0
+
+# The metrics and health-probe ports main.go's flags default to
+# (--metrics-bind-address, --health-probe-bind-address).
+EXPOSE 8080 8081
+
+ENTRYPOINT ["/manager"]

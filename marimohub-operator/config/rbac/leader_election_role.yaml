@@ -1,0 +1,25 @@
+# Permissions for leader election. controller-runtime's default resource
+# lock is Leases only (the legacy configmapsleases lock is not used), so
+# there is no configmaps rule here; Event creation is a separate concern from
+# leader election and is granted, if and when the reconciler emits Events,
+# alongside the resources it emits Events about rather than bundled here.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/name: marimohub-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: leader-election-role
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete

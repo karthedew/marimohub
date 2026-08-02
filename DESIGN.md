@@ -12,6 +12,16 @@ Authoritative target-state inputs (constrain every design task):
 - `marimohub-schema-redesign.md` — ownership moves users → workspaces; `identities` + `local_credentials` split out of `users`; visibility `draft` → `private`; drop `deployments.port`.
 - `marimosession-crd-spec.md` — replace the subprocess `ProcessManager` with a pod-per-session `MarimoSession` CRD + controller; drop the port allocator and in-process idle reaper; add an internal source endpoint.
 
+> **Runtime/controller sections are superseded.** Every design task below shipped and is marked
+> `complete`, so this document remains an accurate record of the backend as built. But
+> `/IMPLEMENTATION_PLAN.md` is now authoritative for the Kubernetes Runtime contract — the
+> generated `MarimoSession` CRD, the Condition-based reconcile state machine, and the opaque
+> `RUNTIME_CREDENTIAL` model — wherever it disagrees with DT-7, DT-8, DT-9, DT-10, or DT-12 below.
+> Read those five tasks as evidence of the design that produced the current `KubeSessionManager`
+> and controller sketch, not as target design for the operator being rebuilt now. The domain-model,
+> authorization, workspace/notebook, and error-taxonomy tasks (DT-1 through DT-6, DT-11, DT-13) are
+> unaffected and remain current.
+
 ---
 
 ## Current State
@@ -1763,6 +1773,10 @@ flowchart TD
 
 ### DT-7 — Session runtime manager seam (subprocess ↔ Kube)
 **Status:** complete
+**Superseded (Kube seam target):** `/IMPLEMENTATION_PLAN.md` is authoritative for the Runtime
+credential and lifecycle contract the Kube-backed seam must honor going forward (Phases 3–5).
+This section records the already-shipped `KubeSessionManager`/`SessionManager` split, not the
+target credential model.
 
 Design the `SessionManager` interface that decouples callers from the subprocess implementation and admits the `KubeSessionManager` from `marimosession-crd-spec.md`. Define the seam's methods (create/spawn, get, target, stop, activity, source read-back) and value objects, and what is dropped from them (`port`, `pid`, `_reserved_ports`, `MARIMO_PORT_RANGE`, capacity gating). `KubeSessionManager` CRUDs `MarimoSession` CRs (CR name = deployment id for deploy, uuid4 for edit/run), lists/gets by label instead of an in-memory dict, and builds `SessionTarget` from `status.serviceName` + the token Secret. Decompose the 609-line `process_manager.py` into cohesive concerns (runtime backend, session registry, workdir/source, readiness) behind the seam, and specify a `SESSION_BACKEND=subprocess|kube` selector. State the deletion of `process_manager.py` internals that no longer apply and the k8s-client dependency to add.
 
@@ -2069,6 +2083,13 @@ annotation) → poll `status.phase` → `Ready`; `await manager.target` reads `s
 
 ### DT-8 — MarimoSession CRD, controller, and internal source endpoint
 **Status:** complete
+**Superseded:** `/IMPLEMENTATION_PLAN.md` is authoritative for the Runtime contract from here on.
+Its generated CRD (Phase 1), Condition-based reconcile state machine (Phase 3), and opaque
+`RUNTIME_CREDENTIAL` (Phase 5) replace the handwritten CRD, `QuotaExceeded:` message-prefix
+signaling, finalizer, and session JWT described below. This section is retained only as the
+record of the design that produced the current backend code and controller sketch, not as
+target design — the controller itself was never implemented against this section; it is being
+built fresh against the plan.
 
 Design the `MarimoSession` CRD (spec/status per the CRD doc), the reconcile loop (Secret/Service/Pod creation, `Pending/Starting/Ready/Sleeping/Failed` phases, idle handling, wake-on-annotation, ownerRef GC), and the OpenShift constraints (dedicated `marimohub-sessions` namespace, `restricted-v2` SCC compliance, NetworkPolicy, ResourceQuota/LimitRange). Recommend the controller stack (kubebuilder/Go vs kopf/Python) with rationale. Design the backend-side internal endpoint `GET /api/internal/notebooks/{id}/source` (service-account-token auth, NetworkPolicy-restricted) that the init container fetches, replacing the tempdir write.
 
@@ -2602,6 +2623,10 @@ sequenceDiagram
 
 ### DT-9 — Proxy / gateway consolidation
 **Status:** complete
+**Superseded (wake/activity mechanics only):** the wake-on-annotation and activity-annotation
+details below are superseded by `/IMPLEMENTATION_PLAN.md`'s wake-request-token and
+activity-signal protocol (Phases 3.4 and 4.5). The gateway consolidation itself — one module for
+HTTP/WebSocket, session vs. deployment resolved by a small resolver — remains current.
 
 Design one gateway abstraction unifying the near-duplicate HTTP and WebSocket proxy paths in `proxy.py` (sessions) and `deployments.py` (deployments): target resolution, activity update, `build_target_url`, `forward_http`, `relay_websocket`. Fold in the wake-on-request behaviour so "resolve-or-wake → mark active → proxy" is expressed once, and isolate the two entry points (session id vs deployment slug) to a small resolver. Define the activity edge so it works for both the subprocess `touch` and the CRD `status.lastActivity`/annotation model.
 
@@ -2894,6 +2919,11 @@ wake → re-`target` → `mark_active` → forward/relay. One gateway body serve
 
 ### DT-10 — Deployment/session lifecycle & status source-of-truth
 **Status:** complete
+**Superseded (controller-facing lifecycle rules):** `/IMPLEMENTATION_PLAN.md`'s state invariants
+and failure classification (its Runtime Contract section) are authoritative for wake/idle/stop
+behavior, the Deployment source-snapshot model, and status projection. This section is retained
+as the record of the read-through/read-model design that produced the current
+`deployments.py`/`sessions.py` split, not as target design.
 
 Design where deployment/session lifecycle state lives after the clean sweep. Today `IdleDeploymentReaper` (asyncio) + `mark_running_deployments_sleeping` (boot reset) + `deployments.status`/`port`/`last_active` in Postgres form the source of truth; the CRD doc moves idleness/restart/orphan handling to the controller and makes Postgres a read-model cache (read-through first). Define target running/sleeping/stopped semantics, wake-on-request (bounded ready timeout, annotation bump then poll), idle-sleep, and stop flows against the DT-7 seam; rewrite `deployments.py`/`sessions.py` accordingly (remove port/lock/capacity paths and re-key edit-save persistence); confirm the already-port-free `SessionOut`/`DeploymentOut` contracts; specify deletion of `deployment_lifecycle.py` and the boot reset.
 
@@ -3372,6 +3402,11 @@ flowchart TD
 
 ### DT-12 — Configuration & runtime-settings surface
 **Status:** complete
+**Superseded (session-token settings):** `SESSION_TOKEN_TTL_SECONDS` and the JWT-based session
+token it configures are superseded by the opaque, non-expiring `RUNTIME_CREDENTIAL` in
+`/IMPLEMENTATION_PLAN.md` Phase 5, which has no TTL setting because its lifetime is the owning
+CR/Secret, not a signed expiry. The rest of the kube/controller settings surface described below
+remains current.
 
 Design the rationalised backend configuration surface. Remove settings obsoleted by the CRD design (`MARIMO_PORT_RANGE`, `IDLE_TIMEOUT_MINUTES`; revisit `MAX_CONCURRENT_SESSIONS` as an optional soft cap for nicer 429s vs. deletion in favour of ResourceQuota); introduce workspace archive retention, trusted-email-linking provider policy, the `SESSION_BACKEND` selector, and kube/controller settings (sessions namespace, runtime image, service DNS suffix, ready timeout). Define how config is grouped and validated, and reconcile the k8s-client dependency addition.
 
@@ -3886,6 +3921,10 @@ DomainError                       (core/errors.py)          detail · status · 
 | DT-11 | Notebook source storage & edit-session persistence | complete |
 | DT-12 | Configuration & runtime-settings surface | complete |
 | DT-13 | Error taxonomy & service→HTTP translation | complete |
+
+DT-7, DT-8, DT-9, DT-10, and DT-12 shipped as written and remain accurate history, but their
+Runtime/controller target-design content is superseded by `/IMPLEMENTATION_PLAN.md`; see the
+superseded notes on each task.
 
 ### Dependency sketch
 

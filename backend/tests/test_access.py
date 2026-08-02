@@ -217,9 +217,7 @@ async def test_visible_notebooks_excludes_archived_workspace(db_session: AsyncSe
     await add_member(db_session, workspace, owner, OWNER)
     await make_notebook(db_session, workspace, visibility=PUBLIC, created_by=owner)
 
-    rows = (
-        await db_session.scalars(select(Notebook).where(visible_notebooks(None)))
-    ).all()
+    rows = (await db_session.scalars(select(Notebook).where(visible_notebooks(None)))).all()
 
     assert rows == []
 

@@ -112,9 +112,7 @@ def upgrade() -> None:
         sa.Column("user_id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
         sa.Column(
             "role",
-            postgresql.ENUM(
-                "owner", "editor", "viewer", name="workspace_role", create_type=False
-            ),
+            postgresql.ENUM("owner", "editor", "viewer", name="workspace_role", create_type=False),
             nullable=False,
         ),
         sa.Column(

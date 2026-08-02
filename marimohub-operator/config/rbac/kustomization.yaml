@@ -1,0 +1,15 @@
+# All RBAC will be applied under this service account in the deployment
+# namespace. There is no ClusterRole here and no metrics-auth/TokenReview
+# RBAC: the Security Baseline forbids any application or operator ClusterRole,
+# and the metrics endpoint is plain HTTP rather than authn/authz-protected
+# (see cmd/main.go). role.yaml/role_binding.yaml are namespaced Role/
+# RoleBinding objects scoped to the Runtime namespace, not the operator's own
+# deployment namespace, since that is where the operator actually needs to
+# read MarimoSession and patch its status.
+resources:
+- service_account.yaml
+- role.yaml
+- role_binding.yaml
+- leader_election_role.yaml
+- leader_election_role_binding.yaml
+

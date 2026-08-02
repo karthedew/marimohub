@@ -363,9 +363,7 @@ async def test_list_notebooks_semantic_search_ranks_public_on_topic_notebook_fir
     db_session: AsyncSession,
 ) -> None:
     _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "semantic-owner")
-    _, searcher_headers, _ = await register_and_login(
-        api_client, db_session, "semantic-searcher"
-    )
+    _, searcher_headers, _ = await register_and_login(api_client, db_session, "semantic-searcher")
     rocket = await create_notebook(
         api_client,
         owner_headers,
@@ -973,9 +971,7 @@ async def test_fork_by_viewer_of_target_workspace_returns_403(
 async def test_fork_is_a_snapshot_and_later_source_edits_do_not_propagate(
     api_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    _, owner_headers, owner_ws = await register_and_login(
-        api_client, db_session, "snapshot-owner"
-    )
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "snapshot-owner")
     _, forker_headers, forker_ws = await register_and_login(
         api_client, db_session, "snapshot-forker"
     )
@@ -1037,9 +1033,7 @@ async def test_fork_attribution_visible_when_parent_readable(
     api_client: AsyncClient, db_session: AsyncSession
 ) -> None:
     _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "attrib-owner")
-    _, forker_headers, forker_ws = await register_and_login(
-        api_client, db_session, "attrib-forker"
-    )
+    _, forker_headers, forker_ws = await register_and_login(api_client, db_session, "attrib-forker")
     parent = await create_notebook(
         api_client, owner_headers, owner_ws, "Attributed Parent", "x = 1"
     )
@@ -1064,9 +1058,7 @@ async def test_fork_attribution_visible_when_parent_readable(
 async def test_fork_attribution_hidden_when_parent_reprivatized(
     api_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    _, owner_headers, owner_ws = await register_and_login(
-        api_client, db_session, "reprivate-owner"
-    )
+    _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "reprivate-owner")
     _, forker_headers, forker_ws = await register_and_login(
         api_client, db_session, "reprivate-forker"
     )

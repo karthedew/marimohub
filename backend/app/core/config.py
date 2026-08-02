@@ -94,9 +94,7 @@ class Settings(BaseSettings):
         if self.SESSION_BACKEND is not SessionBackend.KUBE:
             return
         if not _DNS_LABEL_RE.match(self.SESSION_NAMESPACE):
-            raise ValueError(
-                "SESSION_NAMESPACE must be a DNS-1123 label when SESSION_BACKEND=kube"
-            )
+            raise ValueError("SESSION_NAMESPACE must be a DNS-1123 label when SESSION_BACKEND=kube")
         if not 1 <= self.SESSION_SERVICE_PORT <= _MAX_PORT:
             raise ValueError("SESSION_SERVICE_PORT out of range")
 

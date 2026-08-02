@@ -328,8 +328,14 @@ async def test_target_built_from_service_name_namespace_suffix_port_and_secret_t
     target = await manager.target(session.id)
 
     assert target is not None
-    assert target.http_base_url == f"http://msess-abc.{_NAMESPACE}.{_DNS_SUFFIX}:{_PORT}/api/proxy/{session.id}"
-    assert target.ws_base_url == f"ws://msess-abc.{_NAMESPACE}.{_DNS_SUFFIX}:{_PORT}/api/proxy/{session.id}"
+    assert (
+        target.http_base_url
+        == f"http://msess-abc.{_NAMESPACE}.{_DNS_SUFFIX}:{_PORT}/api/proxy/{session.id}"
+    )
+    assert (
+        target.ws_base_url
+        == f"ws://msess-abc.{_NAMESPACE}.{_DNS_SUFFIX}:{_PORT}/api/proxy/{session.id}"
+    )
     stored_secret = core.secrets[f"msess-{session.id}-env"]
     assert target.access_token == base64.b64decode(stored_secret.data["MARIMO_TOKEN"]).decode()
 

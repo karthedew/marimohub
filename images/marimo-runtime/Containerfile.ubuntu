@@ -1,0 +1,83 @@
+# Ubuntu 24.04 (Noble), pinned by digest so the floating "24.04" tag can
+# never quietly resolve to different bytes than what was scanned and
+# signed. Refresh by re-resolving and updating both the digest and the date:
+#   docker pull ubuntu:24.04
+#   docker inspect ubuntu:24.04 --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from docker.io/library/ubuntu:24.04.
+FROM ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
+
+# The repository-tested marimo release. Bumping this is a deliberate,
+# reviewed decision (compatibility with the CLI surface the Pod builder
+# depends on -- see internal/session -- and with the readiness probe's
+# assumption that GET /api/version requires only "read" scope and never
+# redirects on a bad token), not a routine update.
+ARG MARIMO_VERSION=0.23.10
+
+ENV DEBIAN_FRONTEND=noninteractive \
+	PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
+
+# python3.12-venv, not just python3.12, because Ubuntu marks the system
+# Python as externally managed (PEP 668): a bare `pip install` against it
+# refuses to run. Installing marimo into a dedicated venv instead of
+# fighting that restriction also keeps the interpreter's own package set
+# untouched by anything this build adds.
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+	python3.12 \
+	python3.12-venv \
+	ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Only marimo and its own resolved dependencies are installed -- there is no
+# extra "approved dependency" set layered in yet because the platform does
+# not support per-Workspace or per-Notebook packages. A Notebook that imports
+# anything beyond this set fails at import time inside the running kernel,
+# not at container start, which is the intended boundary: this image never
+# resolves or installs anything once a Pod is running.
+RUN python3.12 -m venv /opt/marimo \
+	&& /opt/marimo/bin/pip install --no-cache-dir --upgrade pip \
+	&& /opt/marimo/bin/pip install --no-cache-dir "marimo==${MARIMO_VERSION}"
+
+ENV PATH=/opt/marimo/bin:${PATH}
+
+# /work, /tmp, and the HOME/cache directories below are always supplied as
+# mounted emptyDir volumes by the Pod builder in production, which
+# Kubernetes creates writable by any UID regardless of what the image sets.
+# These mkdir/chgrp/chmod calls only matter when this image is run directly
+# without those mounts, e.g. local docker-run verification. GID 0 is the
+# group every MarimoHub image standardizes on:
+# OpenShift replaces the container's UID with an arbitrary one from the
+# namespace's allocated range but leaves GID 0 alone, so "group-writable,
+# group-owned by 0" is what actually survives that substitution; a fixed
+# UID owning these directories would not.
+RUN mkdir -p /work /home/marimo /cache \
+	&& chgrp -R 0 /work /home/marimo /cache \
+	&& chmod -R g=u /work /home/marimo /cache
+
+# HOME points at the dedicated home volume rather than /work so an
+# incidental config/history write (pip, ipython, marimo's own user config)
+# can never collide with the one file (notebook.py) the fetcher and marimo
+# hand off through /work. XDG_CACHE_HOME is likewise its own bounded volume
+# rather than a subdirectory of HOME so its emptyDir sizeLimit can differ
+# from HOME's without either mount shadowing the other.
+ENV HOME=/home/marimo \
+	XDG_CACHE_HOME=/cache
+
+# 1001 is the fixed non-root UID every MarimoHub image defaults to on
+# vanilla Kubernetes. There is deliberately no passwd entry created for it:
+# OpenShift's arbitrary-UID injection does not create one either, and bash,
+# python, and marimo all run correctly under a numeric UID with no
+# corresponding /etc/passwd row as long as HOME is set explicitly (verified
+# by docker-run checks under an arbitrary UID).
+USER 1001:0
+
+WORKDIR /work
+
+EXPOSE 8080
+
+# The Pod builder always sets an explicit command and args
+# (command: ["marimo"], args derived from spec.mode), which override this
+# entrypoint; it exists so `docker run <image> edit notebook.py ...` is a
+# meaningful, self-documenting way to exercise the image directly.
+ENTRYPOINT ["marimo"]

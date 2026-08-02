@@ -1,0 +1,26 @@
+# Adds namespace to all resources.
+namespace: marimohub-operator-system
+
+# Value of this field is prepended to the
+# names of all resources, e.g. a deployment named
+# "wordpress" becomes "alices-wordpress".
+# Note that it should also match with the prefix (text before '-') of the namespace
+# field above.
+namePrefix: marimohub-operator-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+# config/policy is deliberately not listed here: it holds a cluster-scoped
+# ValidatingAdmissionPolicy/Binding pair, and this kustomize toolchain's
+# bundled Kubernetes schema does not yet know that kind is cluster-scoped, so
+# the namespace transform below would incorrectly stamp a namespace onto it.
+# `make install`/`make deploy` apply config/policy directly with kubectl
+# instead of folding it into this kustomize graph.
+# The metrics Service is plain HTTP on a private bind address (see cmd/main.go
+# and the Security Baseline: no operator workload may require TokenReview/SAR,
+# which controller-runtime's authn/authz metrics filter needs). OpenShift TLS
+# and ServiceMonitor scraping are added once the chart carries the
+# certificate material.
+- metrics_service.yaml

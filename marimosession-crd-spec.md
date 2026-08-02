@@ -1,5 +1,16 @@
 # MarimoSession CRD & Controller Design
 
+> Superseded. `IMPLEMENTATION_PLAN.md` is authoritative for the `MarimoSession` CRD, controller
+> protocol, and Runtime credential model going forward. In particular: the CRD below is
+> superseded by the Kubebuilder-generated CRD (Phase 1); the `QuotaExceeded:`-prefixed status
+> message and log-tail failure reporting are superseded by typed status Conditions (Phase 3); the
+> bearer token minted into the Secret is superseded by an opaque, non-expiring `RUNTIME_CREDENTIAL`
+> bound to the live CR/Secret rather than a signed, expiring token (Phase 5); and the reconcile
+> loop's implicit "delete → GC'd children → done" cleanup is superseded by an explicit no-finalizer
+> contract (owner references only, no terminal Event gating). This document is retained as the
+> historical record of the design that motivated the pod-per-session architecture, not as target
+> design.
+
 Replaces `process_manager.py`'s subprocess model with a pod-per-session architecture where the cluster is the source of truth. The backend stops managing processes and instead CRUDs `MarimoSession` custom resources; a controller reconciles them into Pods/Services/Secrets.
 
 ## Why a CRD (vs. backend creating Pods directly)

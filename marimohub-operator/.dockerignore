@@ -1,0 +1,6 @@
+.git
+bin
+cover.out
+*.md
+.devcontainer
+test

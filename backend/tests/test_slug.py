@@ -105,8 +105,8 @@ async def test_unique_slug_excludes_a_row_via_the_exclude_clause(
         json={"slug": "exclude-slug"},
     )
     assert deployed.status_code == 200
-    deployment_id = (
-        await db_session.scalar(select(Deployment.id).where(Deployment.slug == "exclude-slug"))
+    deployment_id = await db_session.scalar(
+        select(Deployment.id).where(Deployment.slug == "exclude-slug")
     )
     assert deployment_id is not None
 

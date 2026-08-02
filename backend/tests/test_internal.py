@@ -65,9 +65,7 @@ async def test_data_read_token_for_other_notebook_returns_403(
 
 
 @pytest.mark.asyncio
-async def test_absent_token_returns_401(
-    api_client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_absent_token_returns_401(api_client: AsyncClient, db_session: AsyncSession) -> None:
     _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "int-absent")
     notebook = await create_notebook(api_client, owner_headers, owner_ws, "N", "x = 1")
 
@@ -77,9 +75,7 @@ async def test_absent_token_returns_401(
 
 
 @pytest.mark.asyncio
-async def test_garbage_token_returns_401(
-    api_client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_garbage_token_returns_401(api_client: AsyncClient, db_session: AsyncSession) -> None:
     _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "int-garbage")
     notebook = await create_notebook(api_client, owner_headers, owner_ws, "N", "x = 1")
 
@@ -91,14 +87,10 @@ async def test_garbage_token_returns_401(
 
 
 @pytest.mark.asyncio
-async def test_expired_token_returns_401(
-    api_client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_expired_token_returns_401(api_client: AsyncClient, db_session: AsyncSession) -> None:
     _, owner_headers, owner_ws = await register_and_login(api_client, db_session, "int-expired")
     notebook = await create_notebook(api_client, owner_headers, owner_ws, "N", "x = 1")
-    expired_token = create_session_token(
-        uuid4(), UUID(str(notebook["id"])), ttl_seconds=-1
-    )
+    expired_token = create_session_token(uuid4(), UUID(str(notebook["id"])), ttl_seconds=-1)
 
     response = await api_client.get(
         f"/api/internal/notebooks/{notebook['id']}/source", headers=_bearer(expired_token)
@@ -215,9 +207,7 @@ async def test_data_write_to_nonexistent_notebook_returns_404(
         headers=_bearer(token),
         json={"metric": "cpu"},
     )
-    stored = await db_session.scalar(
-        select(Notebook).where(Notebook.id == missing_id)
-    )
+    stored = await db_session.scalar(select(Notebook).where(Notebook.id == missing_id))
 
     assert response.status_code == 404
     assert stored is None

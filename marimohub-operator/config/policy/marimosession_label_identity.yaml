@@ -1,0 +1,44 @@
+# Enforces that the well-known marimohub.io/notebook, marimohub.io/workspace,
+# and marimohub.io/mode labels agree with the identically named spec fields.
+#
+# This is a ValidatingAdmissionPolicy, not a webhook: it is evaluated inside
+# the API server process itself from a compiled CEL expression, so it needs
+# no Service, no TLS certificate, no extra Deployment, and no TokenReview/SAR
+# grant on any workload's ServiceAccount -- exactly the shape the Security
+# Baseline requires. It exists because the CRD's own x-kubernetes-validations
+# CEL environment only exposes metadata.name and metadata.generateName, never
+# metadata.labels, so this specific rule cannot be expressed as a CRD schema
+# validation the way the other spec-level rules are.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: marimosession-label-identity.marimohub.io
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["marimohub.io"]
+      apiVersions: ["v1alpha1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["marimosessions"]
+  validations:
+  - expression: >-
+      'marimohub.io/notebook' in object.metadata.labels &&
+      object.metadata.labels['marimohub.io/notebook'] == object.spec.notebookId
+    message: "marimohub.io/notebook label must equal spec.notebookId"
+  - expression: >-
+      'marimohub.io/workspace' in object.metadata.labels &&
+      object.metadata.labels['marimohub.io/workspace'] == object.spec.workspaceId
+    message: "marimohub.io/workspace label must equal spec.workspaceId"
+  - expression: >-
+      'marimohub.io/mode' in object.metadata.labels &&
+      object.metadata.labels['marimohub.io/mode'] == object.spec.mode
+    message: "marimohub.io/mode label must equal spec.mode"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: marimosession-label-identity-binding.marimohub.io
+spec:
+  policyName: marimosession-label-identity.marimohub.io
+  validationActions: ["Deny"]

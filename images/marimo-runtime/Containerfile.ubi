@@ -1,0 +1,73 @@
+# Red Hat UBI 9's Python 3.12 s2i image, pinned by digest so the floating
+# "latest" tag can never quietly resolve to different bytes than what was
+# scanned and signed. This base (rather than ubi9-minimal plus a manual
+# Python install) is deliberate: it already ships Python 3.12, pip, a
+# pre-built venv at /opt/app-root owned by UID 1001/GID 0, and group-writable
+# permissions throughout that tree -- exactly the arbitrary-UID contract
+# this image needs, for free. Refresh by re-resolving and updating both the
+# digest and the date:
+#   docker pull registry.access.redhat.com/ubi9/python-312:latest
+#   docker inspect registry.access.redhat.com/ubi9/python-312:latest --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from registry.access.redhat.com/ubi9/python-312:latest.
+FROM registry.access.redhat.com/ubi9/python-312@sha256:6c4161d7da73fced103c8532ee6419510576f0b70bca4a18790878439973bc4d
+
+# The repository-tested marimo release. Bumping this is a deliberate,
+# reviewed decision (compatibility with the CLI surface the Pod builder
+# depends on -- see internal/session -- and with the readiness probe's
+# assumption that GET /api/version requires only "read" scope and never
+# redirects on a bad token), not a routine update.
+ARG MARIMO_VERSION=0.23.10
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
+
+# The base image's own default user (1001, GID 0) already owns
+# /opt/app-root's venv group-writably, so this needs no venv creation and no
+# privilege change: pip install here runs as the same non-root user the
+# final image serves from. Only marimo and its own resolved dependencies are
+# installed -- there is no extra "approved dependency" set layered in yet
+# because the platform does not support per-Workspace or per-Notebook
+# packages. A Notebook that imports anything beyond this set fails at import
+# time inside the running kernel, not at container start, which is the
+# intended boundary: this image never resolves or installs anything once a
+# Pod is running.
+RUN pip install --no-cache-dir "marimo==${MARIMO_VERSION}"
+
+# /work, /tmp, and the HOME/cache directories below are always supplied as
+# mounted emptyDir volumes by the Pod builder in production, which
+# Kubernetes creates writable by any UID regardless of what the image sets.
+# These mkdir/chgrp/chmod calls only matter when this image is run directly
+# without those mounts, e.g. local docker-run verification. Creating them
+# needs a brief switch to root: unlike /opt/app-root, paths under / and
+# /home are not group-writable by default even in this base image.
+USER 0
+RUN mkdir -p /work /home/marimo /cache \
+	&& chgrp -R 0 /work /home/marimo /cache \
+	&& chmod -R g=u /work /home/marimo /cache
+
+# 1001 is the fixed non-root UID every MarimoHub image defaults to on
+# vanilla Kubernetes; it is this base image's own default, kept explicit
+# here so it survives the USER 0 switch above. OpenShift's arbitrary-UID
+# injection overrides it with a UID from the namespace's allocated range but
+# leaves GID 0 alone, which is why every writable path is chgrp/chmod'd to
+# group 0 above rather than owned outright by 1001.
+USER 1001:0
+
+# HOME is repointed at a dedicated volume rather than the base image's own
+# /opt/app-root/src so both Runtime flavors share the exact same mount
+# contract; a Notebook or the reconciler should never need to know which
+# flavor produced a given Pod. XDG_CACHE_HOME is its own bounded volume
+# rather than a subdirectory of HOME so its emptyDir sizeLimit can differ
+# from HOME's without either mount shadowing the other.
+ENV HOME=/home/marimo \
+	XDG_CACHE_HOME=/cache
+
+WORKDIR /work
+
+EXPOSE 8080
+
+# The Pod builder always sets an explicit command and args
+# (command: ["marimo"], args derived from spec.mode), which override this
+# entrypoint; it exists so `docker run <image> edit notebook.py ...` is a
+# meaningful, self-documenting way to exercise the image directly.
+ENTRYPOINT ["marimo"]

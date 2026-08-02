@@ -1,14 +1,22 @@
 # deploy/
 
-Cluster-side manifests for MarimoHub's Kubernetes-native session runtime. These are the
-checked-in contract between the backend (`KubeSessionManager`), the operator that reconciles
-`MarimoSession` resources, and the platform team that provisions the namespace. Full design and
-rationale: `DESIGN.md`, DT-8 ("MarimoSession CRD, controller, and internal source endpoint").
+Cluster-side manifests for MarimoHub's Kubernetes-native session Runtime. These are the
+checked-in contract between the backend, the operator that reconciles `MarimoSession` resources,
+and the platform team that provisions the namespace. `/IMPLEMENTATION_PLAN.md` is the
+authoritative source for the Runtime contract, reconcile behavior, and credential model;
+`DESIGN.md` DT-8 is retained only as historical context for the design that preceded it.
 
 ## Contents
 
 - `crd/marimosession.yaml` — the `MarimoSession` CustomResourceDefinition (group
-  `marimohub.io`, version `v1alpha1`). Cluster-scoped; apply once per cluster.
+  `marimohub.io`, version `v1alpha1`). Cluster-scoped; apply once per cluster. Generated:
+  `make generate` produces the canonical CRD from `marimohub-operator`'s Go types and copies it
+  here byte-for-byte, and `make verify-generated` fails on drift. Do not hand-edit this file.
+- `../marimohub-operator/config/policy/marimosession_label_identity.yaml` — a
+  `ValidatingAdmissionPolicy`/`ValidatingAdmissionPolicyBinding` pair enforcing that the
+  `marimohub.io/notebook`, `marimohub.io/workspace`, and `marimohub.io/mode` labels agree with the
+  identically named spec fields. It is not CRD schema CEL because the CRD validation CEL
+  environment cannot see `metadata.labels`; apply it alongside the CRD.
 - `namespace/namespace.yaml` — the `marimohub-sessions` Namespace that session Pods/Services/
   Secrets live in.
 - `namespace/networkpolicy.yaml` — default-deny isolation for session pods: ingress only from
@@ -24,6 +32,7 @@ manifests) can be created; the namespace must exist before the namespace-scoped 
 
 ```sh
 kubectl apply -f deploy/crd/marimosession.yaml
+kubectl apply -f marimohub-operator/config/policy/marimosession_label_identity.yaml
 kubectl apply -f deploy/namespace/namespace.yaml
 kubectl apply -f deploy/namespace/networkpolicy.yaml
 kubectl apply -f deploy/namespace/resourcequota.yaml
@@ -32,23 +41,19 @@ kubectl apply -f deploy/namespace/limitrange.yaml
 
 The NetworkPolicy's ingress/egress rules select the API's namespace by its
 auto-assigned `kubernetes.io/metadata.name: marimohub` label and pods labelled
-`app: marimohub-api` — that namespace and Deployment are provisioned separately (outside this
-directory) and are not part of M10's scope.
+`app: marimohub-api` — that namespace and Deployment are provisioned separately, outside this
+directory.
 
 ## What's not here
 
-The `MarimoSession` controller (operator) itself is a separate component, out of
-`backend/app` and out of this directory. It is not implemented as part of this repo's backend
-plan — only specified. Its implementer should start from DESIGN.md's DT-8 Design section:
+The `MarimoSession` controller (operator) lives in `marimohub-operator/`, out of `backend/app`
+and out of this directory. `/IMPLEMENTATION_PLAN.md` specifies it in full:
 
-- **"Controller component layout (outside `backend/app`)"** — recommended repo layout
-  (kubebuilder/Go), RBAC scope.
-- **"Reconcile loop (create / ready / fail / idle / wake / delete)"** — the reconciler's
-  pseudocode: phase transitions, the Secret precondition, idle-sleep and wake-on-annotation
-  handling, deterministic failure behavior.
-- **"Per-session manifests (restricted-v2 SCC compliant)"** — the Pod/Service/Secret shapes the
-  controller must render from a `MarimoSession` CR, including which fields the backend authors
-  (the Secret) versus which the controller owns (Pod, Service).
-- **"Service-token auth contract"** — how the per-session bearer token the Secret carries is
-  minted, delivered, and verified; the controller only gates Pod creation on the Secret's
-  presence and never mints or reads the token's claims.
+- **Phase 1** (done) — the generated CRD, typed spec/status, and CEL/`ValidatingAdmissionPolicy`
+  validation that replace the handwritten schema this directory used to carry.
+- **Phase 2** — the Pod/Service builders: security context, fetcher init container, probes,
+  labels, and the immutable `RUNTIME_CREDENTIAL` Secret projection.
+- **Phase 3** — the reconcile state machine: Condition-based phase transitions, idle/wake
+  handling, capacity and failure classification, all without a finalizer.
+- **Phase 5** — the credential model: an opaque, live-resource-bound `RUNTIME_CREDENTIAL` verified
+  by a separate internal API, replacing any expiring signed token.

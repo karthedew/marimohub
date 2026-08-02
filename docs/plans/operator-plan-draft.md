@@ -1,5 +1,7 @@
 # marimohub-operator — Implementation Plan
 
+> Superseded draft. Its review produced `/IMPLEMENTATION_PLAN.md`; do not implement this plan as written.
+
 ## Context
 
 The backend redesign (complete at `8f80f38`) made the cluster the source of truth for session

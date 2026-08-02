@@ -1,0 +1,25 @@
+# Binds manager-role (a namespaced Role generated into the Runtime
+# namespace from the +kubebuilder:rbac markers in
+# internal/controller/marimosession_controller.go) to the operator's
+# ServiceAccount, which lives in the operator's own deployment namespace. A
+# RoleBinding must live in the same namespace as the Role it references, but
+# its subject ServiceAccount may be in a different namespace -- exactly the
+# split the Namespace Boundaries require between the operator's own
+# marimohub-controller namespace and the marimohub-sessions namespace it is
+# scoped to act in.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: marimohub-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: manager-rolebinding
+  namespace: marimohub-sessions
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: manager-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system

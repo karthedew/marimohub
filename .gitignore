@@ -11,3 +11,4 @@ node_modules/
 dist/
 build/
 backend/.molab-notebooks/
+.bin/
