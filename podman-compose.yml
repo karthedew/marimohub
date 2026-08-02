@@ -15,10 +15,30 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Containerfile.backend
+    entrypoint: ["python", "-m", "alembic"]
+    command: ["upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://molab:molab@postgres:5432/molab
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   backend:
     build:
       context: .
       dockerfile: Containerfile.backend
+    # The image's own non-root UID (1001) exists for hardened production
+    # deployment, where every writable path is a Kubernetes-mounted volume it
+    # owns outright. Locally, /app/backend is a bind mount of the host
+    # checkout instead, so the container needs to run as the host user to
+    # read/write it (notebook scratch state, __pycache__, etc.) without a
+    # permission mismatch.
+    user: "${UID:-1000}:${GID:-1000}"
     environment:
       DATABASE_URL: postgresql+asyncpg://molab:molab@postgres:5432/molab
       SECRET_KEY: dev-secret-change-me
@@ -43,6 +63,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   frontend:
     image: node:22

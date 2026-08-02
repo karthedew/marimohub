@@ -1,0 +1,25 @@
+# TLS is opt-in through monitoring.tls (see values.yaml for the shared
+# existing-Secret pattern every other TLS listener in this chart uses).
+# Reachability is bounded by NetworkPolicy either way through
+# .Values.network.monitoring.enabled, which also gates the matching
+# NetworkPolicy ingress rule; TLS adds wire confidentiality on top of that,
+# it never replaces it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}
+  namespace: {{ .Values.namespaces.controller }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "operator") | nindent 4 }}
+  {{- if and .Values.openshift.serviceServingCerts.enabled .Values.monitoring.tls.secretName }}
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: {{ .Values.monitoring.tls.secretName }}
+  {{- end }}
+spec:
+  selector:
+    {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "operator") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.operator.metricsPort }}
+      targetPort: metrics
+      protocol: TCP

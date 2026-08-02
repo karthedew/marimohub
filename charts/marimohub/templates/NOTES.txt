@@ -1,0 +1,48 @@
+MarimoHub has been {{ if .Release.IsUpgrade }}upgraded{{ else }}installed{{ end }} as release "{{ .Release.Name }}" in namespace "{{ .Values.namespaces.app }}".
+
+Endpoints
+{{- if eq .Values.platform "openshift" }}
+  Public application: https://{{ .Values.routes.host | default "<routes.host not set -- see values-openshift.yaml>" }}/
+  Public API:          https://{{ .Values.routes.host | default "<routes.host not set -- see values-openshift.yaml>" }}/api
+{{- else if .Values.ingress.enabled }}
+  Public application: https://{{ .Values.ingress.host }}/
+  Public API:          https://{{ .Values.ingress.host }}/api
+{{- else }}
+  No Route/Ingress is enabled for this release; reach the frontend/backend-public Services
+  directly from inside the cluster, or enable one (routes.host on the openshift profile,
+  ingress.enabled on the portable profile).
+{{- end }}
+  Internal API: cluster-internal only, no public Route/Ingress (by design -- see the internal
+  API's own NetworkPolicy, reachable only from {{ .Values.namespaces.sessions }}).
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+  Operator metrics: scraped in-cluster via the ServiceMonitor in {{ .Values.namespaces.controller }};
+  not publicly reachable.
+{{- end }}
+
+Follow-up checks
+  1. Confirm the migration Job succeeded (it is a pre-install/pre-upgrade hook that already
+     blocked this release if it failed):
+       kubectl get jobs -n {{ .Values.namespaces.app }} -l app.kubernetes.io/component=migration
+  2. Confirm every workload is Ready:
+       kubectl get deploy,cronjob -n {{ .Values.namespaces.app }}
+       kubectl get deploy -n {{ .Values.namespaces.controller }}
+  3. Confirm the operator has an elected leader (only meaningful when operator.replicaCount > 1):
+       kubectl get lease -n {{ .Values.namespaces.controller }}
+{{- if eq .Values.platform "openshift" }}
+  4. Confirm both Routes admitted and share the same host:
+       kubectl get routes -n {{ .Values.namespaces.app }}
+{{- else if .Values.ingress.enabled }}
+  4. Confirm the Ingress has an assigned address:
+       kubectl get ingress -n {{ .Values.namespaces.app }}
+{{- end }}
+
+Before upgrading this release again, re-apply the canonical CRD with server-side apply if it
+changed (Helm's own crds/ directory only ever installs a CRD on first install, never on upgrade):
+       kubectl apply --server-side -f deploy/crd/marimosession.yaml
+
+Uninstalling this release first runs a pre-delete hook that foreground-deletes every
+MarimoSession and waits for its Pods/Services/Secrets to be gone before removing the operator or
+NetworkPolicies; a stuck drain aborts the uninstall rather than leaving orphaned Runtime
+credentials behind. The three pre-created namespaces, every existing Secret this chart only ever
+references by name, the external database, and the CRD itself are never removed by
+`helm uninstall` -- see deploy/README.md for the separate, manual CRD purge step.

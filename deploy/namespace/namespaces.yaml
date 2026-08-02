@@ -1,0 +1,17 @@
+# The three trust-boundary namespaces the platform pre-creates and owns
+# (see the Namespace Boundaries table): the Helm chart installs into all
+# three but never creates, labels, or deletes any of them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marimohub
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marimohub-controller
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: marimohub-sessions

@@ -1,0 +1,72 @@
+# A single pre-delete hook Job: foreground-deletes every MarimoSession CR in
+# namespaces.sessions and waits for their owned Pods/Services/Secrets to be
+# gone before Helm proceeds to delete the operator, RBAC, or NetworkPolicies
+# that make that cleanup possible. `backoffLimit: 0` and a non-zero exit on
+# timeout (see app.commands.drain_sessions) means a stuck drain fails this
+# Job, which Helm's hook-failure detection treats as aborting the uninstall
+# entirely -- the release, and every Runtime credential Secret it has not
+# yet finished draining, stays intact rather than being torn out from under
+# a still-running notebook.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "uninstall-drain") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "uninstall-drain") | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add .Values.uninstallDrain.timeoutSeconds 60 }}
+  # Belt-and-suspenders alongside hook-delete-policy above: this only ever
+  # matters if the release is gone (uninstalled) before Helm's own hook
+  # cleanup removes it.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "uninstall-drain") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "uninstall-drain") }}
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: drain
+          image: {{ include "marimohub.image" .Values.backendPublic.image }}
+          imagePullPolicy: {{ .Values.backendPublic.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Overrides the image's `python -m app.serve` ENTRYPOINT: this Job
+          # never serves anything and never touches the database, so it
+          # takes no envFrom secretRef at all, unlike the migration Job and
+          # maintenance CronJobs.
+          command: ["python", "-m", "app.commands.drain_sessions"]
+          env:
+            - name: SESSION_NAMESPACE
+              value: {{ .Values.namespaces.sessions }}
+            - name: DRAIN_TIMEOUT_SECONDS
+              value: {{ .Values.uninstallDrain.timeoutSeconds | quote }}
+          resources:
+            {{- toYaml .Values.uninstallDrain.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

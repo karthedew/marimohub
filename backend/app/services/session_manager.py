@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import enum
@@ -8,7 +9,7 @@ from fastapi import status
 
 from app.core.config import SessionBackend, get_settings
 from app.core.errors import DomainError
-from app.models import Notebook
+from app.models import Deployment, Notebook
 
 SessionMode = Literal["edit", "run"]
 RuntimeMode = Literal["edit", "run", "deploy"]
@@ -25,7 +26,19 @@ class SessionPhase(enum.StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SessionInfo:
-    """Backend-neutral snapshot of a session's identity and lifecycle state."""
+    """Backend-neutral snapshot of a session's identity and lifecycle state.
+
+    `failure_reason`/`message` are populated only when `phase` is `FAILED`
+    and only by a backend that can classify failures against a stable
+    contract (the Kube backend's Runtime Conditions); they carry a sanitized,
+    bounded Reason/message an authorized caller may surface, never anything
+    an anonymous Deployment visitor should see directly.
+
+    `deployment_revision` mirrors the Runtime's bound deploy revision (deploy
+    mode only) so a caller can detect a stale Runtime still serving a
+    previous snapshot while a redeploy is in flight, without the manager
+    itself needing to know about the backend's Deployment row.
+    """
 
     id: UUID
     notebook_id: UUID
@@ -33,6 +46,9 @@ class SessionInfo:
     phase: SessionPhase
     last_active: datetime | None
     creator_id: UUID | None
+    failure_reason: str | None = None
+    message: str | None = None
+    deployment_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +58,22 @@ class SessionTarget:
     http_base_url: str
     ws_base_url: str
     access_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRef:
+    """A minimal, backend-neutral reference to a live Runtime for maintenance sweeps.
+
+    Deliberately thinner than `SessionInfo`: the maintenance sweep only needs
+    enough identity to decide whether the Runtime's owning state (Workspace,
+    Notebook, Deployment) still justifies it, never its live phase or target.
+    """
+
+    id: UUID
+    mode: RuntimeMode
+    workspace_id: UUID
+    notebook_id: UUID
+    deployment_revision: int | None
 
 
 @runtime_checkable
@@ -54,10 +86,14 @@ class SessionManager(Protocol):
         """Spawn an edit or run session for a notebook and return its info once ready."""
         ...
 
-    async def spawn_deployment(
-        self, notebook: Notebook, deployment_id: UUID, slug: str
-    ) -> SessionInfo:
-        """Spawn (or return the existing) deploy session for a deployment, idempotently."""
+    async def spawn_deployment(self, notebook: Notebook, deployment: Deployment) -> SessionInfo:
+        """Ensure `deployment`'s Runtime is running, waking or creating it as needed.
+
+        Idempotent by `deployment.id`. Takes the whole row (not just its id
+        and slug) because a Kube-backed manager must bind the Runtime spec to
+        `deployment.revision` and `deployment.runtime_image`; a backend that
+        doesn't distinguish deploy revisions may ignore those fields.
+        """
         ...
 
     async def get(self, session_id: UUID) -> SessionInfo | None:
@@ -73,7 +109,33 @@ class SessionManager(Protocol):
         ...
 
     async def stop(self, session_id: UUID) -> None:
-        """Stop and remove a session, raising ``SessionNotFoundError`` if unknown."""
+        """Foreground-delete a session's Runtime and wait until it is gone.
+
+        Raises ``SessionNotFoundError`` if the Runtime never existed. A
+        caller stopping idempotently (it doesn't care whether one was
+        running) suppresses that error rather than checking first, since
+        checking-then-stopping is itself a race.
+        """
+        ...
+
+    async def stop_workspace_sessions(self, workspace_id: UUID) -> None:
+        """Best-effort stop every edit/run Runtime labelled with `workspace_id`.
+
+        Deployment Runtimes are out of scope here -- callers stop those
+        individually through `stop` using the Deployment rows they already
+        track. Edit/run Sessions have no such row, so this is the only way to
+        reach them in bulk; a backend with no such bulk primitive (or no
+        Workspace-scoped Sessions at all) may no-op.
+        """
+        ...
+
+    async def reconcilable_runtimes(self) -> Sequence[RuntimeRef]:
+        """List every Runtime this manager can enumerate, for the maintenance sweep.
+
+        A backend with no cluster-wide listing capability (or nothing worth
+        reconciling this way, e.g. dev-mode subprocess) returns an empty
+        sequence rather than raising.
+        """
         ...
 
     async def shutdown(self) -> None:

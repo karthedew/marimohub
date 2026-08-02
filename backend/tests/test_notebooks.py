@@ -7,8 +7,10 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.main import app
 from app.models import Notebook, NotebookVisibility, Workspace, WorkspaceMember, WorkspaceRole
 from app.services.gitlab_import import MAX_IMPORT_BYTES
+from app.services.session_manager import get_session_manager
 
 
 class _EmbeddingRecorder(Protocol):
@@ -821,6 +823,49 @@ async def test_update_and_delete_enforce_workspace_write_access(
     assert other_delete_public.status_code == 403
     assert other_delete_hidden_private.status_code == 404
     assert owner_delete.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_notebook_stops_its_deployment_runtime_first(
+    api_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Deleting a Notebook stops its Deployment's Runtime before the row disappears.
+
+    `deployments.notebook_id` is `ON DELETE CASCADE`, dropping the Deployment
+    row at the database level with no ORM event to hook -- so the Runtime
+    has to be stopped explicitly, before that FK cascade fires.
+    """
+    # Imported here, not at module level: test_deployments imports helpers
+    # from this module, so a top-level import back would be circular.
+    from test_deployments import FakeDeploymentSessionManager  # noqa: PLC0415
+
+    _, owner_headers, owner_ws = await register_and_login(
+        api_client, db_session, "delete-stops-run"
+    )
+    notebook = await create_notebook(
+        api_client, owner_headers, owner_ws, "Delete Stops Runtime", "x = 1"
+    )
+    manager = FakeDeploymentSessionManager()
+    app.dependency_overrides[get_session_manager] = lambda: manager
+    try:
+        await api_client.post(
+            f"/api/notebooks/{notebook['id']}/deploy",
+            headers=owner_headers,
+            json={"slug": "delete-stops-runtime"},
+        )
+        await api_client.get("/api/deployments/delete-stops-runtime")
+        deployment_id = manager.spawned[0][1]
+        assert deployment_id in manager.sessions
+
+        response = await api_client.delete(
+            f"/api/notebooks/{notebook['id']}", headers=owner_headers
+        )
+    finally:
+        app.dependency_overrides.pop(get_session_manager, None)
+
+    assert response.status_code == 204
+    assert deployment_id in manager.stopped
+    assert deployment_id not in manager.sessions
 
 
 @pytest.mark.asyncio

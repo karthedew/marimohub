@@ -1,0 +1,137 @@
+{{- include "marimohub.databaseTLSGuard" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-internal") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-internal") | nindent 4 }}
+spec:
+  replicas: {{ .Values.backendInternal.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.backendInternal.updateStrategy.maxUnavailable }}
+      maxSurge: {{ .Values.backendInternal.updateStrategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-internal") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-internal") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-internal") }}
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backendInternal.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if gt (.Values.backendInternal.replicaCount | int) 1 }}
+      topologySpreadConstraints:
+        {{- if .Values.backendInternal.topologySpreadConstraints }}
+        {{- toYaml .Values.backendInternal.topologySpreadConstraints | nindent 8 }}
+        {{- else }}
+        {{- include "marimohub.defaultTopologySpreadConstraints" (dict "ctx" $ "component" "backend-internal") | nindent 8 }}
+        {{- end }}
+      affinity:
+        {{- include "marimohub.defaultPodAntiAffinity" (dict "ctx" $ "component" "backend-internal") | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend-internal
+          image: {{ include "marimohub.image" .Values.backendInternal.image }}
+          imagePullPolicy: {{ .Values.backendInternal.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.backendInternal.port }}
+              protocol: TCP
+          {{- if not .Values.backendInternal.existingSecret }}
+          {{- fail "backendInternal.existingSecret is required (an existing Secret with DATABASE_URL and SECRET_KEY)" }}
+          {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.backendInternal.existingSecret }}
+          env:
+            - name: MARIMOHUB_APP
+              value: internal
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.backendInternal.port | quote }}
+            {{- if .Values.backendInternal.tls.enabled }}
+            - name: TLS_CERT_FILE
+              value: /etc/marimohub/tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /etc/marimohub/tls/tls.key
+            {{- end }}
+            - name: SESSION_NAMESPACE
+              value: {{ .Values.namespaces.sessions }}
+            {{- if .Values.database.tls.enabled }}
+            - name: DATABASE_CA_FILE
+              value: /etc/marimohub/db-ca/{{ .Values.database.tls.caSecretKey }}
+            {{- end }}
+          {{- with .Values.backendInternal.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              {{- if .Values.backendInternal.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              {{- if .Values.backendInternal.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.backendInternal.tls.enabled }}
+            - name: tls
+              mountPath: /etc/marimohub/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.database.tls.enabled }}
+            - name: db-ca
+              mountPath: /etc/marimohub/db-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.backendInternal.tls.enabled }}
+        - name: tls
+          secret:
+            {{- if not .Values.backendInternal.tls.secretName }}
+            {{- fail "backendInternal.tls.enabled requires backendInternal.tls.secretName" }}
+            {{- end }}
+            secretName: {{ .Values.backendInternal.tls.secretName }}
+        {{- end }}
+        {{- if .Values.database.tls.enabled }}
+        - name: db-ca
+          secret:
+            secretName: {{ .Values.database.tls.caSecretName }}
+        {{- end }}

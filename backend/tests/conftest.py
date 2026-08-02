@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.api.notebooks import get_embedding_service
 from app.core.config import get_settings
 from app.db.database import get_db
+from app.internal_main import app as internal_app
 from app.main import app
 from app.services.embedding_service import EMBEDDING_DIMENSIONS
 
@@ -48,6 +49,13 @@ def _sync_url(database_url: str, database: str | None = None) -> str:
     return url.render_as_string(hide_password=False)
 
 
+def _restore_env(name: str, original: str | None) -> None:
+    if original is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = original
+
+
 @pytest.fixture(scope="session")
 def test_database_url() -> Generator[str, None, None]:
     database_url = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
@@ -63,23 +71,28 @@ def test_database_url() -> Generator[str, None, None]:
         if exists is None:
             conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
 
-    original_database_url = os.environ.get("DATABASE_URL")
-    original_secret_key = os.environ.get("SECRET_KEY")
+    # Import tests exercise a mocked gitlab.example.com fetch; the allowlist
+    # gate defaults to fully closed (see Settings.GITLAB_IMPORT_ENABLED), so
+    # the test environment opts that one placeholder host in explicitly
+    # rather than every test doing it individually.
+    env_defaults = {
+        "DATABASE_URL": database_url,
+        "SECRET_KEY": "test-secret-with-at-least-32-bytes",
+        "GITLAB_IMPORT_ENABLED": "true",
+        "GITLAB_IMPORT_ALLOWED_HOSTS": '["gitlab.example.com"]',
+    }
+    originals = {name: os.environ.get(name) for name in env_defaults}
     os.environ["DATABASE_URL"] = database_url
-    os.environ.setdefault("SECRET_KEY", "test-secret-with-at-least-32-bytes")
+    for name, value in env_defaults.items():
+        if name != "DATABASE_URL":
+            os.environ.setdefault(name, value)
     get_settings.cache_clear()
     command.upgrade(Config("alembic.ini"), "head")
 
     yield database_url
 
-    if original_database_url is None:
-        os.environ.pop("DATABASE_URL", None)
-    else:
-        os.environ["DATABASE_URL"] = original_database_url
-    if original_secret_key is None:
-        os.environ.pop("SECRET_KEY", None)
-    else:
-        os.environ["SECRET_KEY"] = original_secret_key
+    for name, original in originals.items():
+        _restore_env(name, original)
     get_settings.cache_clear()
 
 
@@ -131,3 +144,26 @@ async def api_client(
         yield client
 
     app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def internal_api_client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+    """A client against the separate internal app, sharing the same test database session.
+
+    Distinct from `api_client`: the internal app has its own `get_db`
+    override but never gets `get_embedding_service` overridden, since none of
+    its routes touch embeddings. Tests set their own
+    `get_runtime_credential_verifier` override per fake cluster state.
+    """
+
+    async def override_db() -> AsyncGenerator[AsyncSession, None]:
+        yield db_session
+
+    internal_app.dependency_overrides[get_db] = override_db
+
+    async with AsyncClient(
+        transport=ASGITransport(app=internal_app), base_url="http://test"
+    ) as client:
+        yield client
+
+    internal_app.dependency_overrides.clear()

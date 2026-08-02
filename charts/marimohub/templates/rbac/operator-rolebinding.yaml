@@ -1,0 +1,19 @@
+# A RoleBinding lives in the same namespace as the Role it references, but
+# its subject ServiceAccount may live elsewhere -- exactly the split between
+# the operator's own namespaces.controller and the namespaces.sessions Role
+# above it needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "operator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}
+    namespace: {{ .Values.namespaces.controller }}

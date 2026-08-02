@@ -1,0 +1,30 @@
+# The pre-delete drain hook never touches the database (see
+# templates/uninstall-drain/job.yaml) -- only DNS and the Kubernetes API, to
+# list/delete MarimoSession CRs and poll their owned children.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "uninstall-drain") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "uninstall-drain") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "uninstall-drain") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- if .Values.network.kubernetesApi.cidrs }}
+    - to:
+        {{- range .Values.network.kubernetesApi.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.network.kubernetesApi.port }}
+          protocol: TCP
+    {{- end }}

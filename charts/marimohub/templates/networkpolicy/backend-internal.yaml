@@ -1,0 +1,49 @@
+# Deliberately no ingress rule for namespaces.app: nothing in the public
+# backend, frontend, or router is ever allowed to reach the internal API --
+# only a Runtime Pod's source-fetcher/marimo container may, which is the
+# entire point of keeping this a separate, unrouted Deployment.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-internal") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-internal") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-internal") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.sessions }}
+      ports:
+        - port: {{ .Values.backendInternal.port }}
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- if .Values.network.database.cidrs }}
+    - to:
+        {{- range .Values.network.database.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.network.database.port }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.network.kubernetesApi.cidrs }}
+    - to:
+        {{- range .Values.network.kubernetesApi.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.network.kubernetesApi.port }}
+          protocol: TCP
+    {{- end }}

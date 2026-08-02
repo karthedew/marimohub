@@ -1,0 +1,160 @@
+{{- include "marimohub.databaseTLSGuard" . }}
+{{- if and .Values.backendPublic.gitlabImport.enabled (not .Values.backendPublic.gitlabImport.allowedHosts) }}
+{{- fail "backendPublic.gitlabImport.allowedHosts is required when backendPublic.gitlabImport.enabled" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+spec:
+  replicas: {{ .Values.backendPublic.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.backendPublic.updateStrategy.maxUnavailable }}
+      maxSurge: {{ .Values.backendPublic.updateStrategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-public") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backendPublic.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if gt (.Values.backendPublic.replicaCount | int) 1 }}
+      topologySpreadConstraints:
+        {{- if .Values.backendPublic.topologySpreadConstraints }}
+        {{- toYaml .Values.backendPublic.topologySpreadConstraints | nindent 8 }}
+        {{- else }}
+        {{- include "marimohub.defaultTopologySpreadConstraints" (dict "ctx" $ "component" "backend-public") | nindent 8 }}
+        {{- end }}
+      affinity:
+        {{- include "marimohub.defaultPodAntiAffinity" (dict "ctx" $ "component" "backend-public") | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend-public
+          image: {{ include "marimohub.image" .Values.backendPublic.image }}
+          imagePullPolicy: {{ .Values.backendPublic.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.backendPublic.port }}
+              protocol: TCP
+          {{- if not .Values.backendPublic.existingSecret }}
+          {{- fail "backendPublic.existingSecret is required (an existing Secret with DATABASE_URL, SECRET_KEY, and any OIDC settings)" }}
+          {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.backendPublic.existingSecret }}
+          env:
+            - name: MARIMOHUB_APP
+              value: public
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.backendPublic.port | quote }}
+            {{- if .Values.backendPublic.tls.enabled }}
+            - name: TLS_CERT_FILE
+              value: /etc/marimohub/tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /etc/marimohub/tls/tls.key
+            {{- end }}
+            - name: SESSION_BACKEND
+              value: kube
+            - name: SESSION_NAMESPACE
+              value: {{ .Values.namespaces.sessions }}
+            - name: SESSION_SERVICE_DNS_SUFFIX
+              value: svc
+            - name: SESSION_SERVICE_PORT
+              value: {{ include "marimohub.runtimePort" . | quote }}
+            - name: SESSION_RUNTIME_IMAGE
+              value: {{ include "marimohub.runtimeImage" . }}
+            - name: ACTIVITY_SIGNAL_INTERVAL_SECONDS
+              value: {{ .Values.runtime.activitySignalIntervalSeconds | quote }}
+            {{- if .Values.database.tls.enabled }}
+            - name: DATABASE_CA_FILE
+              value: /etc/marimohub/db-ca/{{ .Values.database.tls.caSecretKey }}
+            {{- end }}
+            - name: GITLAB_IMPORT_ENABLED
+              value: {{ .Values.backendPublic.gitlabImport.enabled | quote }}
+            {{- if .Values.backendPublic.gitlabImport.proxyUrl }}
+            - name: GITLAB_IMPORT_PROXY_URL
+              value: {{ .Values.backendPublic.gitlabImport.proxyUrl | quote }}
+            {{- end }}
+            {{- if .Values.backendPublic.gitlabImport.allowedHosts }}
+            - name: GITLAB_IMPORT_ALLOWED_HOSTS
+              value: {{ toJson .Values.backendPublic.gitlabImport.allowedHosts | quote }}
+            {{- end }}
+          {{- with .Values.backendPublic.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              {{- if .Values.backendPublic.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+              {{- if .Values.backendPublic.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.backendPublic.tls.enabled }}
+            - name: tls
+              mountPath: /etc/marimohub/tls
+              readOnly: true
+            {{- end }}
+            {{- if .Values.database.tls.enabled }}
+            - name: db-ca
+              mountPath: /etc/marimohub/db-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.backendPublic.tls.enabled }}
+        - name: tls
+          secret:
+            {{- if not .Values.backendPublic.tls.secretName }}
+            {{- fail "backendPublic.tls.enabled requires backendPublic.tls.secretName" }}
+            {{- end }}
+            secretName: {{ .Values.backendPublic.tls.secretName }}
+        {{- end }}
+        {{- if .Values.database.tls.enabled }}
+        - name: db-ca
+          secret:
+            secretName: {{ .Values.database.tls.caSecretName }}
+        {{- end }}

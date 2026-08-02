@@ -1,0 +1,395 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: marimosessions.marimohub.io
+spec:
+  group: marimohub.io
+  names:
+    kind: MarimoSession
+    listKind: MarimoSessionList
+    plural: marimosessions
+    shortNames:
+    - msess
+    singular: marimosession
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.notebookId
+      name: Notebook
+      type: string
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          MarimoSession is the technical resource for both a Session's ephemeral
+          Runtime and a Deployment's durable Runtime. See the Domain Model: a Session
+          has one ephemeral Runtime, while a Deployment has one durable Runtime that
+          may sleep.
+
+          Label/spec identity agreement (marimohub.io/notebook, marimohub.io/
+          workspace, and marimohub.io/mode must equal the identically named spec
+          fields) is deliberately not expressed here as a CRD schema CEL rule: the
+          CRD validation CEL environment only exposes metadata.name and
+          metadata.generateName, not metadata.labels, so the API server rejects any
+          x-kubernetes-validations rule that reaches into self.metadata.labels at
+          CRD-install time. That agreement is instead enforced by the
+          ValidatingAdmissionPolicy in config/policy, which runs inside the API
+          server (no webhook process, no TLS material, no TokenReview/SAR) and does
+          have the full object, including labels, available to its CEL rules.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of MarimoSession
+            properties:
+              baseUrl:
+                description: |-
+                  baseUrl is the proxy path prefix marimo is served under (maps to
+                  --base-url). It must be a bounded, rooted path with no query string,
+                  fragment, or parent-directory traversal, since it becomes part of the
+                  externally routed URL. Immutable.
+                maxLength: 256
+                pattern: ^/[A-Za-z0-9._~!$&'()*+,;=:@/-]*$
+                type: string
+                x-kubernetes-validations:
+                - message: baseUrl must not contain parent-directory traversal
+                  rule: '!self.contains(''..'')'
+                - message: baseUrl is immutable after creation
+                  rule: self == oldSelf
+              creatorId:
+                description: |-
+                  creatorId attributes an edit/run Session to the User who started it.
+                  Nullable and absent for deploy mode and for Sessions started without a
+                  specific actor. Immutable, but its immutability rule lives on the
+                  struct (see the XValidation marker above), not here: a field-level
+                  "self == oldSelf" rule is only reachable once the field already has a
+                  value in both the old and new object, so it silently permits the one
+                  transition that actually matters for an optional field -- going from
+                  absent to present on update. The struct-level rule uses has() to
+                  compare presence as well as value.
+                format: uuid
+                nullable: true
+                type: string
+              deploymentRevision:
+                description: |-
+                  deploymentRevision binds a deploy-mode Runtime to the exact backend
+                  Deployment snapshot it must fetch; the source-fetcher and internal API
+                  use it to reject a stale or since-redeployed request. Required only for
+                  deploy mode (enforced by the XValidation rule on the struct) and
+                  immutable once set: a new revision is always a new Runtime.
+                format: int64
+                minimum: 0
+                type: integer
+                x-kubernetes-validations:
+                - message: deploymentRevision is immutable after creation
+                  rule: self == oldSelf
+              idleTimeoutSeconds:
+                description: |-
+                  idleTimeoutSeconds overrides the operator's per-mode chart default. It
+                  is a minimum idle duration, not an exact shutdown deadline, and is the
+                  one launch-adjacent field that is deliberately mutable: tightening or
+                  loosening the idle budget does not change what Runtime is running, so
+                  it never triggers Pod replacement. 30s is the floor because it must
+                  stay comfortably above the backend's activity-annotation coalescing
+                  window, or throttled activity signals could be mistaken for idleness.
+                format: int32
+                minimum: 30
+                type: integer
+              image:
+                description: |-
+                  image is a fully resolved, digest-qualified Runtime image reference.
+                  Release charts always supply a digest; a mutable tag is rejected so the
+                  Pod the operator creates can never silently diverge from what was
+                  validated at admission time. Immutable.
+                maxLength: 512
+                pattern: ^[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[0-9a-f]{64}$
+                type: string
+                x-kubernetes-validations:
+                - message: image is immutable after creation
+                  rule: self == oldSelf
+              mode:
+                description: |-
+                  mode selects edit, run, or deploy behavior. Immutable: switching modes
+                  is a new Runtime, never an in-place transition.
+                enum:
+                - edit
+                - run
+                - deploy
+                type: string
+                x-kubernetes-validations:
+                - message: mode is immutable after creation
+                  rule: self == oldSelf
+              notebookId:
+                description: |-
+                  notebookId is the Notebook this Runtime serves. Immutable: a different
+                  Notebook is a different Runtime.
+                format: uuid
+                type: string
+                x-kubernetes-validations:
+                - message: notebookId is immutable after creation
+                  rule: self == oldSelf
+              resources:
+                description: |-
+                  resources overrides the operator's chart-wide Runtime resource
+                  defaults. Deliberately mutable: the operator replaces the Pod when this
+                  changes (a resize needs a new container, not an in-place patch), and
+                  status.observedGeneration only advances once that replacement Pod is
+                  fully reconciled.
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims,
+                      that are used by this container.
+
+                      This field depends on the
+                      DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: |-
+                            Name must match the name of one entry in pod.spec.resourceClaims of
+                            the Pod where this field is used. It makes that resource available
+                            inside a container.
+                          type: string
+                        request:
+                          description: |-
+                            Request is the name chosen for a request in the referenced claim.
+                            If empty, everything from the claim is made available, otherwise
+                            only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Limits describes the maximum amount of compute resources allowed.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: |-
+                      Requests describes the minimum amount of compute resources required.
+                      If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                      otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                      More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                    type: object
+                type: object
+              workspaceId:
+                description: |-
+                  workspaceId is the owning Workspace, kept redundantly with notebookId so
+                  the operator and admission rules never need a Notebook lookup to
+                  enforce namespace-wide policy or Workspace-scoped cleanup. Immutable.
+                format: uuid
+                type: string
+                x-kubernetes-validations:
+                - message: workspaceId is immutable after creation
+                  rule: self == oldSelf
+            required:
+            - baseUrl
+            - image
+            - mode
+            - notebookId
+            - workspaceId
+            type: object
+            x-kubernetes-validations:
+            - message: deploymentRevision is required when mode is deploy and must
+                be omitted otherwise
+              rule: 'self.mode == ''deploy'' ? has(self.deploymentRevision) : !has(self.deploymentRevision)'
+            - message: creatorId is immutable after creation
+              rule: has(oldSelf.creatorId) == has(self.creatorId) && (!has(self.creatorId)
+                || self.creatorId == oldSelf.creatorId)
+          status:
+            description: status defines the observed state of MarimoSession
+            properties:
+              attempt:
+                description: |-
+                  attempt counts start attempts for the current generation; it is
+                  consumed (not retried) by a quota rejection until an unobserved wake
+                  request or a resources change starts a new attempt.
+                format: int32
+                type: integer
+              conditions:
+                description: |-
+                  conditions carries the machine-readable Reasons callers key behavior
+                  off of. Merged by type so repeated status patches never duplicate an
+                  entry.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastActivity:
+                description: |-
+                  lastActivity is the controller's own clock reading of the last time
+                  this Runtime was known active; it is never taken from client-supplied
+                  timestamps.
+                format: date-time
+                type: string
+              message:
+                description: |-
+                  message is bounded, sanitized diagnostic text. It must never contain
+                  credentials, raw Pod logs, admission payloads, or a parseable protocol
+                  prefix; Conditions carry the machine-readable meaning.
+                maxLength: 512
+                type: string
+              observedActivity:
+                description: |-
+                  observedActivity is the last marimohub.io/activity annotation value the
+                  controller has acknowledged.
+                type: string
+              observedGeneration:
+                description: |-
+                  observedGeneration advances only after metadata.generation's spec has
+                  been fully reconciled, so callers can detect an in-flight resources
+                  replacement rather than reading a stale Ready condition.
+                format: int64
+                type: integer
+              observedWakeRequest:
+                description: |-
+                  observedWakeRequest is the last marimohub.io/wake-request annotation
+                  value the controller has acknowledged, so a repeated reconcile of the
+                  same request never starts a second Pod attempt.
+                type: string
+              phase:
+                description: |-
+                  phase is the human-readable lifecycle summary. It exists for kubectl
+                  and dashboards; Conditions are the machine-readable contract.
+                enum:
+                - Pending
+                - Starting
+                - Ready
+                - Sleeping
+                - Failed
+                type: string
+              podName:
+                description: |-
+                  podName is the current Runtime Pod's name, cleared before the Pod is
+                  deleted for an idle deploy sleep so a crash between those writes can
+                  never be mistaken for a recoverable infrastructure loss.
+                type: string
+              podTemplateHash:
+                description: |-
+                  podTemplateHash is a content hash of the desired Pod this controller
+                  last built for the current attempt. It exists to distinguish a
+                  deliberate spec.resources change (the only mutable field that alters
+                  the desired Pod's shape) from any other reason the live Pod might be
+                  absent or need replacing: idleTimeoutSeconds changes are invisible to
+                  this hash by construction, since the Pod/Service builders never read
+                  it, so tuning idle behavior can never look like a resources change and
+                  trigger a Pod replacement or an capacity retry it was never meant to.
+                type: string
+              serviceName:
+                description: serviceName is the current Runtime Service's name.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: metadata.name must be the Runtime UUID
+          rule: self.metadata.name.matches('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+    served: true
+    storage: true
+    subresources:
+      status: {}

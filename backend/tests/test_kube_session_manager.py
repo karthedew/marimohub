@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from collections.abc import Generator, Mapping
 import copy
@@ -11,9 +12,10 @@ import pytest
 import yaml
 
 from app.core.config import get_settings
-from app.models import Notebook
-from app.services import kube_session_manager as kube_module
-from app.services.kube_session_manager import KubeSessionManager
+from app.models import Deployment, Notebook
+from app.services import runtime_contract as contract
+import app.services.kube_session_manager as kube_module
+from app.services.kube_session_manager import KubeSessionManager, _ActivityThrottle
 from app.services.session_manager import (
     NotebookStartupError,
     SessionCapacityError,
@@ -25,13 +27,13 @@ from app.services.session_manager import (
 _NAMESPACE = "marimohub-sessions"
 _DNS_SUFFIX = "svc"
 _PORT = 8080
+_RUNTIME_IMAGE = "registry.example/marimo-runtime@sha256:" + "0" * 64
 
 
 @pytest.fixture(autouse=True)
 def _settings_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
-    # create_session_token() reads SECRET_KEY/SESSION_TOKEN_TTL_SECONDS from
-    # settings; these tests are unit tests of the manager, not the API, and
-    # must not depend on another test module having primed the environment.
+    # These tests are unit tests of the manager, not the API, and must not
+    # depend on another test module having primed the environment.
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://molab:molab@localhost:5432/molab_test")
     monkeypatch.setenv("SECRET_KEY", "test-secret-with-at-least-32-bytes")
     get_settings.cache_clear()
@@ -42,9 +44,9 @@ def _settings_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None
 class FakeCustomObjectsApi:
     """Fake `CustomObjectsApi` backed by an in-memory dict of CR bodies.
 
-    Patching the wake annotation flips the stored phase to `Ready`, standing
-    in for the controller's reconcile loop so a poll immediately after a wake
-    observes a resolved session without real cluster timing.
+    Patching the wake-request annotation flips the stored phase to `Ready`,
+    standing in for the controller's reconcile loop so a poll immediately
+    after a wake observes a resolved runtime without real cluster timing.
 
     An optional shared `events` list, handed to both this fake and a
     `FakeCoreV1Api`, lets a test observe the *global* call order across the
@@ -57,7 +59,7 @@ class FakeCustomObjectsApi:
         self.objects: dict[str, dict[str, Any]] = {}
         self.create_calls: list[dict[str, Any]] = []
         self.patch_calls: list[tuple[str, dict[str, Any]]] = []
-        self.delete_calls: list[str] = []
+        self.delete_calls: list[tuple[str, object | None]] = []
         self.on_create: Any = None
         self.events: list[str] = events if events is not None else []
 
@@ -98,31 +100,61 @@ class FakeCustomObjectsApi:
         cr = self.objects[name]
         annotations = body.get("metadata", {}).get("annotations", {})
         cr.setdefault("metadata", {}).setdefault("annotations", {}).update(annotations)
-        if kube_module._WAKE_ANNOTATION in annotations:
-            cr["status"]["phase"] = "Ready"
+        if contract.ANNOTATION_WAKE_REQUEST in annotations:
+            cr["status"] = {
+                "phase": "Ready",
+                "serviceName": cr["status"].get("serviceName", "msess-svc"),
+            }
             self.events.append(f"wake_annotation:{name}")
         return copy.deepcopy(cr)
 
     async def delete_namespaced_custom_object(
-        self, group: str, version: str, namespace: str, plural: str, name: str
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+        body: object | None = None,
     ) -> dict[str, Any]:
         if name not in self.objects:
             raise ApiException(status=404, reason="NotFound")
-        self.delete_calls.append(name)
+        self.delete_calls.append((name, body))
         return self.objects.pop(name)
+
+    async def list_namespaced_custom_object(
+        self, group: str, version: str, namespace: str, plural: str, label_selector: str = ""
+    ) -> dict[str, Any]:
+        items = list(self.objects.values())
+        for clause in filter(None, label_selector.split(",")):
+            if "!=" in clause:
+                key, _, value = clause.partition("!=")
+                items = [
+                    item
+                    for item in items
+                    if item.get("metadata", {}).get("labels", {}).get(key) != value
+                ]
+            elif "=" in clause:
+                key, _, value = clause.partition("=")
+                items = [
+                    item
+                    for item in items
+                    if item.get("metadata", {}).get("labels", {}).get(key) == value
+                ]
+        return {"items": copy.deepcopy(items)}
 
 
 class FakeCoreV1Api:
     """Fake `CoreV1Api` that mirrors the server's stringData -> base64 data move.
 
-    See `FakeCustomObjectsApi`'s docstring for the shared `events` list.
+    Deliberately has no `patch_namespaced_secret`: the real manager never
+    calls it either, since the credential Secret is created once, immutable,
+    and never patched again (see `KubeSessionManager._wake`).
     """
 
-    def __init__(self, events: list[str] | None = None) -> None:
+    def __init__(self) -> None:
         self.secrets: dict[str, client.V1Secret] = {}
         self.create_calls: list[client.V1Secret] = []
-        self.patch_calls: list[tuple[str, dict[str, Any]]] = []
-        self.events: list[str] = events if events is not None else []
 
     @staticmethod
     def _encode(string_data: dict[str, str]) -> dict[str, str]:
@@ -135,7 +167,10 @@ class FakeCoreV1Api:
         self, namespace: str, body: client.V1Secret
     ) -> client.V1Secret:
         stored = client.V1Secret(
-            metadata=body.metadata, data=self._encode(body.string_data or {}), type=body.type
+            metadata=body.metadata,
+            data=self._encode(body.string_data or {}),
+            type=body.type,
+            immutable=body.immutable,
         )
         self.secrets[body.metadata.name] = stored
         self.create_calls.append(stored)
@@ -146,26 +181,30 @@ class FakeCoreV1Api:
             raise ApiException(status=404, reason="NotFound")
         return self.secrets[name]
 
-    async def patch_namespaced_secret(
-        self, name: str, namespace: str, body: Mapping[str, Any]
-    ) -> client.V1Secret:
-        if name not in self.secrets:
-            raise ApiException(status=404, reason="NotFound")
-        self.patch_calls.append((name, dict(body)))
-        secret = self.secrets[name]
-        data = dict(secret.data or {})
-        data.update(self._encode(body.get("stringData", {})))
-        secret.data = data
-        if "SESSION_TOKEN" in body.get("stringData", {}):
-            self.events.append(f"secret_refresh:{name}")
-        return secret
-
 
 def _notebook(*, notebook_id: UUID | None = None, workspace_id: UUID | None = None) -> Notebook:
     return Notebook(
         id=notebook_id or uuid4(),
         workspace_id=workspace_id or uuid4(),
         title="Kube-backed notebook",
+    )
+
+
+def _deployment(
+    notebook: Notebook,
+    *,
+    deployment_id: UUID | None = None,
+    slug: str = "plasma-dashboard",
+    revision: int = 1,
+) -> Deployment:
+    return Deployment(
+        id=deployment_id or uuid4(),
+        notebook_id=notebook.id,
+        slug=slug,
+        revision=revision,
+        runtime_image=_RUNTIME_IMAGE,
+        source_snapshot="x = 1",
+        source_sha256="deadbeef",
     )
 
 
@@ -176,14 +215,42 @@ def _manager(
         namespace=_NAMESPACE,
         service_dns_suffix=_DNS_SUFFIX,
         service_port=_PORT,
-        runtime_image=None,
+        runtime_image=_RUNTIME_IMAGE,
         ready_timeout_seconds=ready_timeout_seconds,
+        delete_timeout_seconds=5.0,
         clients=(custom, core),
     )
 
 
 def _mark_ready(cr: dict[str, Any], *, service_name: str = "msess-svc") -> None:
-    cr["status"] = {"phase": "Ready", "serviceName": service_name}
+    cr["status"] = {
+        "phase": "Ready",
+        "serviceName": service_name,
+        "conditions": [{"type": "Ready", "status": "True"}],
+    }
+
+
+def _mark_quota_exceeded(cr: dict[str, Any]) -> None:
+    cr["status"] = {
+        "phase": "Pending",
+        "conditions": [
+            {
+                "type": "CapacityAvailable",
+                "status": "False",
+                "reason": "QuotaExceeded",
+                "message": "pods quota exhausted",
+            }
+        ],
+    }
+
+
+def _mark_failed(cr: dict[str, Any], *, reason: str = "RuntimeExited") -> None:
+    cr["status"] = {
+        "phase": "Failed",
+        "conditions": [
+            {"type": "Ready", "status": "False", "reason": reason, "message": "container exited 1"}
+        ],
+    }
 
 
 @pytest.mark.asyncio
@@ -200,31 +267,34 @@ async def test_spawn_uses_uuid4_cr_name_and_label_set() -> None:
     assert session.phase == SessionPhase.READY
     labels = custom.create_calls[0]["metadata"]["labels"]
     assert labels == {
-        "marimohub.io/notebook": str(notebook.id),
-        "marimohub.io/workspace": str(notebook.workspace_id),
-        "marimohub.io/mode": "edit",
+        contract.LABEL_NOTEBOOK: str(notebook.id),
+        contract.LABEL_WORKSPACE: str(notebook.workspace_id),
+        contract.LABEL_MODE: "edit",
     }
     assert custom.create_calls[0]["spec"]["baseUrl"] == f"/api/proxy/{session.id}"
 
 
 @pytest.mark.asyncio
-async def test_spawn_deployment_uses_deployment_id_as_cr_name() -> None:
+async def test_spawn_deployment_creates_cr_bound_to_revision_and_image() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     custom.on_create = _mark_ready
     notebook = _notebook()
-    deployment_id = uuid4()
+    deployment = _deployment(notebook, revision=7)
     manager = _manager(custom, core)
 
-    session = await manager.spawn_deployment(notebook, deployment_id, "plasma-dashboard")
+    session = await manager.spawn_deployment(notebook, deployment)
 
-    assert session.id == deployment_id
-    assert str(deployment_id) in custom.objects
-    assert custom.create_calls[0]["spec"]["baseUrl"] == "/api/deployments/plasma-dashboard"
-    assert custom.create_calls[0]["spec"]["mode"] == "deploy"
+    assert session.id == deployment.id
+    assert str(deployment.id) in custom.objects
+    spec = custom.create_calls[0]["spec"]
+    assert spec["baseUrl"] == f"/api/deployments/{deployment.slug}"
+    assert spec["mode"] == "deploy"
+    assert spec["deploymentRevision"] == 7
+    assert spec["image"] == _RUNTIME_IMAGE
 
 
 @pytest.mark.asyncio
-async def test_spawn_creates_secret_with_owner_ref_and_both_tokens() -> None:
+async def test_spawn_creates_immutable_secret_with_owner_ref_and_both_keys() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     custom.on_create = _mark_ready
     notebook = _notebook()
@@ -236,66 +306,114 @@ async def test_spawn_creates_secret_with_owner_ref_and_both_tokens() -> None:
     assert secret.metadata.owner_references[0].name == str(session.id)
     assert secret.metadata.owner_references[0].uid == f"uid-{session.id}"
     assert secret.metadata.owner_references[0].kind == "MarimoSession"
-    assert set(secret.data or {}) == {"MARIMO_TOKEN", "SESSION_TOKEN"}
+    assert set(secret.data or {}) == {"MARIMO_TOKEN", "RUNTIME_CREDENTIAL"}
+    assert secret.immutable is True
 
 
 @pytest.mark.asyncio
-async def test_spawn_deployment_wake_refreshes_token_then_annotates_then_polls_ready() -> None:
-    # A single shared event log (rather than each fake's own `patch_calls`) is
-    # what actually proves *global* ordering: two independent per-client
-    # lists can't distinguish "secret refreshed, then annotated" from
-    # "annotated, then secret refreshed" when both happen to be index 0 in
-    # their own list.
-    events: list[str] = []
-    custom, core = FakeCustomObjectsApi(events), FakeCoreV1Api(events)
+async def test_spawned_runtime_credential_is_bound_to_the_runtime_id() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    manager = _manager(custom, core)
+
+    session = await manager.spawn(_notebook(), "run")
+
+    secret = core.secrets[f"msess-{session.id}-env"]
+    credential = base64.b64decode(secret.data["RUNTIME_CREDENTIAL"]).decode()
+    assert credential.startswith(f"mh_rt_v1.{session.id}.")
+
+
+@pytest.mark.asyncio
+async def test_spawn_deployment_wake_only_annotates_and_never_touches_the_secret() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     notebook = _notebook()
-    deployment_id = uuid4()
-    name = str(deployment_id)
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
 
     custom.objects[name] = {
-        "apiVersion": "marimohub.io/v1alpha1",
-        "kind": "MarimoSession",
+        "apiVersion": contract.API_VERSION,
+        "kind": contract.KIND,
         "metadata": {"name": name, "uid": f"uid-{name}"},
         "spec": {
             "notebookId": str(notebook.id),
             "workspaceId": str(notebook.workspace_id),
             "creatorId": None,
             "mode": "deploy",
-            "baseUrl": "/api/deployments/plasma-dashboard",
+            "baseUrl": f"/api/deployments/{deployment.slug}",
+            "deploymentRevision": deployment.revision,
+        },
+        "status": {"phase": "Sleeping"},
+    }
+    existing_secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(name=f"msess-{name}-env"),
+        data={
+            "MARIMO_TOKEN": base64.b64encode(b"token").decode(),
+            "RUNTIME_CREDENTIAL": base64.b64encode(f"mh_rt_v1.{name}.abc".encode()).decode(),
+        },
+        type="Opaque",
+        immutable=True,
+    )
+    core.secrets[f"msess-{name}-env"] = existing_secret
+    manager = _manager(custom, core)
+
+    session = await manager.spawn_deployment(notebook, deployment)
+
+    assert session.id == deployment.id
+    assert session.phase == SessionPhase.READY
+    # A wake is nothing but the annotation: RUNTIME_CREDENTIAL never expires
+    # and the Secret is immutable, so there is nothing left to refresh, and
+    # `create_namespaced_secret` (the only write path) is never called again
+    # once the Secret already exists.
+    assert core.secrets[f"msess-{name}-env"] is existing_secret
+    assert core.create_calls == []
+    wake_patch_name, wake_patch_body = custom.patch_calls[0]
+    assert wake_patch_name == name
+    assert contract.ANNOTATION_WAKE_REQUEST in wake_patch_body["metadata"]["annotations"]
+
+
+@pytest.mark.asyncio
+async def test_wake_annotation_is_a_random_token_not_a_timestamp() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
+    custom.objects[name] = {
+        "metadata": {"name": name, "uid": f"uid-{name}"},
+        "spec": {
+            "notebookId": str(notebook.id),
+            "workspaceId": str(notebook.workspace_id),
+            "creatorId": None,
+            "mode": "deploy",
+            "baseUrl": f"/api/deployments/{deployment.slug}",
+            "deploymentRevision": deployment.revision,
         },
         "status": {"phase": "Sleeping"},
     }
     core.secrets[f"msess-{name}-env"] = client.V1Secret(
         metadata=client.V1ObjectMeta(name=f"msess-{name}-env"),
-        data={
-            "MARIMO_TOKEN": base64.b64encode(b"old-token").decode(),
-            "SESSION_TOKEN": base64.b64encode(b"stale").decode(),
-        },
+        data={"MARIMO_TOKEN": base64.b64encode(b"t").decode()},
         type="Opaque",
+        immutable=True,
     )
     manager = _manager(custom, core)
 
-    session = await manager.spawn_deployment(notebook, deployment_id, "plasma-dashboard")
+    await manager.spawn_deployment(notebook, deployment)
 
-    assert session.id == deployment_id
-    assert session.phase == SessionPhase.READY
-    # The shared event log orders across *both* clients, so this actually
-    # pins the secret-refresh-before-wake-annotation timeline the wake
-    # contract requires (a restarted pod must never boot with a stale token).
-    assert events == [f"secret_refresh:msess-{name}-env", f"wake_annotation:{name}"]
-    assert core.patch_calls[0][0] == f"msess-{name}-env"
-    assert "SESSION_TOKEN" in core.patch_calls[0][1]["stringData"]
-    wake_patch_name, wake_patch_body = custom.patch_calls[0]
-    assert wake_patch_name == name
-    assert kube_module._WAKE_ANNOTATION in wake_patch_body["metadata"]["annotations"]
+    _, body = custom.patch_calls[0]
+    token = body["metadata"]["annotations"][contract.ANNOTATION_WAKE_REQUEST]
+    # An RFC3339 timestamp always contains ':' (and typically 'T'); a
+    # `secrets.token_urlsafe` value never does. This is the cheapest
+    # reliable way to prove the annotation carries an opaque token, not a
+    # clock reading the caller could ever construct or predict.
+    assert ":" not in token
 
 
 @pytest.mark.asyncio
 async def test_spawn_deployment_already_ready_returns_existing_info_without_waking() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     notebook = _notebook()
-    deployment_id = uuid4()
-    name = str(deployment_id)
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
     custom.objects[name] = {
         "metadata": {"name": name},
         "spec": {
@@ -303,17 +421,18 @@ async def test_spawn_deployment_already_ready_returns_existing_info_without_waki
             "workspaceId": str(notebook.workspace_id),
             "creatorId": None,
             "mode": "deploy",
-            "baseUrl": "/api/deployments/plasma-dashboard",
+            "baseUrl": f"/api/deployments/{deployment.slug}",
+            "deploymentRevision": deployment.revision,
         },
         "status": {"phase": "Ready", "serviceName": "msess-svc"},
     }
     manager = _manager(custom, core)
 
-    session = await manager.spawn_deployment(notebook, deployment_id, "plasma-dashboard")
+    session = await manager.spawn_deployment(notebook, deployment)
 
-    assert session.id == deployment_id
+    assert session.id == deployment.id
     assert session.phase == SessionPhase.READY
-    assert core.patch_calls == []
+    assert core.create_calls == []
     assert custom.patch_calls == []
 
 
@@ -383,6 +502,48 @@ async def test_target_is_none_when_ready_but_no_service_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_target_is_none_while_cr_is_terminating() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    notebook = _notebook()
+    name = str(uuid4())
+    custom.objects[name] = {
+        "metadata": {"name": name, "deletionTimestamp": "2026-01-01T00:00:00Z"},
+        "spec": {
+            "notebookId": str(notebook.id),
+            "workspaceId": str(notebook.workspace_id),
+            "creatorId": None,
+            "mode": "run",
+            "baseUrl": f"/api/proxy/{name}",
+        },
+        "status": {"phase": "Ready", "serviceName": "msess-svc"},
+    }
+    manager = _manager(custom, core)
+
+    assert await manager.target(UUID(name)) is None
+
+
+@pytest.mark.asyncio
+async def test_target_is_none_when_observed_generation_lags() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    notebook = _notebook()
+    name = str(uuid4())
+    custom.objects[name] = {
+        "metadata": {"name": name, "generation": 2},
+        "spec": {
+            "notebookId": str(notebook.id),
+            "workspaceId": str(notebook.workspace_id),
+            "creatorId": None,
+            "mode": "run",
+            "baseUrl": f"/api/proxy/{name}",
+        },
+        "status": {"phase": "Ready", "serviceName": "msess-svc", "observedGeneration": 1},
+    }
+    manager = _manager(custom, core)
+
+    assert await manager.target(UUID(name)) is None
+
+
+@pytest.mark.asyncio
 async def test_mark_active_coalesces_two_calls_into_one_patch() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     custom.on_create = _mark_ready
@@ -397,21 +558,59 @@ async def test_mark_active_coalesces_two_calls_into_one_patch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mark_active_never_raises_for_unknown_session() -> None:
+async def test_mark_active_writes_a_random_token_not_a_timestamp() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
     manager = _manager(custom, core)
+    session = await manager.spawn(_notebook(), "run")
+    custom.patch_calls.clear()
 
-    await manager.mark_active(uuid4())  # would 404 inside; must not propagate
+    await manager.mark_active(session.id)
+
+    _, body = custom.patch_calls[0]
+    token = body["metadata"]["annotations"][contract.ANNOTATION_ACTIVITY]
+    assert ":" not in token
 
 
 @pytest.mark.asyncio
-async def test_spawn_raises_capacity_error_on_quota_exceeded_sentinel() -> None:
+async def test_mark_active_does_not_advance_throttle_on_failed_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    manager = _manager(custom, core)
+    session = await manager.spawn(_notebook(), "run")
+    custom.patch_calls.clear()
 
-    def _quota_exceeded(cr: dict[str, Any]) -> None:
-        cr["status"] = {"phase": "Pending", "message": "QuotaExceeded: pods quota exhausted"}
+    async def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("cluster unavailable")
 
-    custom.on_create = _quota_exceeded
+    monkeypatch.setattr(custom, "patch_namespaced_custom_object", _boom)
+    await manager.mark_active(session.id)  # swallowed; throttle must not advance
+
+    monkeypatch.undo()
+    await manager.mark_active(session.id)  # should still attempt, not be suppressed
+
+    assert len(custom.patch_calls) == 1
+
+
+def test_activity_throttle_evicts_least_recently_used_beyond_max_entries() -> None:
+    throttle = _ActivityThrottle(max_entries=2)
+    a, b, c = uuid4(), uuid4(), uuid4()
+
+    throttle.record(a, 0.0)
+    throttle.record(b, 1.0)
+    throttle.record(c, 2.0)  # evicts `a`, the least recently used
+
+    assert throttle.ready(a, 100.0, window_seconds=1000.0) is True
+    assert throttle.ready(b, 100.0, window_seconds=1000.0) is False
+    assert throttle.ready(c, 100.0, window_seconds=1000.0) is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_raises_capacity_error_on_quota_condition() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_quota_exceeded
     manager = _manager(custom, core)
 
     with pytest.raises(SessionCapacityError):
@@ -433,11 +632,7 @@ async def test_spawn_raises_session_start_error_on_poll_timeout(
 @pytest.mark.asyncio
 async def test_spawn_raises_notebook_startup_error_on_failed_phase() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
-
-    def _failed(cr: dict[str, Any]) -> None:
-        cr["status"] = {"phase": "Failed", "message": "container exited 1"}
-
-    custom.on_create = _failed
+    custom.on_create = _mark_failed
     manager = _manager(custom, core)
 
     with pytest.raises(NotebookStartupError):
@@ -445,7 +640,167 @@ async def test_spawn_raises_notebook_startup_error_on_failed_phase() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_deletes_cr_and_unknown_session_raises_not_found() -> None:
+async def test_get_reports_sanitized_failure_reason_and_message() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = lambda cr: _mark_failed(cr, reason="OOMKilled")
+    manager = _manager(custom, core)
+    notebook = _notebook()
+
+    with pytest.raises(NotebookStartupError):
+        await manager.spawn(notebook, "run")
+
+    # `spawn`'s own failure compensates (deletes) the CR; this test re-creates
+    # one directly to inspect `get()`'s projection in isolation.
+    name = str(uuid4())
+    custom.objects[name] = {
+        "metadata": {"name": name},
+        "spec": {
+            "notebookId": str(notebook.id),
+            "workspaceId": str(notebook.workspace_id),
+            "creatorId": None,
+            "mode": "run",
+            "baseUrl": f"/api/proxy/{name}",
+        },
+        "status": {
+            "phase": "Failed",
+            "message": "killed",
+            "conditions": [{"type": "Ready", "status": "False", "reason": "OOMKilled"}],
+        },
+    }
+
+    info = await manager.get(UUID(name))
+
+    assert info is not None
+    assert info.phase == SessionPhase.FAILED
+    assert info.failure_reason == "OOMKilled"
+    assert info.message == "killed"
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_compensates_by_deleting_cr_and_secret() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_failed
+    manager = _manager(custom, core)
+
+    with pytest.raises(NotebookStartupError):
+        await manager.spawn(_notebook(), "run")
+
+    assert custom.objects == {}
+    assert custom.delete_calls
+    deleted_name, delete_body = custom.delete_calls[0]
+    assert isinstance(delete_body, client.V1DeleteOptions)
+    assert delete_body.propagation_policy == "Foreground"
+    assert deleted_name is not None
+
+
+@pytest.mark.asyncio
+async def test_spawn_compensation_preserves_original_exception_on_cancellation() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    manager = _manager(custom, core, ready_timeout_seconds=5.0)
+
+    async def _raise_cancel(session_id: UUID) -> None:
+        raise asyncio.CancelledError
+
+    manager._poll_ready = _raise_cancel  # ty: ignore[invalid-assignment]
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.spawn(_notebook(), "run")
+
+    assert custom.objects == {}  # compensating delete still ran despite the cancellation
+
+
+@pytest.mark.asyncio
+async def test_deploy_create_failure_does_not_delete_the_cr() -> None:
+    """Deploy Runtimes are retained on failure; only edit/run creation compensates."""
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_failed
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    manager = _manager(custom, core)
+
+    with pytest.raises(NotebookStartupError):
+        await manager.spawn_deployment(notebook, deployment)
+
+    assert str(deployment.id) in custom.objects
+    assert custom.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_deploy_running_waits_for_terminating_cr_before_recreating() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
+    custom.objects[name] = {
+        "metadata": {"name": name, "deletionTimestamp": "2026-01-01T00:00:00Z"},
+        "spec": {"notebookId": str(notebook.id), "workspaceId": str(notebook.workspace_id)},
+        "status": {"phase": "Ready"},
+    }
+    manager = _manager(custom, core)
+    custom.on_create = _mark_ready
+    real_get = custom.get_namespaced_custom_object
+    calls = 0
+
+    async def _gc_finishes_on_first_wait_poll(
+        group: str, version: str, namespace: str, plural: str, name_arg: str
+    ) -> dict[str, Any]:
+        nonlocal calls
+        if name_arg != name:
+            return await real_get(group, version, namespace, plural, name_arg)
+        calls += 1
+        if calls == 1:
+            # The CR's own initial fetch: still terminating, seen normally.
+            return await real_get(group, version, namespace, plural, name_arg)
+        if calls == 2:
+            # The controller's GC finishes by the time `_wait_gone` first polls.
+            custom.objects.pop(name, None)
+            raise ApiException(status=404, reason="NotFound")
+        # Every later read (the recreated CR's own polling) behaves normally.
+        return await real_get(group, version, namespace, plural, name_arg)
+
+    custom.get_namespaced_custom_object = _gc_finishes_on_first_wait_poll  # ty: ignore[invalid-assignment]
+
+    session = await manager.spawn_deployment(notebook, deployment)
+
+    assert session.phase == SessionPhase.READY
+
+
+@pytest.mark.asyncio
+async def test_missing_owned_secret_is_repaired_on_wake() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
+    custom.objects[name] = {
+        "metadata": {"name": name, "uid": f"uid-{name}"},
+        "spec": {
+            "notebookId": str(notebook.id),
+            "workspaceId": str(notebook.workspace_id),
+            "creatorId": None,
+            "mode": "deploy",
+            "baseUrl": f"/api/deployments/{deployment.slug}",
+            "deploymentRevision": deployment.revision,
+        },
+        "status": {"phase": "Sleeping"},
+    }
+    # No secret registered at all -- simulates it having been deleted out-of-band.
+    manager = _manager(custom, core)
+
+    async def _mark_after_wake(*args: object, **kwargs: object) -> dict[str, Any]:
+        cr = custom.objects[name]
+        cr["status"] = {"phase": "Ready", "serviceName": "msess-svc"}
+        return copy.deepcopy(cr)
+
+    custom.patch_namespaced_custom_object = _mark_after_wake  # ty: ignore[invalid-assignment]
+
+    session = await manager.spawn_deployment(notebook, deployment)
+
+    assert session.phase == SessionPhase.READY
+    assert f"msess-{name}-env" in core.secrets
+
+
+@pytest.mark.asyncio
+async def test_stop_deletes_cr_with_foreground_propagation_and_waits_for_not_found() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     custom.on_create = _mark_ready
     manager = _manager(custom, core)
@@ -454,8 +809,55 @@ async def test_stop_deletes_cr_and_unknown_session_raises_not_found() -> None:
     await manager.stop(session.id)
 
     assert str(session.id) not in custom.objects
+    name, body = custom.delete_calls[0]
+    assert name == str(session.id)
+    assert isinstance(body, client.V1DeleteOptions)
+    assert body.propagation_policy == "Foreground"
     with pytest.raises(SessionNotFoundError):
         await manager.stop(session.id)
+
+
+@pytest.mark.asyncio
+async def test_stop_workspace_sessions_deletes_only_non_deploy_runtimes_in_workspace() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    workspace_id = uuid4()
+    other_workspace_id = uuid4()
+    notebook_in = _notebook(workspace_id=workspace_id)
+    notebook_out = _notebook(workspace_id=other_workspace_id)
+    manager = _manager(custom, core)
+
+    custom.on_create = _mark_ready
+    edit_session = await manager.spawn(notebook_in, "edit")
+    run_session = await manager.spawn(notebook_in, "run")
+    other_ws_session = await manager.spawn(notebook_out, "run")
+    deployment = _deployment(notebook_in)
+    deploy_session = await manager.spawn_deployment(notebook_in, deployment)
+
+    await manager.stop_workspace_sessions(workspace_id)
+
+    assert str(edit_session.id) not in custom.objects
+    assert str(run_session.id) not in custom.objects
+    assert str(other_ws_session.id) in custom.objects
+    assert str(deploy_session.id) in custom.objects  # deploy runtimes are out of scope here
+
+
+@pytest.mark.asyncio
+async def test_reconcilable_runtimes_lists_every_cr_in_the_namespace() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    manager = _manager(custom, core)
+    notebook = _notebook()
+    edit_session = await manager.spawn(notebook, "edit")
+    deployment = _deployment(notebook, revision=3)
+    deploy_session = await manager.spawn_deployment(notebook, deployment)
+
+    refs = await manager.reconcilable_runtimes()
+
+    by_id = {ref.id: ref for ref in refs}
+    assert by_id[edit_session.id].mode == "edit"
+    assert by_id[edit_session.id].workspace_id == notebook.workspace_id
+    assert by_id[deploy_session.id].mode == "deploy"
+    assert by_id[deploy_session.id].deployment_revision == 3
 
 
 @pytest.mark.asyncio
@@ -488,8 +890,9 @@ async def test_spawned_cr_bodies_carry_every_required_crd_spec_field() -> None:
     required = _crd_required_spec_fields()
     assert required  # sanity: the CRD actually declares required fields
 
+    deploy_notebook = _notebook()
     await manager.spawn(_notebook(), "edit")
-    await manager.spawn_deployment(_notebook(), uuid4(), "plasma-dashboard")
+    await manager.spawn_deployment(deploy_notebook, _deployment(deploy_notebook))
 
     assert custom.create_calls, "expected at least one CR create"
     for created in custom.create_calls:

@@ -1,0 +1,16 @@
+# The real namespace-wide backstop behind runtime.resources/fetcherResources:
+# a Pod-create Forbidden the operator cannot otherwise explain is confirmed
+# as capacity exhaustion only when it agrees with this object's live
+# hard/used values (see the controller's quota-confirmation logic), so this
+# quota must actually exist as a cluster object, not only inform a soft
+# operator-side default.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "runtime") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "runtime") | nindent 4 }}
+spec:
+  hard:
+    {{- toYaml .Values.runtime.quota.hard | nindent 4 }}

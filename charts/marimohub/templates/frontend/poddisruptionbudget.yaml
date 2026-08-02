@@ -1,0 +1,21 @@
+# Only meaningful once there is more than one replica to disrupt: against a
+# single Pod, minAvailable: 1 would block every voluntary eviction of the
+# only replica that exists (see values-kind.yaml's one-replica profile).
+{{- if gt (.Values.frontend.replicaCount | int) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "frontend") | nindent 4 }}
+spec:
+  # AlwaysAllow: an unhealthy Pod (failing readiness) should never
+  # itself block a voluntary eviction the way a healthy one legitimately
+  # would.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  minAvailable: {{ .Values.frontend.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "frontend") | nindent 6 }}
+{{- end }}

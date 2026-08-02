@@ -1,19 +1,120 @@
-FROM python:3.12-slim
+# Red Hat UBI 9's Python 3.12 s2i image, pinned by digest so the floating
+# "latest" tag can never quietly resolve to different bytes than what was
+# scanned and signed. Same base as images/marimo-runtime/Containerfile.ubi:
+# it ships a pre-built venv at /opt/app-root owned by UID 1001/GID 0 and
+# group-writable throughout, which is the arbitrary-UID contract this image
+# needs for free. Refresh by re-resolving and updating both the digest and
+# the date:
+#   docker pull registry.access.redhat.com/ubi9/python-312:latest
+#   docker inspect registry.access.redhat.com/ubi9/python-312:latest --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from registry.access.redhat.com/ubi9/python-312:latest.
+FROM registry.access.redhat.com/ubi9/python-312@sha256:6c4161d7da73fced103c8532ee6419510576f0b70bca4a18790878439973bc4d AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+	PYTHONUNBUFFERED=1 \
+	UV_COMPILE_BYTECODE=1 \
+	UV_LINK_MODE=copy \
+	UV_PROJECT_ENVIRONMENT=/opt/app-root/venv
 
-WORKDIR /app/backend
+WORKDIR /build
 
 RUN pip install --no-cache-dir uv
 
+# Dependency resolution is its own layer, keyed only on the lockfile, so an
+# application-code change never invalidates the (expensive: torch is in
+# this dependency set) sync below. The project itself has no [build-system]
+# and is never installed as a package -- it runs directly off PYTHONPATH
+# from /app/backend in the final stage -- so this one sync is the complete
+# dependency install; nothing needs to run again after the app code lands.
 COPY backend/pyproject.toml backend/uv.lock ./
-RUN uv sync --frozen
+RUN uv sync --frozen --no-dev
 
-COPY backend/ ./
+COPY backend/app ./app
+COPY backend/alembic.ini ./alembic.ini
+
+# Bake the exact embedding model embedding_service.py resolves at import
+# time so a running Pod never reaches Hugging Face Hub to fetch it: startup
+# is then bounded by local disk I/O, not registry/network availability, and
+# offline/egress-restricted namespaces work identically to any other. Saved
+# under /opt/app-root, not /opt/models, so it lands inside the tree the base
+# image already made group-writable rather than needing its own mkdir/chgrp.
+# `uv run` re-syncs its target environment before executing, including the
+# dev dependency group, unless told not to -- --frozen --no-dev keeps this
+# step from quietly installing ruff/ty/complexipy into the shipped venv.
+RUN uv run --frozen --no-dev python -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('all-MiniLM-L6-v2').save('/opt/app-root/models/all-MiniLM-L6-v2')"
+
+# Same base as the builder stage -- this is a hardening/size split (drop
+# pip's cache and the dependency resolution step from the shipped image),
+# not a different runtime.
+FROM registry.access.redhat.com/ubi9/python-312@sha256:6c4161d7da73fced103c8532ee6419510576f0b70bca4a18790878439973bc4d
+
+# HOME=/tmp rather than the base image's own /opt/app-root/src: an
+# OpenShift-assigned arbitrary UID has no /etc/passwd entry, so anything
+# that falls back to "$HOME" (or getpwuid) needs that path to already be
+# writable without relying on username resolution. /tmp is the one path
+# every profile guarantees is writable, mounted or not.
+#
+# USER=marimohub covers the same gap for `getpass.getuser()`: torch's
+# inductor cache-dir resolution (imported transitively by
+# sentence-transformers) calls it during model load, and stdlib
+# `getpass.getuser()` only falls through to `pwd.getpwuid()` -- which raises
+# `KeyError` for a UID with no passwd entry -- when none of
+# LOGNAME/USER/LNAME/USERNAME are already set.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1 \
+	PATH="/opt/app-root/venv/bin:${PATH}" \
+	EMBEDDING_MODEL_PATH=/opt/app-root/models/all-MiniLM-L6-v2 \
+	HF_HUB_OFFLINE=1 \
+	TRANSFORMERS_OFFLINE=1 \
+	MARIMOHUB_APP=public \
+	HOST=0.0.0.0 \
+	PORT=8000 \
+	HOME=/tmp \
+	USER=marimohub
+
+WORKDIR /app/backend
+
+COPY --from=builder /opt/app-root/venv /opt/app-root/venv
+COPY --from=builder /opt/app-root/models /opt/app-root/models
+
+# Under SESSION_BACKEND=subprocess -- the default, and the only backend that
+# runs Notebook kernels inside this container rather than in a separate Pod --
+# the session manager spawns `marimo ... --sandbox`, and marimo refuses to
+# start without uv on PATH because sandbox mode resolves each Notebook's PEP
+# 723 dependencies into its own uv-managed environment. Copying the binary the
+# builder already downloaded (rather than a second `pip install uv`) keeps
+# resolution behaviour identical across the two stages and costs one layer of
+# a single static binary. /opt/app-root/bin is already on the base image's
+# PATH. Inert under SESSION_BACKEND=kube, where kernels never run here.
+COPY --from=builder /opt/app-root/bin/uv /opt/app-root/bin/uv
+COPY --from=builder /build/app ./app
+COPY --from=builder /build/alembic.ini ./alembic.ini
+
+# /app/backend and /tmp are the only paths this image ever writes to at run
+# time (the venv and baked model are read-only application state). Kubernetes
+# supplies /tmp as a mounted, size-bounded emptyDir in production; the
+# chgrp/chmod below only matters for a direct docker-run without that mount.
+# GID 0 is the group every MarimoHub image standardizes on: OpenShift
+# replaces the container's UID with an arbitrary one from the namespace's
+# allocated range but leaves GID 0 alone.
+#
+# /opt/app-root/models needs the same treatment for a different reason: the
+# safetensors writer that baked the model saved its weights file `0600`
+# (owner-only), so an arbitrary UID -- which is never the "default" UID that
+# wrote it -- cannot read it without this even though it never needs to
+# write there.
+USER 0
+RUN chgrp -R 0 /app/backend /tmp /opt/app-root/models \
+	&& chmod -R g=u /app/backend /tmp /opt/app-root/models
+
+USER 1001:0
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uv run alembic upgrade head && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app"]
+# No shell in the exec path: signals reach the Python process directly, which
+# is what lets Uvicorn's own SIGTERM handling (stop accepting connections,
+# drain in-flight requests/WebSockets, then exit) run without a wrapper
+# shell either swallowing the signal or forwarding it a beat too late.
+ENTRYPOINT ["python", "-m", "app.serve"]

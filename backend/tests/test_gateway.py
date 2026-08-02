@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 import logging
 from typing import cast
@@ -11,13 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 from starlette.websockets import WebSocketDisconnect
 
-from app.api import deployments as deployments_module
 from app.api.deployments import DeploymentResolver
 from app.api.proxy import SessionResolver, edit_save_callback
 from app.core.errors import DomainError
-from app.models import Deployment, Notebook
+from app.models import Deployment, DeploymentDesiredState, Notebook, Workspace
 from app.services import marimo_proxy
 from app.services.marimo_proxy import (
+    ActivityLease,
     GatewayError,
     GatewayRoute,
     Resolver,
@@ -33,6 +34,8 @@ from app.services.session_manager import (
     SessionPhase,
     SessionTarget,
 )
+
+_RUNTIME_IMAGE = "registry.example/marimo-runtime@sha256:" + "0" * 64
 
 # A fake upstream access token, routed through a constant so the value is never a
 # string literal at the sensitive call site below.
@@ -61,9 +64,7 @@ class _FakeManager:
     ) -> SessionInfo:
         raise NotImplementedError
 
-    async def spawn_deployment(
-        self, notebook: Notebook, deployment_id: UUID, slug: str
-    ) -> SessionInfo:
+    async def spawn_deployment(self, notebook: Notebook, deployment: Deployment) -> SessionInfo:
         raise NotImplementedError
 
     async def get(self, session_id: UUID) -> SessionInfo | None:
@@ -93,18 +94,17 @@ class _WakingManager(_FakeManager):
     async def target(self, session_id: UUID) -> SessionTarget | None:
         return self.target_after_wake if self.woken else None
 
-    async def spawn_deployment(
-        self, notebook: Notebook, deployment_id: UUID, slug: str
-    ) -> SessionInfo:
-        self.spawn_calls.append((notebook.id, deployment_id, slug))
+    async def spawn_deployment(self, notebook: Notebook, deployment: Deployment) -> SessionInfo:
+        self.spawn_calls.append((notebook.id, deployment.id, deployment.slug))
         self.woken = True
         return SessionInfo(
-            id=deployment_id,
+            id=deployment.id,
             notebook_id=notebook.id,
             mode="deploy",
             phase=SessionPhase.READY,
             last_active=datetime.now(UTC),
             creator_id=None,
+            deployment_revision=deployment.revision,
         )
 
 
@@ -212,19 +212,49 @@ async def test_session_resolver_returns_route_when_target_present() -> None:
 # ── DeploymentResolver — resolve-or-wake ordering ────────────────────────────
 
 
+async def _active_deployment(db_session: AsyncSession, *, slug: str) -> tuple[Notebook, Deployment]:
+    """Commit a real, active Deployment row (workspace/notebook included) for resolver tests.
+
+    `DeploymentResolver.resolve()` now locks the owning Workspace/Deployment
+    through real Postgres row locks when it needs to wake, so these tests
+    need real committed rows, not bare in-memory objects.
+    """
+    workspace = Workspace(slug=f"resolver-{slug}", name="Resolver")
+    db_session.add(workspace)
+    await db_session.flush()
+    notebook = Notebook(workspace_id=workspace.id, title="T", source="x = 1")
+    db_session.add(notebook)
+    await db_session.flush()
+    deployment = Deployment(
+        notebook_id=notebook.id,
+        slug=slug,
+        desired_state=DeploymentDesiredState.ACTIVE,
+        source_snapshot="x = 1",
+        source_sha256="deadbeef",
+        runtime_image=_RUNTIME_IMAGE,
+        revision=1,
+    )
+    db_session.add(deployment)
+    await db_session.commit()
+    return notebook, deployment
+
+
 @pytest.mark.asyncio
 async def test_deployment_resolver_fast_path_skips_spawn_when_already_routable(
-    monkeypatch: pytest.MonkeyPatch,
+    db_session: AsyncSession,
 ) -> None:
-    deployment = Deployment(id=uuid4(), notebook_id=uuid4(), slug="s")
-    notebook = Notebook(id=deployment.notebook_id, workspace_id=uuid4(), title="T", source="x = 1")
-
-    async def fake_load(db: object, slug: str) -> tuple[Deployment, Notebook]:
-        return deployment, notebook
-
-    monkeypatch.setattr(deployments_module, "_load_active_deployment", fake_load)
-    manager = _FakeManager(target=_TARGET)
-    resolver = DeploymentResolver(cast("AsyncSession", None), cast("SessionManager", manager), "s")
+    notebook, deployment = await _active_deployment(db_session, slug="fast-path")
+    info = SessionInfo(
+        id=deployment.id,
+        notebook_id=notebook.id,
+        mode="deploy",
+        phase=SessionPhase.READY,
+        last_active=datetime.now(UTC),
+        creator_id=None,
+        deployment_revision=deployment.revision,
+    )
+    manager = _FakeManager(target=_TARGET, info=info)
+    resolver = DeploymentResolver(db_session, cast("SessionManager", manager), "fast-path")
 
     route = await resolver.resolve()
 
@@ -234,42 +264,30 @@ async def test_deployment_resolver_fast_path_skips_spawn_when_already_routable(
 
 @pytest.mark.asyncio
 async def test_deployment_resolver_wakes_exactly_once_when_sleeping(
-    monkeypatch: pytest.MonkeyPatch,
+    db_session: AsyncSession,
 ) -> None:
-    deployment = Deployment(id=uuid4(), notebook_id=uuid4(), slug="s")
-    notebook = Notebook(id=deployment.notebook_id, workspace_id=uuid4(), title="T", source="x = 1")
-
-    async def fake_load(db: object, slug: str) -> tuple[Deployment, Notebook]:
-        return deployment, notebook
-
-    monkeypatch.setattr(deployments_module, "_load_active_deployment", fake_load)
+    notebook, deployment = await _active_deployment(db_session, slug="wake-once")
     manager = _WakingManager(target_after_wake=_TARGET)
-    resolver = DeploymentResolver(cast("AsyncSession", None), cast("SessionManager", manager), "s")
+    resolver = DeploymentResolver(db_session, cast("SessionManager", manager), "wake-once")
 
     route = await resolver.resolve()
 
     assert route == GatewayRoute(deployment.id, _TARGET)
-    assert manager.spawn_calls == [(notebook.id, deployment.id, "s")]
+    assert manager.spawn_calls == [(notebook.id, deployment.id, "wake-once")]
 
 
 @pytest.mark.asyncio
 async def test_deployment_resolver_raises_upstream_not_ready_when_still_unroutable_after_wake(
-    monkeypatch: pytest.MonkeyPatch,
+    db_session: AsyncSession,
 ) -> None:
-    deployment = Deployment(id=uuid4(), notebook_id=uuid4(), slug="s")
-    notebook = Notebook(id=deployment.notebook_id, workspace_id=uuid4(), title="T", source="x = 1")
-
-    async def fake_load(db: object, slug: str) -> tuple[Deployment, Notebook]:
-        return deployment, notebook
-
-    monkeypatch.setattr(deployments_module, "_load_active_deployment", fake_load)
+    notebook, deployment = await _active_deployment(db_session, slug="never-ready")
     manager = _WakingManager(target_after_wake=None)
-    resolver = DeploymentResolver(cast("AsyncSession", None), cast("SessionManager", manager), "s")
+    resolver = DeploymentResolver(db_session, cast("SessionManager", manager), "never-ready")
 
     with pytest.raises(UpstreamNotReady):
         await resolver.resolve()
 
-    assert manager.spawn_calls == [(notebook.id, deployment.id, "s")]
+    assert manager.spawn_calls == [(notebook.id, deployment.id, "never-ready")]
 
 
 # ── proxy_http: resolve → mark_active → forward ordering ────────────────────
@@ -304,6 +322,7 @@ async def test_proxy_http_resolves_marks_active_then_forwards_once_per_request(
         target: SessionTarget,
         path: str,
         *,
+        lease: object = None,
         response_body_callback: object = None,
         follow_redirects: bool = False,
     ) -> Response:
@@ -508,3 +527,67 @@ async def test_edit_save_callback_swallows_persist_failure(
     assert db.rolled_back is True
     assert db.committed is False
     assert any("edit-save persist failed" in message for message in caplog.messages)
+
+
+# ── ActivityLease: keeps signaling for the connection's full duration ──────
+
+
+@pytest.mark.asyncio
+async def test_activity_lease_signals_periodically_until_stopped() -> None:
+    manager = _FakeManager()
+    session_id = uuid4()
+    lease = ActivityLease(cast("SessionManager", manager), session_id, interval_seconds=0.01)
+
+    lease.start()
+    await asyncio.sleep(0.05)
+    await lease.stop()
+    fired_while_running = len(manager.mark_active_calls)
+
+    await asyncio.sleep(0.05)  # after stop, no further signals should arrive
+
+    assert fired_while_running > 0
+    assert len(manager.mark_active_calls) == fired_while_running
+    assert all(call == session_id for call in manager.mark_active_calls)
+
+
+@pytest.mark.asyncio
+async def test_activity_lease_stop_is_idempotent() -> None:
+    manager = _FakeManager()
+    lease = ActivityLease(cast("SessionManager", manager), uuid4(), interval_seconds=1.0)
+
+    lease.start()
+    await lease.stop()
+    await lease.stop()  # must not raise or hang
+
+
+@pytest.mark.asyncio
+async def test_streamed_response_release_helper_closes_upstream_and_stops_lease() -> None:
+    """The background task Starlette runs after draining a streamed response must release the lease.
+
+    This is what actually keeps `ActivityLease` alive for a streamed
+    response's *full* duration: `_forward_http` hands the lease to this same
+    callback, so it is only stopped once the client has finished reading the
+    body, not the instant the (still-streaming) response object is returned.
+    """
+    closed: list[str] = []
+
+    class _FakeUpstreamResponse:
+        async def aclose(self) -> None:
+            closed.append("response")
+
+    class _FakeHTTPXClient:
+        async def aclose(self) -> None:
+            closed.append("client")
+
+    manager = _FakeManager()
+    lease = ActivityLease(cast("SessionManager", manager), uuid4(), interval_seconds=1.0)
+    lease.start()
+
+    await marimo_proxy._close_upstream_and_release_lease(
+        cast("httpx.AsyncClient", _FakeHTTPXClient()),
+        cast("httpx.Response", _FakeUpstreamResponse()),
+        lease,
+    )
+
+    assert closed == ["response", "client"]
+    assert lease._task is None  # stopped, not merely requested to stop

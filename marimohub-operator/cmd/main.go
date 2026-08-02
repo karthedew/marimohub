@@ -64,6 +64,7 @@ func main() {
 func run() error {
 	var metricsAddr string
 	var probeAddr string
+	var metricsCertDir string
 	var enableLeaderElection bool
 	opts := zap.Options{
 		Development: true,
@@ -73,6 +74,9 @@ func run() error {
 	fs.StringVar(&metricsAddr, "metrics-bind-address", ":8080",
 		"The address the metrics endpoint binds to. Set to 0 to disable the metrics endpoint.")
 	fs.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	fs.StringVar(&metricsCertDir, "metrics-cert-dir", "",
+		"Directory containing tls.crt/tls.key the metrics endpoint serves over TLS. "+
+			"Empty (the default) serves metrics over plain HTTP instead.")
 	fs.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -87,17 +91,25 @@ func run() error {
 		return fmt.Errorf("invalid manager configuration: %w", err)
 	}
 
-	// The metrics endpoint is deliberately plain HTTP on a private bind
-	// address rather than served through controller-runtime's
+	// The metrics endpoint is never served through controller-runtime's
 	// WithAuthenticationAndAuthorization filter: that filter requires the
 	// manager's ServiceAccount to create TokenReviews and
 	// SubjectAccessReviews, and no operator workload is permitted that
 	// cluster-scoped grant. A NetworkPolicy restricts who can reach this
-	// port; OpenShift-native TLS and ServiceMonitor scraping are added once
-	// the chart exists to carry the certificate material.
+	// port regardless. TLS is opt-in through --metrics-cert-dir, which the
+	// chart sets whenever it mounts an existing tls.crt/tls.key Secret for
+	// the operator's metrics Service (see templates/monitoring/); when set,
+	// controller-runtime's own certwatcher polls and reloads that pair in
+	// place, the same rotation-without-restart property the backend and
+	// frontend TLS entrypoints implement for their own listeners.
 	metricsServerOptions := metricsserver.Options{
 		BindAddress:   metricsAddr,
-		SecureServing: false,
+		SecureServing: metricsCertDir != "",
+	}
+	if metricsCertDir != "" {
+		metricsServerOptions.CertDir = metricsCertDir
+		metricsServerOptions.CertName = "tls.crt"
+		metricsServerOptions.KeyName = "tls.key"
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -147,7 +159,7 @@ func run() error {
 		ImagePullDeadline: controller.DefaultImagePullDeadline,
 		UnhealthyTimeout:  controller.DefaultUnhealthyTimeout,
 		NodeLossDeadline:  controller.DefaultNodeLossDeadline,
-		IdleGracePeriod:   controller.DefaultIdleGracePeriod,
+		IdleGracePeriod:   cfg.IdleGracePeriod,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("failed to create controller %q: %w", "marimosession", err)
 	}

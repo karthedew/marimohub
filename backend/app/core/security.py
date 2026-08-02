@@ -46,39 +46,3 @@ def decode_token(token: str) -> UUID | None:
         return UUID(subject)
     except (InvalidTokenError, ValueError):
         return None
-
-
-def create_session_token(
-    session_id: UUID, notebook_id: UUID, ttl_seconds: int | None = None
-) -> str:
-    """Return a signed JWT binding a session pod to exactly one notebook."""
-    settings = get_settings()
-    resolved_ttl = ttl_seconds if ttl_seconds is not None else settings.SESSION_TOKEN_TTL_SECONDS
-    now = datetime.now(UTC)
-    return jwt.encode(  # pyright: ignore[reportUnknownMemberType]
-        {
-            "typ": "session",
-            "sid": str(session_id),
-            "nid": str(notebook_id),
-            "iat": now,
-            "exp": now + timedelta(seconds=resolved_ttl),
-        },
-        settings.SECRET_KEY,
-        algorithm="HS256",
-    )
-
-
-def decode_session_token(token: str) -> tuple[UUID, UUID] | None:
-    """Return the (session_id, notebook_id) bound to a valid session token, or ``None``."""
-    try:
-        payload: dict[str, object] = jwt.decode(  # pyright: ignore[reportUnknownMemberType]
-            token, get_settings().SECRET_KEY, algorithms=["HS256"]
-        )
-        if payload.get("typ") != "session":
-            return None
-        session_id, notebook_id = payload.get("sid"), payload.get("nid")
-        if not isinstance(session_id, str) or not isinstance(notebook_id, str):
-            return None
-        return UUID(session_id), UUID(notebook_id)
-    except (InvalidTokenError, ValueError):
-        return None

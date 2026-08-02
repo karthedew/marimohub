@@ -1,0 +1,21 @@
+# backend-public authors CR lifecycle and its owned credential Secret, never
+# CR status: status.observedGeneration/phase/conditions are the operator's
+# field alone (see the Resource Ownership table), so there is no
+# marimosessions/status rule here, and Secret access is create+get only --
+# never patch/delete/list/watch, since backend-public never mutates or
+# enumerates an existing Secret, only creates one for a new Runtime and
+# reads it back once to confirm it exists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+rules:
+  - apiGroups: ["marimohub.io"]
+    resources: ["marimosessions"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get"]

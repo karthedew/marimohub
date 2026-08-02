@@ -1,0 +1,20 @@
+# get/list/watch plus delete on marimosessions backs the drain script's
+# listing, foreground-delete, and poll-until-gone; get/list/watch on
+# pods/services/secrets backs only its poll for their children to disappear
+# -- it never creates, patches, or deletes any of the three directly (owner-
+# reference GC removes them once the owning CR's foreground delete
+# completes).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "uninstall-drain") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "uninstall-drain") | nindent 4 }}
+rules:
+  - apiGroups: ["marimohub.io"]
+    resources: ["marimosessions"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "secrets"]
+    verbs: ["get", "list", "watch"]

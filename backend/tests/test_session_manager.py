@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.models import Notebook
+from app.models import Deployment, Notebook
 from app.services.session_manager import (
     NotebookStartupError,
     SessionNotFoundError,
@@ -157,11 +157,11 @@ async def test_concurrent_deployment_spawn_returns_existing_start(
     monkeypatch.setattr(readiness_module, "probe", delayed_probe)
     manager = SubprocessSessionManager(command_factory=command_factory)
     notebook = _notebook()
-    deployment_id = uuid4()
+    deployment = Deployment(id=uuid4(), notebook_id=notebook.id, slug="runtime")
 
-    first = asyncio.create_task(manager.spawn_deployment(notebook, deployment_id, "runtime"))
+    first = asyncio.create_task(manager.spawn_deployment(notebook, deployment))
     await probe_started.wait()
-    second = asyncio.create_task(manager.spawn_deployment(notebook, deployment_id, "runtime"))
+    second = asyncio.create_task(manager.spawn_deployment(notebook, deployment))
     await asyncio.sleep(0)
     ready.set()
 
@@ -171,7 +171,7 @@ async def test_concurrent_deployment_spawn_returns_existing_start(
         await manager.shutdown()
 
     assert first_session == second_session
-    assert first_session.id == deployment_id
+    assert first_session.id == deployment.id
     assert len(commands) == 1
 
 

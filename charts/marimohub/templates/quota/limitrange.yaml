@@ -1,0 +1,20 @@
+# Per-container defaults/ceiling so a MarimoSession CR's spec.resources
+# override can't request more than the platform allows, independent of the
+# operator's own default-resources flag: admission enforces this even if a
+# future code path ever forgot to apply the chart-wide default.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "runtime") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "runtime") | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      default:
+        {{- toYaml .Values.runtime.resources.limits | nindent 8 }}
+      defaultRequest:
+        {{- toYaml .Values.runtime.resources.requests | nindent 8 }}
+      max:
+        {{- toYaml .Values.runtime.limitRange.max | nindent 8 }}

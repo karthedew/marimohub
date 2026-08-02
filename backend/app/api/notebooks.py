@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import NotebookRead, NotebookWrite, get_current_user, get_current_user_optional
 from app.db.database import get_db
-from app.models import Notebook, NotebookVisibility, User, Workspace, WorkspaceRole
+from app.models import Deployment, Notebook, NotebookVisibility, User, Workspace, WorkspaceRole
 from app.schemas import (
     NotebookCreate,
     NotebookFork,
@@ -19,6 +19,7 @@ from app.schemas import (
     NotebookPublish,
     NotebookUpdate,
 )
+from app.services import deployment_lifecycle
 from app.services.access import (
     Action,
     authorize_workspace,
@@ -30,6 +31,7 @@ from app.services.access import (
 from app.services.embedding_service import EmbeddingService, embedding_service
 from app.services.gitlab_import import import_gitlab_notebook
 from app.services.notebook_storage import NotebookStorageService, get_notebook_storage
+from app.services.session_manager import SessionManager, get_session_manager
 
 router = APIRouter(prefix="/api/notebooks", tags=["notebooks"])
 
@@ -348,8 +350,20 @@ async def delete_notebook(
     ctx: NotebookWrite,
     db: Annotated[AsyncSession, Depends(get_db)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
+    manager: Annotated[SessionManager, Depends(get_session_manager)],
 ) -> Response:
-    """Delete a notebook the caller can edit."""
+    """Delete a notebook the caller can edit, stopping its deployment's Runtime first.
+
+    The FK cascade (`deployments.notebook_id ON DELETE CASCADE`) removes the
+    Deployment row at the database level as part of this same delete, with
+    no ORM event to hook -- so the Runtime has to be stopped explicitly,
+    before that row disappears out from under it.
+    """
+    deployment_id = await db.scalar(
+        select(Deployment.id).where(Deployment.notebook_id == ctx.notebook.id)
+    )
+    if deployment_id is not None:
+        await deployment_lifecycle.stop_if_running(manager, deployment_id)
     await storage.delete(ctx.notebook.id)
     await db.delete(ctx.notebook)
     await db.commit()

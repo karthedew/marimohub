@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "frontend") | nindent 4 }}
+spec:
+  replicas: {{ .Values.frontend.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.frontend.updateStrategy.maxUnavailable }}
+      maxSurge: {{ .Values.frontend.updateStrategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "frontend") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "frontend") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.frontend.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if gt (.Values.frontend.replicaCount | int) 1 }}
+      topologySpreadConstraints:
+        {{- if .Values.frontend.topologySpreadConstraints }}
+        {{- toYaml .Values.frontend.topologySpreadConstraints | nindent 8 }}
+        {{- else }}
+        {{- include "marimohub.defaultTopologySpreadConstraints" (dict "ctx" $ "component" "frontend") | nindent 8 }}
+        {{- end }}
+      affinity:
+        {{- include "marimohub.defaultPodAntiAffinity" (dict "ctx" $ "component" "frontend") | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: {{ include "marimohub.image" .Values.frontend.image }}
+          imagePullPolicy: {{ .Values.frontend.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.frontend.port }}
+              protocol: TCP
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.frontend.port | quote }}
+            {{- if .Values.frontend.publicApiUrl }}
+            - name: PUBLIC_API_URL
+              value: {{ .Values.frontend.publicApiUrl | quote }}
+            {{- end }}
+            {{- if .Values.frontend.tls.enabled }}
+            - name: TLS_CERT_FILE
+              value: /etc/marimohub/tls/tls.crt
+            - name: TLS_KEY_FILE
+              value: /etc/marimohub/tls/tls.key
+            {{- end }}
+          {{- with .Values.frontend.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              {{- if .Values.frontend.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              {{- if .Values.frontend.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.frontend.tls.enabled }}
+            - name: tls
+              mountPath: /etc/marimohub/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.frontend.tls.enabled }}
+        - name: tls
+          secret:
+            {{- if not .Values.frontend.tls.secretName }}
+            {{- fail "frontend.tls.enabled requires frontend.tls.secretName" }}
+            {{- end }}
+            secretName: {{ .Values.frontend.tls.secretName }}
+        {{- end }}

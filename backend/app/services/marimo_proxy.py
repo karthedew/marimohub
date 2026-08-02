@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+import contextlib
 from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import quote, urlencode
@@ -13,6 +14,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
+from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.services.session_manager import SessionManager, SessionTarget
 
@@ -78,6 +80,43 @@ class UpstreamUnreachable(GatewayError):  # noqa: N818 -- named for the resoluti
     status = status.HTTP_502_BAD_GATEWAY
 
 
+class ActivityLease:
+    """Keeps signaling activity for a Runtime across the full life of a proxied connection.
+
+    A single request/response edge or WebSocket frame already calls
+    `mark_active` once at that edge, but a long-lived stream (a large
+    download, an open WebSocket with quiet stretches) needs more than edge
+    signals: the operator's idle clock only ever sees what this gateway
+    tells it. This periodically re-signals for as long as it stays open,
+    independent of whether any traffic crosses it in that window.
+    """
+
+    def __init__(self, manager: SessionManager, session_id: UUID, interval_seconds: float) -> None:
+        """Configure the runtime to signal for and how often, without starting yet."""
+        self._manager = manager
+        self._session_id = session_id
+        self._interval_seconds = interval_seconds
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        """Begin the periodic signal; call exactly once per connection."""
+        self._task = asyncio.create_task(self._pulse())
+
+    async def _pulse(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval_seconds)
+            await self._manager.mark_active(self._session_id)
+
+    async def stop(self) -> None:
+        """Cancel the periodic signal; safe to call more than once."""
+        if self._task is None:
+            return
+        task, self._task = self._task, None
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 class _RawHeaders(Protocol):
     """Structural type for header containers exposing raw byte pairs."""
 
@@ -130,9 +169,12 @@ async def _request_body(request: Request) -> bytes | None:
     return await request.body()
 
 
-async def _close_upstream(client: httpx.AsyncClient, response: httpx.Response) -> None:
+async def _close_upstream_and_release_lease(
+    client: httpx.AsyncClient, response: httpx.Response, lease: ActivityLease
+) -> None:
     await response.aclose()
     await client.aclose()
+    await lease.stop()
 
 
 async def _forward_http(
@@ -140,10 +182,17 @@ async def _forward_http(
     target: SessionTarget,
     path: str,
     *,
+    lease: ActivityLease,
     response_body_callback: ResponseBodyCallback | None = None,
     follow_redirects: bool = False,
 ) -> Response:
-    """Proxy an HTTP request to the notebook process and return its response."""
+    """Proxy an HTTP request to the notebook process and return its response.
+
+    `lease` must stay alive for as long as the response body is still being
+    read: a buffered response stops it before returning, while a streamed
+    one hands it to the same background task that closes the upstream
+    connection, so it keeps signaling for the whole download.
+    """
     client = httpx.AsyncClient(follow_redirects=follow_redirects)
     body = await _request_body(request)
     query_string = cast("bytes", request.scope.get("query_string", b""))
@@ -166,6 +215,7 @@ async def _forward_http(
         )
     except httpx.HTTPError as exc:
         await client.aclose()
+        await lease.stop()
         raise UpstreamUnreachable("Notebook process is unreachable") from exc
 
     if response_body_callback is not None:
@@ -177,12 +227,15 @@ async def _forward_http(
         )
         await upstream_response.aclose()
         await client.aclose()
+        await lease.stop()
         return response
 
     response = StreamingResponse(
         upstream_response.aiter_raw(),
         status_code=upstream_response.status_code,
-        background=BackgroundTask(_close_upstream, client, upstream_response),
+        background=BackgroundTask(
+            _close_upstream_and_release_lease, client, upstream_response, lease
+        ),
     )
     response.raw_headers = _filtered_header_pairs(
         upstream_response.headers, strip_content_length=True
@@ -244,13 +297,25 @@ async def proxy_http(
     """Resolve-or-wake, mark activity, and forward the HTTP request to the upstream session."""
     route = await resolver.resolve()
     await manager.mark_active(route.session_id)
-    return await _forward_http(
-        request,
-        route.target,
-        path,
-        response_body_callback=response_body_callback,
-        follow_redirects=follow_redirects,
+    lease = ActivityLease(
+        manager, route.session_id, get_settings().ACTIVITY_SIGNAL_INTERVAL_SECONDS
     )
+    lease.start()
+    try:
+        return await _forward_http(
+            request,
+            route.target,
+            path,
+            lease=lease,
+            response_body_callback=response_body_callback,
+            follow_redirects=follow_redirects,
+        )
+    except BaseException:
+        # `_forward_http` already stops the lease on every path it itself
+        # returns or raises from; this only catches something unexpected
+        # above it. `ActivityLease.stop` is idempotent either way.
+        await lease.stop()
+        raise
 
 
 async def proxy_websocket(
@@ -263,6 +328,10 @@ async def proxy_websocket(
         await websocket.close(code=exc.ws_close_code)
         return
     await manager.mark_active(route.session_id)  # connect edge; _relay_websocket marks per frame
+    lease = ActivityLease(
+        manager, route.session_id, get_settings().ACTIVITY_SIGNAL_INTERVAL_SECONDS
+    )
+    lease.start()
     target_url = _build_target_url(
         route.target.ws_base_url,
         "ws",
@@ -273,3 +342,5 @@ async def proxy_websocket(
         await _relay_websocket(websocket, target_url, manager, route.session_id)
     except (ConnectionClosed, WebSocketDisconnect, OSError):
         return
+    finally:
+        await lease.stop()

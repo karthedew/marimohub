@@ -1,0 +1,22 @@
+# No Route/Ingress ever targets this Service: the internal API is reachable
+# only from inside the cluster (the Runtime source-fetcher and marimo
+# container), never from a public listener.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-internal") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-internal") | nindent 4 }}
+  {{- if and .Values.openshift.serviceServingCerts.enabled .Values.backendInternal.tls.secretName }}
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: {{ .Values.backendInternal.tls.secretName }}
+  {{- end }}
+spec:
+  selector:
+    {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-internal") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.backendInternal.port }}
+      targetPort: http
+      protocol: TCP

@@ -1,4 +1,23 @@
-from dataclasses import dataclass
+"""Runtime-authenticated routes: source delivery and Notebook data.
+
+Every route here is reached only from inside the sessions namespace -- a
+Runtime's source-fetcher init container or its own marimo process -- and is
+authenticated by the Runtime's own `RUNTIME_CREDENTIAL`, never a user
+session. `RuntimeBound` verifies the credential alone; `RuntimeNotebookBound`
+additionally requires the verified Runtime be bound to the `notebook_id` in
+the path, which is what lets `read_data`/`write_data` stay Notebook-addressed
+while still being Runtime-authenticated.
+
+The source-fetcher's contract for `read_runtime_source` (see
+`images/source-fetcher` and the Pod builder's fetcher init container):
+
+- `INTERNAL_API_URL` -- this app's base URL, injected by the chart.
+- the Runtime's own id, taken from its own CR name / `$HOSTNAME`-derived
+  identity, used to build the request path.
+- `RUNTIME_CREDENTIAL`, read from a mounted Secret projection file and sent
+  as ``Authorization: Bearer <credential>``.
+"""
+
 from typing import Annotated
 from uuid import UUID
 
@@ -10,79 +29,118 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError, Unauthenticated
-from app.core.security import decode_session_token
 from app.db.database import get_db
-from app.models import Notebook, NotebookData
+from app.models import Deployment, DeploymentDesiredState, Notebook, NotebookData
 from app.schemas import NotebookDataCreated, NotebookDataOut
 from app.services.access import PermissionDenied
 from app.services.notebook_storage import NotebookStorageService, get_notebook_storage
+from app.services.runtime_credentials import (
+    RuntimeCredentialVerifier,
+    RuntimePrincipal,
+    get_runtime_credential_verifier,
+)
 
 router = APIRouter(prefix="/api/internal", tags=["internal"])
 
-# Distinct from `deps.oauth2_scheme`: this scheme resolves SESSION_TOKENs, never user JWTs.
-session_bearer = HTTPBearer(auto_error=False)
+# Distinct from `deps.oauth2_scheme`: this scheme resolves RUNTIME_CREDENTIALs,
+# never user-facing access tokens.
+runtime_bearer = HTTPBearer(auto_error=False)
 
 
-@dataclass(frozen=True, slots=True)
-class SessionPrincipal:
-    """The session pod identity carried by a verified SESSION_TOKEN."""
-
-    session_id: UUID
-    notebook_id: UUID
-
-
-def require_session_notebook(
-    notebook_id: UUID,
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(session_bearer)],
-) -> SessionPrincipal:
-    """Validate the SESSION_TOKEN and require it be bound to the path notebook.
-
-    Signature and claim check only, no DB or cluster I/O: a pod pointed at the
-    wrong notebook is rejected before any query runs.
-    """
+async def _authenticate(
+    credentials: HTTPAuthorizationCredentials | None, verifier: RuntimeCredentialVerifier
+) -> RuntimePrincipal:
     if credentials is None:
-        raise Unauthenticated("Missing session token")
-    decoded = decode_session_token(credentials.credentials)
-    if decoded is None:
-        raise Unauthenticated("Invalid session token")
-    session_id, token_notebook_id = decoded
-    if token_notebook_id != notebook_id:
-        raise PermissionDenied("Session token not scoped to this notebook")
-    return SessionPrincipal(session_id=session_id, notebook_id=notebook_id)
+        raise Unauthenticated("Missing runtime credential")
+    return await verifier.verify(credentials.credentials)
 
 
-SessionBound = Annotated[SessionPrincipal, Depends(require_session_notebook)]
+async def require_runtime(
+    runtime_id: UUID,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(runtime_bearer)],
+    verifier: Annotated[RuntimeCredentialVerifier, Depends(get_runtime_credential_verifier)],
+) -> RuntimePrincipal:
+    """Verify the presented credential and require it name this exact Runtime.
+
+    No DB or extra cluster I/O beyond `verifier.verify` itself: a credential
+    that verifies but names a different Runtime than the path is rejected
+    before anything else runs.
+    """
+    principal = await _authenticate(credentials, verifier)
+    if principal.runtime_id != runtime_id:
+        raise Unauthenticated("Runtime credential does not match this runtime")
+    return principal
 
 
-@router.get("/notebooks/{notebook_id}/source", response_class=PlainTextResponse)
-async def read_source(
+async def require_runtime_notebook(
     notebook_id: UUID,
-    _: SessionBound,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(runtime_bearer)],
+    verifier: Annotated[RuntimeCredentialVerifier, Depends(get_runtime_credential_verifier)],
+) -> RuntimePrincipal:
+    """Verify the presented credential and require it be bound to the path notebook."""
+    principal = await _authenticate(credentials, verifier)
+    if principal.notebook_id != notebook_id:
+        raise PermissionDenied("Runtime credential not scoped to this notebook")
+    return principal
+
+
+RuntimeBound = Annotated[RuntimePrincipal, Depends(require_runtime)]
+RuntimeNotebookBound = Annotated[RuntimePrincipal, Depends(require_runtime_notebook)]
+
+
+async def _deploy_snapshot(db: AsyncSession, principal: RuntimePrincipal) -> str | None:
+    """Return a deploy Runtime's exact deployed snapshot, or fail closed.
+
+    A deploy Runtime's CR name is the Deployment id (see the Runtime
+    Contract's naming table), so `principal.runtime_id` doubles as the
+    Deployment primary key here. Wrong Notebook, stopped intent, a
+    superseded revision, and a since-deleted row are all one
+    indistinguishable "not found" -- the fetcher never learns which
+    precondition failed, only that it must not proceed.
+    """
+    deployment = await db.get(Deployment, principal.runtime_id)
+    if (
+        deployment is None
+        or deployment.notebook_id != principal.notebook_id
+        or deployment.desired_state is not DeploymentDesiredState.ACTIVE
+        or principal.deployment_revision != deployment.revision
+    ):
+        raise NotFoundError("Deployment not found")
+    return deployment.source_snapshot
+
+
+@router.get("/runtimes/{runtime_id}/source", response_class=PlainTextResponse)
+async def read_runtime_source(
+    principal: RuntimeBound,
     db: Annotated[AsyncSession, Depends(get_db)],
     storage: Annotated[NotebookStorageService, Depends(get_notebook_storage)],
 ) -> PlainTextResponse:
-    """Return the notebook's stored source for the init container to fetch.
+    """Return the source this Runtime's fetcher should write to `/work/notebook.py`.
 
-    A notebook with no source yet (a fresh edit session) is a 200 with an
-    empty body, never a 404 -- the init container's `--retry` depends on
-    only genuine absence of the notebook producing a non-2xx.
+    A deploy Runtime always reads its immutable `Deployment.source_snapshot`
+    bound to `spec.deploymentRevision`; edit/run read the Notebook's current
+    source through `NotebookStorageService` instead, since neither mode runs
+    against a frozen snapshot. Either way, no source yet is a valid empty
+    document, not a 404 -- the fetcher's `--retry` depends on only a genuine
+    authorization or binding failure producing a non-2xx.
     """
-    notebook = await db.get(Notebook, notebook_id)
-    if notebook is None:
-        raise NotFoundError("Notebook not found")
-    source = await storage.get(notebook)
+    if principal.mode == "deploy":
+        source = await _deploy_snapshot(db, principal)
+    else:
+        notebook = await db.get(Notebook, principal.notebook_id)
+        source = await storage.get(notebook) if notebook is not None else None
     return PlainTextResponse(source or "", media_type="text/x-python")
 
 
 @router.post("/notebooks/{notebook_id}/data", response_model=NotebookDataCreated, status_code=201)
 async def write_data(
     notebook_id: UUID,
-    _: SessionBound,
+    _: RuntimeNotebookBound,
     db: Annotated[AsyncSession, Depends(get_db)],
     payload: Annotated[JsonValue, Body()],
     source: Annotated[str | None, Query(max_length=255)] = None,
 ) -> NotebookDataCreated:
-    """Persist a data payload written by the session pod's own runtime."""
+    """Persist a data payload written by the Runtime's own marimo process."""
     if await db.get(Notebook, notebook_id) is None:
         raise NotFoundError("Notebook not found")
     data = NotebookData(notebook_id=notebook_id, payload=payload, source=source)
@@ -95,10 +153,10 @@ async def write_data(
 @router.get("/notebooks/{notebook_id}/data", response_model=NotebookDataOut)
 async def read_data(
     notebook_id: UUID,
-    _: SessionBound,
+    _: RuntimeNotebookBound,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> NotebookDataOut:
-    """Return the notebook's latest data payload; the token itself is the authorization."""
+    """Return the notebook's latest data payload; the credential itself is the authorization."""
     data = await db.scalar(
         select(NotebookData)
         .where(NotebookData.notebook_id == notebook_id)

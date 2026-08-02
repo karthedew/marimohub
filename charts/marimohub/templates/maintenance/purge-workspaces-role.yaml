@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "purge-workspaces") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "purge-workspaces") | nindent 4 }}
+rules:
+  - apiGroups: ["marimohub.io"]
+    resources: ["marimosessions"]
+    verbs: ["get", "list", "delete"]

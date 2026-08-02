@@ -1,0 +1,20 @@
+# The internal API's entire Kubernetes surface is a live named get of a CR
+# and its Secret to verify a presented RUNTIME_CREDENTIAL (see
+# RuntimeCredentialVerifier) -- nothing here lists, creates, patches, or
+# deletes anything, on purpose: widening this Role would widen what a
+# compromised internal-API process could do to every other Runtime, not
+# just the one it is currently verifying.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-internal") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-internal") | nindent 4 }}
+rules:
+  - apiGroups: ["marimohub.io"]
+    resources: ["marimosessions"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]

@@ -1,0 +1,402 @@
+# Default values for marimohub.
+#
+# This chart never creates or deletes the three trust-boundary namespaces it
+# installs into (`namespaces.app`, `namespaces.controller`, `namespaces.sessions`
+# below): the platform pre-creates and owns them, and Helm only ever installs
+# namespace-scoped objects inside them. It also never installs PostgreSQL: every
+# `existingSecret`/`existingConfigMap` field below names a Secret or ConfigMap an
+# administrator already created in the target namespace.
+
+namespaces:
+  # Frontend, both backend APIs, and the migration Job run here.
+  app: marimohub
+  # The operator's leader-elected Deployment runs here.
+  controller: marimohub-controller
+  # Untrusted notebook Runtime Pods/Services/Secrets/CRs live here.
+  sessions: marimohub-sessions
+
+# Names an existing image-pull Secret in each namespace above, only needed
+# when the configured registry requires authentication. Left empty, no
+# imagePullSecrets are attached anywhere.
+imagePullSecrets: []
+
+# ── high availability ────────────────────────────────────────────────────
+# The same four fields recur identically on frontend/backendPublic/
+# backendInternal/operator below rather than living in one shared block:
+# each component still owns its own replicaCount, and a PodDisruptionBudget/
+# priorityClassName/topologySpreadConstraints only ever make sense read
+# alongside the component they apply to.
+#
+# podDisruptionBudget.minAvailable and topologySpreadConstraints/
+# updateStrategy only ever render when that component's own replicaCount is
+# greater than 1 -- a PDB with minAvailable: 1 against a single replica would
+# block every voluntary eviction of the only Pod that exists, which is
+# exactly wrong for values-kind.yaml's constrained single-replica profile.
+# An empty topologySpreadConstraints list does not mean "no spreading": the
+# templates fall back to a sensible host+zone spread across this component's
+# own Pods (see the marimohub.defaultTopologySpreadConstraints helper) built
+# from its own selector labels, so most installs never need to set this.
+
+# ── frontend ─────────────────────────────────────────────────────────────
+frontend:
+  replicaCount: 2
+  image:
+    repository: ghcr.io/karthedew/marimohub-frontend
+    digest: sha256:e4d8d7bbe48f46c06bfef8cf6ee1e020c588a7ddac7ee4ffe44f3e1ebdba3efa
+  imagePullPolicy: IfNotPresent
+  port: 3000
+  # PUBLIC_API_URL the server-rendered frontend calls for its own
+  # server-side data loads; the browser bundle calls the same public
+  # hostname's /api path through the router instead of this in-cluster URL.
+  publicApiUrl: ""
+  resources:
+    requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
+    limits: { cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi }
+  podDisruptionBudget:
+    minAvailable: 1
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  updateStrategy:
+    maxUnavailable: 0
+    maxSurge: 1
+  tls:
+    # No Route/Ingress in front of a plaintext origin: the router always
+    # speaks TLS to this Service (re-encrypt on OpenShift, direct TLS on the
+    # portable profile's Ingress), so the origin itself must terminate TLS
+    # rather than accept plaintext from a network any Pod in the cluster can
+    # reach.
+    enabled: true
+    # Existing Secret of type kubernetes.io/tls, keys tls.crt/tls.key. Left
+    # empty here because there is no safe repository-wide default: the
+    # OpenShift profile points this at a service-serving-certificate Secret
+    # name (see values-openshift.yaml), the portable profile at an
+    # administrator-supplied self-signed Secret name (see values-kind.yaml).
+    secretName: ""
+
+# ── backend-public ───────────────────────────────────────────────────────
+backendPublic:
+  replicaCount: 2
+  image:
+    repository: ghcr.io/karthedew/marimohub-backend
+    digest: sha256:5d59fdd14fc64c473a252f82e594ea3984bdb8bd2b3261406338ab92e33dea61
+  imagePullPolicy: IfNotPresent
+  port: 8000
+  # Existing Secret an administrator populates with DATABASE_URL, SECRET_KEY,
+  # PUBLIC_API_URL, and OIDC_PROVIDERS (JSON). Required; the chart only wires
+  # the reference, never the value.
+  existingSecret: ""
+  resources:
+    requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi }
+  podDisruptionBudget:
+    minAvailable: 1
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  updateStrategy:
+    maxUnavailable: 0
+    maxSurge: 1
+  tls:
+    enabled: true
+    secretName: ""
+  # Disabled (and no allowlist) by default: importing a Notebook from an
+  # arbitrary administrator-supplied URL is an SSRF surface, so it stays off
+  # until an administrator both enables it and names the exact hosts it may
+  # reach. proxyUrl is optional -- some deployments bound egress to
+  # allowedHosts through network.externalProxy's CIDR allowlist alone rather
+  # than through an actual HTTP(S) proxy.
+  gitlabImport:
+    enabled: false
+    proxyUrl: ""
+    allowedHosts: []
+
+# ── backend-internal ─────────────────────────────────────────────────────
+backendInternal:
+  replicaCount: 2
+  image:
+    repository: ghcr.io/karthedew/marimohub-backend
+    digest: sha256:5d59fdd14fc64c473a252f82e594ea3984bdb8bd2b3261406338ab92e33dea61
+  imagePullPolicy: IfNotPresent
+  port: 8000
+  # Same application Secret backend-public reads: both processes load the
+  # identical `Settings` model, so both need DATABASE_URL/SECRET_KEY even
+  # though the internal app never mounts an auth or OIDC route.
+  existingSecret: ""
+  resources:
+    requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi }
+  podDisruptionBudget:
+    minAvailable: 1
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  updateStrategy:
+    maxUnavailable: 0
+    maxSurge: 1
+  tls:
+    # Never optional: the internal API has no Route and is reachable only
+    # from the Runtime namespace, but the wire itself is still cluster
+    # network any Pod on a compromised node could sniff without this.
+    enabled: true
+    secretName: ""
+
+# ── operator ──────────────────────────────────────────────────────────────
+operator:
+  replicaCount: 2
+  image:
+    repository: ghcr.io/karthedew/marimohub-operator
+    digest: sha256:1f8db095a1b8d539288f838bdbe34b57e78ef576d4067c53b9ac5db5a41e9d09
+  imagePullPolicy: IfNotPresent
+  metricsPort: 8080
+  healthPort: 8081
+  resources:
+    requests: { cpu: 10m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  leaderElection:
+    enabled: true
+  podDisruptionBudget:
+    minAvailable: 1
+  priorityClassName: ""
+  topologySpreadConstraints: []
+  updateStrategy:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# ── database ─────────────────────────────────────────────────────────────
+# The chart never deploys PostgreSQL; this only configures how backendPublic,
+# backendInternal, and the migration Job verify the external database's TLS
+# certificate. Unset, the driver falls back to its own default (no
+# certificate verification), which is only acceptable outside the OpenShift
+# profile -- see values-openshift.yaml, which requires this.
+database:
+  tls:
+    enabled: false
+    # Existing Secret in namespaces.app holding the external PostgreSQL's CA
+    # certificate. The chart never mints or copies it.
+    caSecretName: ""
+    caSecretKey: ca.crt
+
+# ── Runtime policy ───────────────────────────────────────────────────────
+# Injected into the public backend (so it can author the CRD's required
+# spec.image) and into the operator's startup flags (fetcher image, resource
+# defaults, idle timeouts, and the sessions namespace's LimitRange/
+# ResourceQuota). None of this is backend product authorization -- it is
+# strictly the chart-wide compute/lifecycle policy every Runtime gets unless
+# a MarimoSession spec overrides idleTimeoutSeconds/resources itself.
+runtime:
+  defaultImageFlavor: ubi
+  images:
+    ubi: ghcr.io/karthedew/marimohub-runtime-ubi@sha256:bba30906147ea4f24a531548cd54f7dded3b071932af2e97b64d05df244fe49a
+    ubuntu: ghcr.io/karthedew/marimohub-runtime-ubuntu@sha256:f82c757db7b38372e8e3d75e1566e7f43025c9dde2d61ca8f49ef475cc57a394
+  fetcherImage:
+    repository: ghcr.io/karthedew/marimohub-source-fetcher
+    digest: sha256:03d1f35ad5479905759f6bb467ec30d747ce5c6265f20db393e7ecd81786f9c1
+  imagePullPolicy: IfNotPresent
+  # Runtime Pods never automount a ServiceAccount token (see the pod
+  # contract), so this only ever matters for identity-based image pull;
+  # empty leaves Runtime Pods on the sessions namespace default.
+  serviceAccountName: ""
+  # A plain list of existing Secret names in namespaces.sessions, e.g.
+  # ["my-pull-secret"] -- distinct from the top-level imagePullSecrets list
+  # of {name: ...} objects: a registry credential good enough for the
+  # chart's own Deployments in namespaces.app/namespaces.controller is not
+  # automatically present in namespaces.sessions, so Runtime Pods need their
+  # own reference, and the operator's --image-pull-secrets flag takes a
+  # comma-separated name list rather than a Pod-spec-shaped object.
+  imagePullSecrets: []
+  # An existing Secret/key in namespaces.sessions holding the CA certificate
+  # Runtime Pods use to validate the internal API's TLS certificate. Must
+  # name real material an administrator (or the OpenShift service CA) has
+  # already placed in that namespace; the chart never mints or copies it.
+  internalApiCA:
+    secretName: ""
+    secretKey: ca.crt
+  idleTimeoutSeconds:
+    edit: 1800
+    run: 600
+    deploy: 300
+  # The backend's own per-replica activity-signal interval (how often an
+  # open HTTP stream or WebSocket re-signals liveness) and the additional
+  # grace the controller adds on top before treating silence as idleness.
+  # The grace must stay comfortably larger than the signal interval so one
+  # throttled or delayed signal can never be mistaken for idleness.
+  activitySignalIntervalSeconds: 10
+  activityGraceSeconds: 20
+  resources:
+    requests: { cpu: 250m, memory: 512Mi, ephemeral-storage: 256Mi }
+    limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 1Gi }
+  fetcherResources:
+    requests: { cpu: 25m, memory: 64Mi, ephemeral-storage: 32Mi }
+    limits: { cpu: 100m, memory: 128Mi, ephemeral-storage: 128Mi }
+  # A real namespace ResourceQuota/LimitRange for namespaces.sessions, not
+  # only an operator-side soft default: Pod-create admission is the actual
+  # backstop, and the operator classifies its Forbidden response against
+  # these same hard values (see internal/controller's quota confirmation
+  # logic).
+  quota:
+    hard:
+      pods: "50"
+      requests.cpu: "12500m"
+      requests.memory: "25Gi"
+      requests.ephemeral-storage: "12800Mi"
+      limits.cpu: "50"
+      limits.memory: "100Gi"
+      limits.ephemeral-storage: "50Gi"
+  limitRange:
+    max: { cpu: "2", memory: 4Gi, ephemeral-storage: 2Gi }
+  workVolumeSizeLimit: 512Mi
+  maxSourceBytes: 10485760
+  # Administrator-managed CIDR/port egress an operator explicitly opts a
+  # Runtime into beyond DNS and the internal API -- never a user-facing
+  # control. Each entry is `{cidr, port, protocol}`.
+  egressAllowlist: []
+
+# ── migration ────────────────────────────────────────────────────────────
+# A single pre-install/pre-upgrade Helm hook Job runs `alembic upgrade head`
+# against backendPublic.existingSecret's DATABASE_URL once, before any
+# application Deployment rolls out; a non-zero exit blocks the release. Its
+# ServiceAccount is never automounted and receives no RBAC at all -- Alembic
+# only ever talks to the database.
+migration:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi }
+  activeDeadlineSeconds: 300
+
+# ── maintenance ──────────────────────────────────────────────────────────
+# Two hardened, single-concurrency CronJobs wrapping the backend's own
+# retryable cleanup commands. Each gets its own least-privilege
+# ServiceAccount scoped to exactly what its command touches -- both only
+# ever list/get/delete MarimoSession CRs, never create or patch one, and
+# neither touches a Secret directly (owner-reference GC removes a deleted
+# CR's Pod/Service/Secret children on its own).
+maintenance:
+  reconcileRuntimes:
+    schedule: "*/10 * * * *"
+    resources:
+      requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi }
+  purgeWorkspaces:
+    schedule: "0 * * * *"
+    resources:
+      requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi }
+
+# ── uninstall drain ──────────────────────────────────────────────────────
+# A pre-delete Helm hook Job that foreground-deletes every MarimoSession CR
+# in namespaces.sessions and waits for their owned Pods/Services/Secrets to
+# be gone before Helm removes the operator or NetworkPolicies; a timeout
+# aborts the uninstall rather than leaving orphaned Runtime credentials
+# behind. Its ServiceAccount is scoped to exactly CR/Pod/Service/Secret
+# get/list/watch plus CR delete in namespaces.sessions -- nothing else.
+uninstallDrain:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
+    limits: { cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi }
+  timeoutSeconds: 120
+
+# ── monitoring ───────────────────────────────────────────────────────────
+# The operator's metrics Service always exists; TLS and Prometheus Operator
+# ServiceMonitor scraping are both opt-in. tls reuses the existing-Secret
+# pattern every other TLS listener in this chart uses (see backendPublic.tls
+# for the identical shape) rather than inventing new certificate machinery;
+# when enabled, controller-runtime's own certwatcher (the same rotation
+# mechanism the operator's leader-election/reconcile loop already links in)
+# polls and reloads it, matching the backend/frontend TLS entrypoints'
+# rotation-without-restart property.
+#
+# serviceMonitor assumes the Prometheus Operator CRD (monitoring.coreos.com/
+# v1 ServiceMonitor) is already installed cluster-wide; this chart never
+# attempts to detect that with `lookup`, so enabling it against a cluster
+# without that CRD fails the release the same way any other reference to a
+# missing CRD would.
+monitoring:
+  tls:
+    enabled: false
+    secretName: ""
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+
+# ── network and TLS boundaries ───────────────────────────────────────────
+# Standard NetworkPolicy selects Pods/namespaces/CIDRs, never FQDNs, and the
+# Kubernetes API server and an external database sit behind endpoints
+# NetworkPolicy cannot portably discover on its own (a Service in front of
+# the API server is host-network/post-DNAT, and an external database has no
+# in-cluster Pod selector at all) -- so both are explicit CIDR/port values
+# rather than a selector this chart could compute for you.
+network:
+  dns:
+    ports:
+      - { port: 53, protocol: UDP }
+      - { port: 53, protocol: TCP }
+  kubernetesApi:
+    # e.g. ["10.0.0.1/32"] -- the API server endpoint(s) this cluster's
+    # `kubernetes.default.svc` actually resolves to. Left empty by default;
+    # a production install must set this or the operator/backend workloads
+    # that need API access get no egress path to it at all.
+    cidrs: []
+    port: 6443
+  database:
+    cidrs: []
+    port: 5432
+  router:
+    # Ingress source allowed to reach the frontend/backend-public Services.
+    # OpenShift sets this to the router namespace; the portable profile
+    # points it at its Ingress controller's own namespace/pods instead.
+    namespaceSelector: {}
+    podSelector: {}
+  externalProxy:
+    # Explicit CIDR/port egress for a configured OIDC issuer or GitLab
+    # import proxy. Empty by default: no product feature in this chart
+    # depends on it existing yet, so leaving it empty denies that egress
+    # entirely rather than silently opening the public backend to the
+    # internet.
+    cidrs: []
+    ports: []
+  monitoring:
+    enabled: false
+    namespaceSelector: {}
+    podSelector: {}
+
+# ── preflight ─────────────────────────────────────────────────────────────
+# Not a Helm hook and not `lookup`: namespace existence/labels are checked by
+# the versioned `hack/preflight/check-namespaces.sh` script (using the same
+# pinned kubectl this repository's other offline checks use) before `helm
+# install`/`helm upgrade` ever runs, so a missing or mislabeled namespace
+# fails before Helm creates a single object rather than mid-release.
+preflight:
+  requiredLabels: {}
+
+# Rendering profile: "openshift" adds service-serving-certificate
+# annotations and creates re-encrypt Routes; "portable" expects manually
+# supplied TLS Secrets and a conditional Ingress instead.
+platform: portable
+
+openshift:
+  serviceServingCerts:
+    enabled: false
+
+# OpenShift only: same-host path Routes, /api -> backendPublic and / ->
+# frontend, both re-encrypt TLS. host has no safe repository-wide default
+# (it is the public hostname the installer's DNS points at this cluster's
+# router) and is left empty here; render still succeeds with it empty (an
+# OpenShift Route with no host auto-generates one, which is a functional gap
+# an installer must close, not a template-time error) -- set it, and
+# destinationCACertificate, before a real install. destinationCACertificate
+# is the cluster's own service-ca bundle content (the `service-ca.crt` key
+# OpenShift publishes as the `openshift-service-ca.crt` ConfigMap in every
+# namespace), required for the router to trust openshift.serviceServingCerts
+# Service certificates; without it the router falls back to its own default
+# CA and re-encrypt TLS to these Services fails.
+routes:
+  host: ""
+  destinationCACertificate: ""
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  # The public listener's own certificate. Empty falls back to
+  # frontend.tls.secretName -- fine for a portable/dev install reusing one
+  # self-signed Secret for both hops, but an administrator may point this at
+  # a distinct publicly-verifiable certificate instead.
+  tlsSecretName: ""

@@ -1,0 +1,87 @@
+{{- include "marimohub.databaseTLSGuard" . }}
+{{- if not .Values.backendPublic.existingSecret }}
+{{- fail "backendPublic.existingSecret is required (the migration Job runs against the same DATABASE_URL)" }}
+{{- end }}
+# A single pre-install/pre-upgrade hook Job: `helm.sh/hook-weight: "0"` runs
+# it after the ServiceAccount above (weight -5) and before every application
+# Deployment rolls out (Deployments are not hooks at all, so they only ever
+# apply once this hook's own install/upgrade phase has fully succeeded).
+# `backoffLimit: 0` means the very first failed attempt marks the Job
+# Failed immediately -- what Helm's hook-failure detection watches for to
+# block the rest of the release -- rather than retrying quietly first.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "migration") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "migration") | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  # Belt-and-suspenders alongside hook-delete-policy above: this only ever
+  # matters if a release is abandoned before Helm's own hook cleanup runs.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "migration") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "migration") }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: {{ include "marimohub.image" .Values.backendPublic.image }}
+          imagePullPolicy: {{ .Values.backendPublic.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Overrides the image's `python -m app.serve` ENTRYPOINT entirely:
+          # this Job runs Alembic directly, once, and never starts a server.
+          # Application Pods never invoke Alembic (see Containerfile.backend)
+          # -- this Job is the only place `alembic upgrade head` ever runs.
+          command: ["alembic"]
+          args: ["upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: {{ .Values.backendPublic.existingSecret }}
+          {{- if .Values.database.tls.enabled }}
+          env:
+            - name: DATABASE_CA_FILE
+              value: /etc/marimohub/db-ca/{{ .Values.database.tls.caSecretKey }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.database.tls.enabled }}
+            - name: db-ca
+              mountPath: /etc/marimohub/db-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.database.tls.enabled }}
+        - name: db-ca
+          secret:
+            secretName: {{ .Values.database.tls.caSecretName }}
+        {{- end }}

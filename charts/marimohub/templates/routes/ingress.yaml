@@ -1,0 +1,50 @@
+# The portable profile's same-host path routing alternative to OpenShift
+# Routes: /api -> backend-public, / -> frontend, gated behind
+# ingress.enabled since not every portable Kubernetes cluster carries an
+# Ingress controller. `backend-protocol: HTTPS` keeps the ingress-to-origin
+# hop TLS (both origins terminate TLS themselves; see frontend.tls/
+# backendPublic.tls), matching the Security Baseline's requirement that
+# nothing in the cluster ever receives plaintext for these two Services --
+# this chart's portable profile has no service-serving-certificate
+# machinery to verify that origin certificate against, so it is the same
+# "encrypted but unverified" trust level a re-encrypt Route's
+# destinationCACertificate exists specifically to close on OpenShift; that
+# gap is why the portable profile carries no STIG claim.
+{{- if and (eq .Values.platform "portable") .Values.ingress.enabled }}
+{{- if not .Values.ingress.host }}
+{{- fail "ingress.host is required when ingress.enabled" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "ingress") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "ingress") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      secretName: {{ .Values.ingress.tlsSecretName | default .Values.frontend.tls.secretName }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+                port:
+                  name: http
+{{- end }}

@@ -1,15 +1,59 @@
-FROM node:22-alpine AS build
-WORKDIR /app
+# Red Hat UBI 9's Node 22 s2i image, pinned by digest so the floating
+# "latest" tag can never quietly resolve to different bytes than what was
+# scanned and signed. Same rationale as Containerfile.backend's UBI base:
+# it ships a pre-built /opt/app-root owned by UID 1001/GID 0 and
+# group-writable throughout, the arbitrary-UID contract this image needs
+# for free. Refresh by re-resolving and updating both the digest and the
+# date:
+#   docker pull registry.access.redhat.com/ubi9/nodejs-22:latest
+#   docker inspect registry.access.redhat.com/ubi9/nodejs-22:latest --format '{{.RepoDigests}}'
+# Resolved 2026-08-01 from registry.access.redhat.com/ubi9/nodejs-22:latest.
+FROM registry.access.redhat.com/ubi9/nodejs-22@sha256:cb8bf510760dee18a622d1775e202943b7529c280bf1820731d3171140218fc0 AS build
+
+WORKDIR /opt/app-root/src
+
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
+
 COPY frontend/ ./
 RUN npm run build
 
-FROM node:22-alpine
-WORKDIR /app
-ENV NODE_ENV=production HOST=0.0.0.0 PORT=3000
-COPY --from=build /app/build ./build
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/package.json ./package.json
+# adapter-node bundles every dependency the built server actually needs
+# (Node built-ins and relative chunk files only -- verified: nothing under
+# build/ imports a bare package specifier), so the final stage needs
+# neither node_modules nor a package manager at all, only build/ and the
+# custom server.js that serves it.
+FROM registry.access.redhat.com/ubi9/nodejs-22@sha256:cb8bf510760dee18a622d1775e202943b7529c280bf1820731d3171140218fc0
+
+# HOME=/tmp rather than the base image's own /opt/app-root/src: an
+# OpenShift-assigned arbitrary UID has no /etc/passwd entry, so anything
+# that falls back to "$HOME" needs that path to already be writable without
+# relying on username resolution.
+ENV NODE_ENV=production \
+	HOST=0.0.0.0 \
+	PORT=3000 \
+	HOME=/tmp
+
+WORKDIR /opt/app-root/src
+
+COPY --from=build /opt/app-root/src/build ./build
+COPY --from=build /opt/app-root/src/server.js ./server.js
+
+# /opt/app-root/src and /tmp are the only paths this image ever writes to
+# (there is nothing to write under normal operation; this only matters for
+# a direct docker-run without Kubernetes's own mounted, size-bounded /tmp
+# emptyDir). GID 0 is the group every MarimoHub image standardizes on:
+# OpenShift replaces the container's UID with an arbitrary one from the
+# namespace's allocated range but leaves GID 0 alone.
+USER 0
+RUN chgrp -R 0 /opt/app-root/src /tmp && chmod -R g=u /opt/app-root/src /tmp
+
+USER 1001:0
+
 EXPOSE 3000
-CMD ["node", "build"]
+
+# No shell in the exec path: signals reach the Node process directly, which
+# is what lets server.js's own SIGTERM handling (stop accepting new
+# connections, drain in-flight requests, then exit) run without a wrapper
+# shell either swallowing the signal or forwarding it a beat too late.
+ENTRYPOINT ["node", "server.js"]

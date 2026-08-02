@@ -1,3 +1,10 @@
+"""The public application: routed, user- and anonymous-visitor-facing.
+
+`/api/internal/*` is deliberately not mounted here. It lives in
+`app.internal_main`, a separate ASGI app -- see that module's docstring for
+why the two are kept apart rather than one app gated by a dependency.
+"""
+
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -7,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.data import router as data_router
 from app.api.deployments import router as deployments_router
-from app.api.internal import router as internal_router
 from app.api.notebooks import router as notebooks_router
 from app.api.proxy import router as proxy_router
 from app.api.sessions import router as sessions_router
@@ -39,7 +45,6 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(data_router)
 app.include_router(deployments_router)
-app.include_router(internal_router)
 app.include_router(notebooks_router)
 app.include_router(sessions_router)
 app.include_router(workspaces_router)

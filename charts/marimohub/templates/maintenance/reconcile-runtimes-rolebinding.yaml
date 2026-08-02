@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "reconcile-runtimes") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "reconcile-runtimes") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "reconcile-runtimes") }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "reconcile-runtimes") }}
+    namespace: {{ .Values.namespaces.app }}

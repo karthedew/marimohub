@@ -1,0 +1,56 @@
+# namespaces.sessions holds nothing but Runtime Pods/Services/Secrets/CRs
+# (see the Namespace Boundaries table), so an empty podSelector here safely
+# means "every Runtime Pod" without accidentally also matching an operator
+# or backend workload that never runs in this namespace. Cross-Runtime
+# traffic and Runtime access to the Kubernetes API are both denied by
+# omission: neither rule appears below, and the namespace's own default-deny
+# NetworkPolicy leaves anything unlisted blocked.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "runtime") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "runtime") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Only backend-public proxies HTTP/WebSocket traffic to a Runtime
+    # Service; no other namespace, and no other Pod within this one, may
+    # reach a Runtime on its serving port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.app }}
+          podSelector:
+            matchLabels:
+              {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-public") | nindent 14 }}
+      ports:
+        - port: {{ include "marimohub.runtimePort" . }}
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    # The internal API, and nothing else in namespaces.app: not
+    # backend-public, not the frontend.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.app }}
+          podSelector:
+            matchLabels:
+              {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-internal") | nindent 14 }}
+      ports:
+        - port: {{ .Values.backendInternal.port }}
+          protocol: TCP
+    {{- range .Values.runtime.egressAllowlist }}
+    - to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+      ports:
+        - port: {{ .port }}
+          protocol: {{ .protocol | default "TCP" }}
+    {{- end }}

@@ -4,9 +4,10 @@ import shutil
 from uuid import UUID, uuid4
 
 from app.core.config import Settings
-from app.models import Notebook
+from app.models import Deployment, Notebook
 from app.services.session_manager import (
     RuntimeMode,
+    RuntimeRef,
     SessionInfo,
     SessionManagerError,
     SessionMode,
@@ -59,20 +60,24 @@ class SubprocessSessionManager:
             notebook, mode, creator_id=creator_id, session_id=uuid4(), base_url=None
         )
 
-    async def spawn_deployment(
-        self, notebook: Notebook, deployment_id: UUID, slug: str
-    ) -> SessionInfo:
-        """Spawn (or return the existing) deploy session for a deployment."""
+    async def spawn_deployment(self, notebook: Notebook, deployment: Deployment) -> SessionInfo:
+        """Spawn (or return the existing) deploy session for a deployment.
+
+        Dev-mode only: unlike the Kube backend, this never distinguishes
+        deploy revisions or a resolved image digest, so `deployment.revision`
+        and `deployment.runtime_image` are unused here -- the subprocess
+        always runs the notebook's current source.
+        """
         async with self._deployment_spawn_lock:
-            existing = await self._registry.get(deployment_id)
+            existing = await self._registry.get(deployment.id)
             if existing is not None:
                 return existing.info()
             return await self._spawn(
                 notebook,
                 "deploy",
                 creator_id=None,
-                session_id=deployment_id,
-                base_url=f"/api/deployments/{slug}",
+                session_id=deployment.id,
+                base_url=f"/api/deployments/{deployment.slug}",
             )
 
     def _ensure_not_shutting_down(self) -> None:
@@ -161,6 +166,20 @@ class SubprocessSessionManager:
         if session is None:
             raise SessionNotFoundError("Session not found")
         await self._stop_live(session)
+
+    async def stop_workspace_sessions(self, workspace_id: UUID) -> None:
+        """No-op: the local dev registry does not track a session's workspace.
+
+        Local subprocess sessions are not workspace-labelled the way a Kube
+        Runtime CR is, and this backend is dev-only, so bulk workspace
+        cleanup is not implemented here; `app.services.workspace_service`
+        still stops every tracked Deployment individually through `stop`.
+        """
+        return
+
+    async def reconcilable_runtimes(self) -> list[RuntimeRef]:
+        """Always empty: local dev sessions are not subject to the maintenance sweep."""
+        return []
 
     async def shutdown(self) -> None:
         """Stop all tracked sessions.

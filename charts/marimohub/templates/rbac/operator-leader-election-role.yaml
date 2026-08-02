@@ -1,0 +1,15 @@
+# controller-runtime's default resource lock is Leases only; there is no
+# configmaps rule because the legacy configmapsleases lock is never used.
+# Scoped to namespaces.controller only -- the operator never needs Lease
+# access anywhere else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator-leader-election") }}
+  namespace: {{ .Values.namespaces.controller }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "operator") | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

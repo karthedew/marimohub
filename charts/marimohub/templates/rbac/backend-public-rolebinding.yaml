@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+  namespace: {{ .Values.namespaces.sessions }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+    namespace: {{ .Values.namespaces.app }}

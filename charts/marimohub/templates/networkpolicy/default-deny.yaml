@@ -1,0 +1,16 @@
+# Every namespace starts fully closed; every other NetworkPolicy in this
+# chart only ever adds a narrow allow on top; there is no "allow all" default
+# net anywhere in the release.
+{{- range $ns := list .Values.namespaces.app .Values.namespaces.controller .Values.namespaces.sessions }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "default-deny") }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "default-deny") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+{{- end }}

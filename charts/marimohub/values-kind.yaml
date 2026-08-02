@@ -1,0 +1,78 @@
+# Portable Kubernetes / kind development profile. No STIG claim applies to
+# this profile (see the Security Baseline); it exists so the platform is
+# installable and testable without OpenShift's Route/service-CA machinery.
+#
+# Every CIDR below is a placeholder that varies per kind cluster -- there is
+# no portable way for this chart to discover them. Replace with the values
+# `kubectl cluster-info dump | grep -m1 -A0 'cluster-cidr\|service-cluster-ip-range'`
+# and your kind network's actual API server address report for your own
+# cluster before installing; the values here only make `helm template`
+# render a complete, exercisable NetworkPolicy shape.
+
+platform: portable
+
+openshift:
+  serviceServingCerts:
+    enabled: false
+
+ingress:
+  enabled: true
+  className: nginx
+  host: marimohub.kind.local
+
+# One-replica development values: a constrained kind cluster (typically a
+# single Docker-network node) has no real multi-node spread to gain from two
+# replicas, and a PodDisruptionBudget/topologySpreadConstraints against a
+# single replica would only ever get in the way of iterating quickly.
+frontend:
+  replicaCount: 1
+  tls:
+    enabled: true
+    # An administrator creates this kubernetes.io/tls Secret (a self-signed
+    # certificate is sufficient for kind) before installing.
+    secretName: marimohub-frontend-tls
+
+backendPublic:
+  replicaCount: 1
+  existingSecret: marimohub-backend-env
+  tls:
+    enabled: true
+    secretName: marimohub-backend-public-tls
+
+backendInternal:
+  replicaCount: 1
+  existingSecret: marimohub-backend-env
+  tls:
+    enabled: true
+    secretName: marimohub-backend-internal-tls
+
+operator:
+  replicaCount: 1
+
+runtime:
+  internalApiCA:
+    # The self-signed backend-internal certificate's own CA, mirrored into
+    # namespaces.sessions so Runtime Pods can validate it. The chart never
+    # copies this across namespaces; an administrator (or a documented
+    # `kubectl get secret ... -o jsonpath` one-liner) does.
+    secretName: marimohub-internal-api-ca
+    secretKey: ca.crt
+
+network:
+  kubernetesApi:
+    # kind's default pod/API network; override with your cluster's actual
+    # Docker network CIDR (`docker network inspect kind`).
+    cidrs: ["172.18.0.0/16"]
+    port: 6443
+  database:
+    # A disposable PostgreSQL fixture reachable from the kind Docker network,
+    # not a Service this chart manages.
+    cidrs: ["172.18.0.0/16"]
+    port: 5432
+  router:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: ingress-nginx

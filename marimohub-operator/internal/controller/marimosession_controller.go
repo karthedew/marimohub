@@ -50,11 +50,16 @@ import (
 )
 
 // Default deadlines the manager wires in unless a test overrides them.
-// These are not yet manager flags: nothing in the chart's documented value
-// shape anticipates configuring them the way it already does for idle
-// timeouts and resource defaults, so promoting them to flags is a
-// mechanical follow-up whenever that need arises, not a decision this
-// package should preempt.
+// DefaultImagePullDeadline, DefaultUnhealthyTimeout, and DefaultNodeLossDeadline
+// are not yet manager flags: nothing in the chart's documented value shape
+// anticipates configuring them the way it already does for idle timeouts and
+// resource defaults, so promoting them to flags is a mechanical follow-up
+// whenever that need arises, not a decision this package should preempt.
+// DefaultIdleGracePeriod is the one exception: it mirrors the value
+// managerconfig falls back to when --idle-grace-period-seconds is omitted,
+// since the chart's Runtime policy values do name this one
+// (activityGraceSeconds) and main.go wires the resolved flag value, not this
+// constant, into the reconciler.
 const (
 	DefaultImagePullDeadline = 10 * time.Minute
 	DefaultUnhealthyTimeout  = 2 * time.Minute

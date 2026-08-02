@@ -1,0 +1,84 @@
+{{- include "marimohub.databaseTLSGuard" . }}
+{{- if not .Values.backendPublic.existingSecret }}
+{{- fail "backendPublic.existingSecret is required (the purge sweep runs against the same DATABASE_URL)" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "purge-workspaces") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "purge-workspaces") | nindent 4 }}
+spec:
+  schedule: {{ .Values.maintenance.purgeWorkspaces.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "purge-workspaces") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "purge-workspaces") }}
+          automountServiceAccountToken: true
+          enableServiceLinks: false
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: purge-workspaces
+              image: {{ include "marimohub.image" .Values.backendPublic.image }}
+              imagePullPolicy: {{ .Values.backendPublic.imagePullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              command: ["python", "-m", "app.commands.purge_archived_workspaces"]
+              envFrom:
+                - secretRef:
+                    name: {{ .Values.backendPublic.existingSecret }}
+              env:
+                - name: SESSION_BACKEND
+                  value: kube
+                - name: SESSION_NAMESPACE
+                  value: {{ .Values.namespaces.sessions }}
+                - name: SESSION_SERVICE_DNS_SUFFIX
+                  value: svc
+                - name: SESSION_SERVICE_PORT
+                  value: {{ include "marimohub.runtimePort" . | quote }}
+                - name: SESSION_RUNTIME_IMAGE
+                  value: {{ include "marimohub.runtimeImage" . }}
+                {{- if .Values.database.tls.enabled }}
+                - name: DATABASE_CA_FILE
+                  value: /etc/marimohub/db-ca/{{ .Values.database.tls.caSecretKey }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.maintenance.purgeWorkspaces.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if .Values.database.tls.enabled }}
+                - name: db-ca
+                  mountPath: /etc/marimohub/db-ca
+                  readOnly: true
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+            {{- if .Values.database.tls.enabled }}
+            - name: db-ca
+              secret:
+                secretName: {{ .Values.database.tls.caSecretName }}
+            {{- end }}

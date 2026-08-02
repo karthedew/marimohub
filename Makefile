@@ -13,7 +13,7 @@ else
 $(error Unsupported ENGINE '$(ENGINE)'; use ENGINE=docker or ENGINE=podman)
 endif
 
-COMPOSE := $(COMPOSE_CMD) -f $(COMPOSE_FILE) -p $(COMPOSE_PROJECT)
+COMPOSE := UID=$(shell id -u) GID=$(shell id -g) $(COMPOSE_CMD) -f $(COMPOSE_FILE) -p $(COMPOSE_PROJECT)
 
 .PHONY: help build up up-d down down-v logs ps restart health \
 	backend-build backend-up backend-restart backend-logs refresh-deps \
@@ -208,6 +208,11 @@ CHARTS_DIR := charts/marimohub
 GENERATED_CRD := $(OPERATOR_DIR)/config/crd/bases/marimohub.io_marimosessions.yaml
 KIND_SMOKE := hack/smoke/kind/run.sh
 OPENSHIFT_SMOKE := hack/smoke/openshift/run.sh
+# Offline `helm lint`/`helm template` fall back to Kubernetes v1.20.0 without
+# a live cluster to ask, which is below the chart's own kubeVersion floor;
+# every offline render pins this explicitly instead.
+CHART_KUBE_VERSION := 1.35.0
+CHART_PROFILES := values-kind.yaml values-openshift.yaml
 
 .PHONY: bootstrap-tools verify-tools generate verify-generated \
 	operator-check operator-test backend-check frontend-check \
@@ -220,10 +225,11 @@ verify-tools:
 	@hack/tools/verify.sh
 
 # Regenerates deepcopy/CRD/RBAC from the operator's Go source, then copies
-# the one generated CRD byte-for-byte to every place it must also live.
-# deploy/crd/marimosession.yaml exists today; charts/marimohub/crds is copied
-# to only once the chart directory exists, so this stays a plain conditional
-# rather than a stub that manufactures an empty chart layout ahead of time.
+# the one generated CRD byte-for-byte to every place it must also live:
+# deploy/crd/marimosession.yaml and charts/marimohub/crds/. The chart
+# directory check stays a plain conditional rather than an unconditional
+# copy so this target never fails outright on a worktree that has removed
+# or not yet vendored the chart.
 generate:
 	$(MAKE) -C $(OPERATOR_DIR) generate manifests
 	cp "$(GENERATED_CRD)" deploy/crd/marimosession.yaml
@@ -264,13 +270,33 @@ images:
 	$(ENGINE) build -f images/marimo-runtime/Containerfile.ubuntu -t marimohub-runtime-ubuntu:dev images/marimo-runtime
 	$(ENGINE) build -f images/marimo-runtime/Containerfile.ubi -t marimohub-runtime-ubi:dev images/marimo-runtime
 
+# Lints, schema-validates (values.schema.json runs automatically as part of
+# lint/template whenever it is present), renders, and policy-checks the
+# chart against both shipped profiles. Nothing here renders bare
+# values.yaml alone: several required fields (TLS Secret names, the
+# database/Kubernetes API CIDRs) are deliberately left empty there so a
+# real install always supplies them through values-kind.yaml/
+# values-openshift.yaml or an equivalent override, never silently falls
+# back to an insecure or non-functional default.
 helm-check:
-	@if [ -d "$(CHARTS_DIR)" ]; then \
-		.bin/helm lint $(CHARTS_DIR); \
-	else \
-		echo "helm-check: $(CHARTS_DIR) does not exist yet (Phase 6 creates it)"; \
-		exit 1; \
-	fi
+	@set -e; \
+	for profile in $(CHART_PROFILES); do \
+		echo "== helm lint ($$profile) =="; \
+		.bin/helm lint $(CHARTS_DIR) -f "$(CHARTS_DIR)/$$profile" --kube-version $(CHART_KUBE_VERSION); \
+	done; \
+	rendered=$$(mktemp -d); \
+	trap 'rm -rf "$$rendered"' EXIT; \
+	for profile in $(CHART_PROFILES); do \
+		out="$$rendered/$${profile%.yaml}.yaml"; \
+		echo "== helm template ($$profile) =="; \
+		.bin/helm template marimohub-check $(CHARTS_DIR) -f "$(CHARTS_DIR)/$$profile" --kube-version $(CHART_KUBE_VERSION) --include-crds > "$$out"; \
+		echo "== kubeconform ($$profile) =="; \
+		.bin/kubeconform -kubernetes-version $(CHART_KUBE_VERSION) -summary -ignore-missing-schemas "$$out"; \
+		echo "== kube-linter ($$profile) =="; \
+		.bin/kube-linter lint "$$out"; \
+		echo "== RBAC/NetworkPolicy/image/security-context assertions ($$profile) =="; \
+		HELM=.bin/helm python3 hack/chart-tests/verify_chart.py $(CHARTS_DIR) "$(CHARTS_DIR)/$$profile"; \
+	done
 
 kind-smoke:
 	@if [ -x "$(KIND_SMOKE)" ]; then \
@@ -288,11 +314,7 @@ openshift-smoke:
 		exit 1; \
 	fi
 
-# All checks that do not require a live cluster. Working checks run first so
-# a failure further down never hides their result. operator-check and
-# helm-check currently fail because their components do not exist yet
-# (Phases 1 and 6); that is the correct, honest state of this target until
-# those phases land.
+# All checks that do not require a live cluster.
 verify: verify-tools verify-generated backend-check frontend-check operator-check helm-check
 
 _require-compose:

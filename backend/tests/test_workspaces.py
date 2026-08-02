@@ -341,12 +341,17 @@ async def test_archive_stops_workspace_deployment_runtimes(
     manager = FakeDeploymentSessionManager()
     app.dependency_overrides[get_session_manager] = lambda: manager
     try:
+        # Wake it once first so the manager actually has a live Runtime
+        # tracked to stop -- a Deployment nobody ever visited has no Runtime
+        # for archive to tear down in the first place.
+        await api_client.get("/api/deployments/stoprun-slug")
         response = await api_client.delete(f"/api/workspaces/{workspace_id}", headers=owner_headers)
     finally:
         app.dependency_overrides.pop(get_session_manager, None)
 
     assert response.status_code == 204
     assert deployment_id in manager.stopped
+    assert workspace_id in manager.stopped_workspaces
 
 
 async def test_purge_due_workspaces_is_idempotent_and_cascades(db_session: AsyncSession) -> None:
@@ -378,7 +383,7 @@ async def test_purge_due_workspaces_is_idempotent_and_cascades(db_session: Async
     await db_session.commit()
     due_id, not_due_id, notebook_id = due.id, not_due.id, notebook.id
 
-    first_run = await purge_due_workspaces(db_session, now)
+    first_run = await purge_due_workspaces(db_session, FakeDeploymentSessionManager(), now)
     assert first_run == 1
     # The purge's raw DELETE cascades notebooks at the DB level, invisible to this
     # session's identity map; expire everything so the checks below re-query.
@@ -388,7 +393,7 @@ async def test_purge_due_workspaces_is_idempotent_and_cascades(db_session: Async
     assert await db_session.get(Notebook, notebook_id) is None
     assert await db_session.get(Workspace, not_due_id) is not None
 
-    second_run = await purge_due_workspaces(db_session, now)
+    second_run = await purge_due_workspaces(db_session, FakeDeploymentSessionManager(), now)
     assert second_run == 0
 
 
@@ -404,7 +409,7 @@ async def test_delete_user_hard_deletes_sole_member_workspaces(db_session: Async
     )
     await db_session.commit()
 
-    await delete_user(db_session, user.id)
+    await delete_user(db_session, FakeDeploymentSessionManager(), user.id)
 
     assert await db_session.get(Workspace, workspace.id) is None
     assert await db_session.get(User, user.id) is None
@@ -433,7 +438,7 @@ async def test_delete_user_blocks_on_sole_ownership_of_shared_workspace(
     await db_session.commit()
 
     with pytest.raises(ConflictError):
-        await delete_user(db_session, sole_owner.id)
+        await delete_user(db_session, FakeDeploymentSessionManager(), sole_owner.id)
 
     assert await db_session.get(User, sole_owner.id) is not None
     remaining = await owner_count(db_session, workspace.id)
@@ -462,7 +467,7 @@ async def test_delete_user_succeeds_when_co_owner_of_shared_workspace(
     )
     await db_session.commit()
 
-    await delete_user(db_session, co_owner.id)
+    await delete_user(db_session, FakeDeploymentSessionManager(), co_owner.id)
 
     assert await db_session.get(User, co_owner.id) is None
     assert await db_session.get(Workspace, workspace.id) is not None
@@ -496,7 +501,7 @@ async def test_delete_user_blocked_by_shared_workspace_leaves_sole_member_worksp
     await db_session.commit()
 
     with pytest.raises(ConflictError):
-        await delete_user(db_session, user.id)
+        await delete_user(db_session, FakeDeploymentSessionManager(), user.id)
 
     assert await db_session.get(User, user.id) is not None
     assert await db_session.get(Workspace, solo_workspace.id) is not None

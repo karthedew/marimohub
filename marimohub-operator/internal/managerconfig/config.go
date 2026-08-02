@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -28,6 +29,11 @@ import (
 // on the CR override, or the two would disagree about the shortest Runtime
 // lifetime the platform allows.
 const MinIdleTimeoutSeconds = 30
+
+// defaultIdleGracePeriodSeconds mirrors controller.DefaultIdleGracePeriod so
+// a manager started without --idle-grace-period-seconds keeps behaving
+// exactly as it did before the flag existed.
+const defaultIdleGracePeriodSeconds = 20
 
 // imageDigestPattern reuses the exact rule the CRD applies to spec.image, so
 // the manager's own --fetcher-image flag and the API server's admission
@@ -86,6 +92,16 @@ type Config struct {
 	// IdleTimeout holds the per-mode idle defaults applied when a
 	// MarimoSession does not set spec.idleTimeoutSeconds.
 	IdleTimeout session.IdleTimeoutDefaults
+
+	// IdleGracePeriod is added on top of the effective idle timeout before
+	// any idle action, absorbing the backend's own activity-signal interval
+	// so a throttled activity write is never mistaken for real idleness.
+	// This is the one reconciler deadline promoted to a flag: the chart's
+	// documented Runtime policy values already name it
+	// (activityGraceSeconds), unlike the image-pull/unhealthy/node-loss
+	// deadlines, which stay internal constants until something actually
+	// needs to configure them.
+	IdleGracePeriod time.Duration
 }
 
 // flagValues holds the raw, unvalidated flag destinations. Keeping this
@@ -106,6 +122,7 @@ type flagValues struct {
 	idleTimeoutEdit      int
 	idleTimeoutRun       int
 	idleTimeoutDeploy    int
+	idleGracePeriod      int
 }
 
 // FlagSet is the handle RegisterFlags returns; call Resolve after the
@@ -148,6 +165,9 @@ func RegisterFlags(fs *flag.FlagSet) *FlagSet {
 		"Default idle timeout for run-mode Runtimes, in seconds. Required, minimum 30.")
 	fs.IntVar(&v.idleTimeoutDeploy, "idle-timeout-deploy-seconds", 0,
 		"Default idle timeout for deploy-mode Runtimes, in seconds. Required, minimum 30.")
+	fs.IntVar(&v.idleGracePeriod, "idle-grace-period-seconds", defaultIdleGracePeriodSeconds,
+		"Additional grace period added on top of the effective idle timeout before any idle action, "+
+			"absorbing the backend's own activity-signal interval. Must stay comfortably larger than that interval.")
 	return &FlagSet{values: v}
 }
 
@@ -166,6 +186,7 @@ func (f *FlagSet) Resolve() (Config, error) {
 			RunSeconds:    int32(v.idleTimeoutRun),
 			DeploySeconds: int32(v.idleTimeoutDeploy),
 		},
+		IdleGracePeriod: time.Duration(v.idleGracePeriod) * time.Second,
 	}
 
 	var errs []error
@@ -236,6 +257,10 @@ func (f *FlagSet) Resolve() (Config, error) {
 		if timeout.value < MinIdleTimeoutSeconds {
 			errs = append(errs, fmt.Errorf("%s must be at least %d, got %d", timeout.flag, MinIdleTimeoutSeconds, timeout.value))
 		}
+	}
+
+	if v.idleGracePeriod < 0 {
+		errs = append(errs, fmt.Errorf("--idle-grace-period-seconds must not be negative, got %d", v.idleGracePeriod))
 	}
 
 	if len(errs) > 0 {

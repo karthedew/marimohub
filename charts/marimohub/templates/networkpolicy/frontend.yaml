@@ -1,0 +1,41 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "frontend") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "frontend") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The router (an OpenShift Route or the portable profile's Ingress
+    # controller) is the only thing ever allowed to reach the frontend
+    # directly; nothing in-cluster calls it.
+    - from:
+        - namespaceSelector:
+            {{- .Values.network.router.namespaceSelector | toYaml | nindent 12 }}
+          podSelector:
+            {{- .Values.network.router.podSelector | toYaml | nindent 12 }}
+      ports:
+        - port: {{ .Values.frontend.port }}
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    # Server-side data loads to backend-public; the browser's own calls go
+    # through the router's /api path instead of this in-cluster edge.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.app }}
+          podSelector:
+            matchLabels:
+              {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-public") | nindent 14 }}
+      ports:
+        - port: {{ .Values.backendPublic.port }}
+          protocol: TCP

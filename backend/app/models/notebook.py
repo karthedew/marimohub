@@ -91,8 +91,16 @@ class Notebook(Base):
         remote_side="Notebook.id", back_populates="forks"
     )
     forks: Mapped[list["Notebook"]] = relationship(back_populates="parent")
-    deployment: Mapped["Deployment | None"] = relationship(back_populates="notebook", uselist=False)
-    data: Mapped[list["NotebookData"]] = relationship(back_populates="notebook")
+    # `passive_deletes=True` on both: the FK already cascades at the database
+    # level, so the ORM must not try to first null out a loaded Deployment's
+    # `notebook_id` (violating its NOT NULL constraint) or issue a per-row
+    # DELETE for NotebookData before the parent row's own delete/cascade runs.
+    deployment: Mapped["Deployment | None"] = relationship(
+        back_populates="notebook", uselist=False, passive_deletes=True
+    )
+    data: Mapped[list["NotebookData"]] = relationship(
+        back_populates="notebook", passive_deletes=True
+    )
 
 
 class NotebookData(Base):

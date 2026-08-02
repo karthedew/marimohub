@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -7,13 +8,26 @@ if TYPE_CHECKING:
 MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIMENSIONS = 384
 
+# The production image bakes this exact model to a fixed local path at build
+# time (see Containerfile.backend) and points EMBEDDING_MODEL_PATH at it, so
+# a running Pod loads it from disk and never reaches Hugging Face Hub.
+# Leaving the variable unset -- the case for local development -- falls back
+# to MODEL_NAME, which sentence-transformers resolves and caches from the
+# Hub on first use exactly as it always has.
+_MODEL_PATH_ENV_VAR = "EMBEDDING_MODEL_PATH"
+
+
+def _model_source() -> str:
+    """Return the model name or baked local path to load `SentenceTransformer` from."""
+    return os.environ.get(_MODEL_PATH_ENV_VAR, MODEL_NAME)
+
 
 def _load_model() -> "SentenceTransformer":
     # Imported lazily so the heavy sentence-transformers/torch stack is not
     # loaded at process startup, only on first embedding request.
     from sentence_transformers import SentenceTransformer  # noqa: PLC0415
 
-    return SentenceTransformer(MODEL_NAME)
+    return SentenceTransformer(_model_source())
 
 
 def _encode(model: "SentenceTransformer", text: str) -> list[float]:

@@ -1,0 +1,18 @@
+{{- if gt (.Values.backendPublic.replicaCount | int) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+spec:
+  # AlwaysAllow: an unhealthy Pod (failing readiness) should never
+  # itself block a voluntary eviction the way a healthy one legitimately
+  # would.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  minAvailable: {{ .Values.backendPublic.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-public") | nindent 6 }}
+{{- end }}

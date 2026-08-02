@@ -1,0 +1,51 @@
+# Same-host path routing: /api -> backend-public, / -> frontend. OpenShift
+# matches Routes by longest path prefix first regardless of creation order,
+# so the /api Route below always wins over the / Route for API traffic
+# without either needing an explicit priority field. Both terminate
+# re-encrypt: the router decrypts the client's TLS, then re-encrypts to the
+# origin Service's own TLS listener (see frontend.tls/backendPublic.tls),
+# verified against routes.destinationCACertificate -- the cluster's
+# service-ca bundle content, since both origins present
+# service-serving-certificate-issued certificates when
+# openshift.serviceServingCerts.enabled.
+{{- if eq .Values.platform "openshift" }}
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "api") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+spec:
+  host: {{ .Values.routes.host }}
+  path: /api
+  to:
+    kind: Service
+    name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+  port:
+    targetPort: http
+  tls:
+    termination: reencrypt
+    destinationCACertificate: {{ .Values.routes.destinationCACertificate | quote }}
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "frontend") | nindent 4 }}
+spec:
+  host: {{ .Values.routes.host }}
+  path: /
+  to:
+    kind: Service
+    name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "frontend") }}
+  port:
+    targetPort: http
+  tls:
+    termination: reencrypt
+    destinationCACertificate: {{ .Values.routes.destinationCACertificate | quote }}
+    insecureEdgeTerminationPolicy: Redirect
+{{- end }}

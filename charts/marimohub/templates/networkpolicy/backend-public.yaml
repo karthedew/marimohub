@@ -1,0 +1,73 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-public") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "backend-public") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The router's own /api path and the frontend's server-side data loads
+    # are the only two callers.
+    - from:
+        - namespaceSelector:
+            {{- .Values.network.router.namespaceSelector | toYaml | nindent 12 }}
+          podSelector:
+            {{- .Values.network.router.podSelector | toYaml | nindent 12 }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.app }}
+          podSelector:
+            matchLabels:
+              {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "frontend") | nindent 14 }}
+      ports:
+        - port: {{ .Values.backendPublic.port }}
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    # The Runtime Service in every Session/Deployment this backend proxies
+    # to, never a specific Pod selector: the operator, not this policy,
+    # decides which Runtime Pods exist.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.sessions }}
+      ports:
+        - port: {{ include "marimohub.runtimePort" . }}
+          protocol: TCP
+    {{- if .Values.network.database.cidrs }}
+    - to:
+        {{- range .Values.network.database.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.network.database.port }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.network.kubernetesApi.cidrs }}
+    - to:
+        {{- range .Values.network.kubernetesApi.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.network.kubernetesApi.port }}
+          protocol: TCP
+    {{- end }}
+    {{- if .Values.network.externalProxy.cidrs }}
+    - to:
+        {{- range .Values.network.externalProxy.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        {{- toYaml .Values.network.externalProxy.ports | nindent 8 }}
+    {{- end }}

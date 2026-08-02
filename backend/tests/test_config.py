@@ -54,6 +54,22 @@ def test_kube_backend_requires_service_port_in_range() -> None:
         _settings(SESSION_BACKEND=SessionBackend.KUBE, SESSION_SERVICE_PORT=70_000)
 
 
+def test_kube_backend_requires_runtime_image() -> None:
+    # The CRD requires spec.image on every Runtime; an unset image would only
+    # surface as an admission rejection on the first Session otherwise.
+    with pytest.raises(ValidationError, match="SESSION_RUNTIME_IMAGE"):
+        _settings(SESSION_BACKEND=SessionBackend.KUBE)
+
+
+def test_kube_backend_accepts_a_configured_runtime_image() -> None:
+    settings = _settings(
+        SESSION_BACKEND=SessionBackend.KUBE,
+        SESSION_RUNTIME_IMAGE="registry.example/marimo-runtime@sha256:" + "0" * 64,
+    )
+
+    assert settings.SESSION_RUNTIME_IMAGE is not None
+
+
 def test_oidc_provider_slug_must_be_a_dns_label() -> None:
     with pytest.raises(ValidationError, match="DNS label"):
         _settings(OIDC_PROVIDERS=[_oidc_provider("Not A Slug")])
@@ -68,7 +84,6 @@ def test_oidc_provider_slugs_must_be_unique() -> None:
     "override",
     [
         lambda: {"SESSION_READY_TIMEOUT_SECONDS": 0},
-        lambda: {"SESSION_TOKEN_TTL_SECONDS": 0},
         lambda: {"WORKSPACE_ARCHIVE_RETENTION_DAYS": 0},
     ],
 )
@@ -94,3 +109,22 @@ def test_non_google_provider_value_is_kind_colon_slug() -> None:
     provider = _oidc_provider("okta")
 
     assert provider.provider_value == "oidc:okta"
+
+
+def test_gitlab_import_enabled_requires_nonempty_allowlist() -> None:
+    with pytest.raises(ValidationError, match="GITLAB_IMPORT_ALLOWED_HOSTS"):
+        _settings(GITLAB_IMPORT_ENABLED=True, GITLAB_IMPORT_ALLOWED_HOSTS=[])
+
+
+def test_gitlab_import_disabled_never_validates_allowlist() -> None:
+    settings = _settings(GITLAB_IMPORT_ENABLED=False, GITLAB_IMPORT_ALLOWED_HOSTS=[])
+
+    assert settings.GITLAB_IMPORT_ALLOWED_HOSTS == []
+
+
+def test_gitlab_import_enabled_accepts_a_configured_allowlist() -> None:
+    settings = _settings(
+        GITLAB_IMPORT_ENABLED=True, GITLAB_IMPORT_ALLOWED_HOSTS=["gitlab.example.com"]
+    )
+
+    assert settings.GITLAB_IMPORT_ALLOWED_HOSTS == ["gitlab.example.com"]

@@ -1,0 +1,125 @@
+{{- if and .Values.backendInternal.tls.enabled (not .Values.runtime.internalApiCA.secretName) }}
+{{- fail "runtime.internalApiCA.secretName is required when backendInternal.tls.enabled (Runtime Pods must trust the internal API's certificate)" }}
+{{- end }}
+{{- if and .Values.monitoring.tls.enabled (not .Values.monitoring.tls.secretName) }}
+{{- fail "monitoring.tls.enabled requires monitoring.tls.secretName" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}
+  namespace: {{ .Values.namespaces.controller }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "operator") | nindent 4 }}
+spec:
+  replicas: {{ .Values.operator.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.operator.updateStrategy.maxUnavailable }}
+      maxSurge: {{ .Values.operator.updateStrategy.maxSurge }}
+  selector:
+    matchLabels:
+      {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "operator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "operator") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if gt (.Values.operator.replicaCount | int) 1 }}
+      topologySpreadConstraints:
+        {{- if .Values.operator.topologySpreadConstraints }}
+        {{- toYaml .Values.operator.topologySpreadConstraints | nindent 8 }}
+        {{- else }}
+        {{- include "marimohub.defaultTopologySpreadConstraints" (dict "ctx" $ "component" "operator") | nindent 8 }}
+        {{- end }}
+      affinity:
+        {{- include "marimohub.defaultPodAntiAffinity" (dict "ctx" $ "component" "operator") | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: {{ include "marimohub.image" .Values.operator.image }}
+          imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command: ["/manager"]
+          args:
+            - --health-probe-bind-address=:{{ .Values.operator.healthPort }}
+            - --metrics-bind-address=:{{ .Values.operator.metricsPort }}
+            {{- if .Values.operator.leaderElection.enabled }}
+            - --leader-elect
+            {{- end }}
+            - --runtime-namespace={{ .Values.namespaces.sessions }}
+            - --fetcher-image={{ include "marimohub.image" .Values.runtime.fetcherImage }}
+            - --internal-api-url={{ if .Values.backendInternal.tls.enabled }}https{{ else }}http{{ end }}://{{ include "marimohub.componentName" (dict "ctx" $ "component" "backend-internal") }}.{{ .Values.namespaces.app }}.svc:{{ .Values.backendInternal.port }}
+            - --internal-api-ca-secret-name={{ .Values.runtime.internalApiCA.secretName }}
+            - --internal-api-ca-secret-key={{ .Values.runtime.internalApiCA.secretKey }}
+            - --default-resources={{ toJson .Values.runtime.resources }}
+            - --fetcher-resources={{ toJson .Values.runtime.fetcherResources }}
+            - --image-pull-policy={{ .Values.runtime.imagePullPolicy }}
+            {{- if .Values.runtime.serviceAccountName }}
+            - --runtime-service-account={{ .Values.runtime.serviceAccountName }}
+            {{- end }}
+            {{- if .Values.runtime.imagePullSecrets }}
+            - --image-pull-secrets={{ join "," .Values.runtime.imagePullSecrets }}
+            {{- end }}
+            - --idle-timeout-edit-seconds={{ .Values.runtime.idleTimeoutSeconds.edit }}
+            - --idle-timeout-run-seconds={{ .Values.runtime.idleTimeoutSeconds.run }}
+            - --idle-timeout-deploy-seconds={{ .Values.runtime.idleTimeoutSeconds.deploy }}
+            - --idle-grace-period-seconds={{ .Values.runtime.activityGraceSeconds }}
+            {{- if .Values.monitoring.tls.enabled }}
+            - --metrics-cert-dir=/etc/marimohub/metrics-tls
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.operator.healthPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.operator.metricsPort }}
+              protocol: TCP
+          {{- with .Values.operator.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- if .Values.monitoring.tls.enabled }}
+          volumeMounts:
+            - name: metrics-tls
+              mountPath: /etc/marimohub/metrics-tls
+              readOnly: true
+          {{- end }}
+      {{- if .Values.monitoring.tls.enabled }}
+      volumes:
+        - name: metrics-tls
+          secret:
+            secretName: {{ .Values.monitoring.tls.secretName }}
+      {{- end }}
+      terminationGracePeriodSeconds: 10

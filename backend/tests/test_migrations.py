@@ -5,6 +5,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import Deployment, DeploymentDesiredState, Notebook, Workspace
+
 
 @pytest.mark.asyncio
 async def test_workspaces_archive_columns_nullable_with_paired_check(
@@ -163,3 +165,103 @@ async def test_notebook_visibility_enum_labels(db_session: AsyncSession) -> None
         )
     ).all()
     assert {row.enumlabel for row in rows} == {"private", "unlisted", "public"}
+
+
+@pytest.mark.asyncio
+async def test_deployment_desired_state_enum_labels(db_session: AsyncSession) -> None:
+    rows = (
+        await db_session.execute(
+            text(
+                "SELECT e.enumlabel FROM pg_enum e "
+                "JOIN pg_type t ON e.enumtypid = t.oid "
+                "WHERE t.typname = 'deployment_desired_state'"
+            )
+        )
+    ).all()
+    assert {row.enumlabel for row in rows} == {"active", "stopped"}
+
+
+@pytest.mark.asyncio
+async def test_old_deployment_status_column_and_type_are_gone(db_session: AsyncSession) -> None:
+    column = (
+        await db_session.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'deployments' AND column_name = 'status'"
+            )
+        )
+    ).one_or_none()
+    assert column is None
+
+    enum_type = (
+        await db_session.execute(text("SELECT 1 FROM pg_type WHERE typname = 'deployment_status'"))
+    ).one_or_none()
+    assert enum_type is None
+
+
+@pytest.mark.asyncio
+async def test_deployment_snapshot_columns_exist_and_default_to_stopped_zero(
+    db_session: AsyncSession,
+) -> None:
+    workspace = Workspace(slug="migration-snapshot-ws", name="Migration Snapshot")
+    db_session.add(workspace)
+    await db_session.flush()
+    notebook = Notebook(workspace_id=workspace.id, title="Migration Snapshot NB")
+    db_session.add(notebook)
+    await db_session.flush()
+    deployment = Deployment(notebook_id=notebook.id, slug="migration-snapshot-deploy")
+    db_session.add(deployment)
+    await db_session.commit()
+    await db_session.refresh(deployment)
+
+    assert deployment.desired_state is DeploymentDesiredState.STOPPED
+    assert deployment.revision == 0
+    assert deployment.source_snapshot is None
+    assert deployment.source_sha256 is None
+    assert deployment.runtime_image is None
+
+
+@pytest.mark.asyncio
+async def test_active_deployment_requires_snapshot_digest_and_positive_revision(
+    db_session: AsyncSession,
+) -> None:
+    workspace = Workspace(slug="migration-active-ws", name="Migration Active")
+    db_session.add(workspace)
+    await db_session.flush()
+    notebook = Notebook(workspace_id=workspace.id, title="Migration Active NB")
+    db_session.add(notebook)
+    await db_session.flush()
+    deployment = Deployment(
+        notebook_id=notebook.id,
+        slug="migration-active-deploy",
+        desired_state=DeploymentDesiredState.ACTIVE,
+    )
+    db_session.add(deployment)
+
+    with pytest.raises(IntegrityError, match="ck_deployments_active_requires_snapshot"):
+        await db_session.commit()
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_active_deployment_with_full_snapshot_is_accepted(
+    db_session: AsyncSession,
+) -> None:
+    workspace = Workspace(slug="migration-active-ok-ws", name="Migration Active Ok")
+    db_session.add(workspace)
+    await db_session.flush()
+    notebook = Notebook(workspace_id=workspace.id, title="Migration Active Ok NB")
+    db_session.add(notebook)
+    await db_session.flush()
+    deployment = Deployment(
+        notebook_id=notebook.id,
+        slug="migration-active-ok-deploy",
+        desired_state=DeploymentDesiredState.ACTIVE,
+        source_snapshot="",  # an empty notebook is a valid snapshot
+        source_sha256="deadbeef",
+        runtime_image="registry.example/marimo-runtime@sha256:" + "0" * 64,
+        revision=1,
+    )
+    db_session.add(deployment)
+
+    await db_session.commit()  # must not raise

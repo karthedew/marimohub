@@ -152,9 +152,8 @@ async def delete_workspace(
     db: Annotated[AsyncSession, Depends(get_db)],
     manager: Annotated[SessionManager, Depends(get_session_manager)],
 ) -> Response:
-    """Archive a workspace and stop its deployment runtimes."""
-    await workspace_service.archive_workspace(db, manager, ctx.workspace)
-    await db.commit()
+    """Archive a workspace and stop every Runtime it owns."""
+    await workspace_service.archive_workspace(db, manager, ctx.workspace.id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

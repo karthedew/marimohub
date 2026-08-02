@@ -1,0 +1,98 @@
+# OpenShift production profile: STIG-aligned, service-serving certificates,
+# and re-encrypt Routes (added once templates/routes/ exists). Replace the
+# Kubernetes API and database CIDRs with the values your cluster/network
+# team publishes -- this chart cannot discover either portably (see
+# values.yaml's network section for why).
+
+platform: openshift
+
+openshift:
+  serviceServingCerts:
+    enabled: true
+
+ingress:
+  enabled: false
+
+frontend:
+  tls:
+    enabled: true
+    # OpenShift auto-provisions this Secret because
+    # openshift.serviceServingCerts.enabled annotates the Service with it;
+    # the name only has to match, never be created by hand.
+    secretName: marimohub-frontend-tls
+
+backendPublic:
+  existingSecret: marimohub-backend-env
+  tls:
+    enabled: true
+    secretName: marimohub-backend-public-tls
+
+backendInternal:
+  existingSecret: marimohub-backend-env
+  tls:
+    enabled: true
+    secretName: marimohub-backend-internal-tls
+
+# Verified TLS to PostgreSQL is required in this profile (see the Security
+# Baseline): an administrator creates this Secret from the external
+# database's own CA before installing.
+database:
+  tls:
+    enabled: true
+    caSecretName: marimohub-database-ca
+    caSecretKey: ca.crt
+
+# Same service-serving-certificate pattern as frontend/backendPublic/
+# backendInternal above; cluster monitoring can then scrape this Service
+# over TLS the way network.monitoring.enabled below already allows into it.
+monitoring:
+  tls:
+    enabled: true
+    secretName: marimohub-operator-metrics-tls
+  serviceMonitor:
+    enabled: true
+
+# Both left empty for the same reason network.kubernetesApi/database.cidrs
+# below are: neither the public hostname nor the cluster's service-ca bundle
+# content is something this chart can discover or default safely. Set both
+# before a real install -- host to the hostname DNS points at this cluster's
+# router, destinationCACertificate to the contents of the
+# `openshift-service-ca.crt` ConfigMap any namespace already carries
+# (`oc get configmap openshift-service-ca.crt -o jsonpath='{.data.service-ca\.crt}'`).
+routes:
+  host: ""
+  destinationCACertificate: ""
+
+runtime:
+  internalApiCA:
+    # The cluster's own service-ca bundle, mirrored into namespaces.sessions
+    # (OpenShift publishes it cluster-wide as a ConfigMap, not a Secret, in
+    # every namespace as `openshift-service-ca.crt`; an administrator copies
+    # its content into this Secret once per Runtime namespace).
+    secretName: marimohub-internal-api-ca
+    secretKey: service-ca.crt
+
+network:
+  kubernetesApi:
+    # The cluster's API server load balancer endpoint(s), from
+    # `oc get endpoints kubernetes -n default`.
+    cidrs: []
+    port: 6443
+  database:
+    cidrs: []
+    port: 5432
+  router:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openshift-ingress
+    podSelector:
+      matchLabels:
+        ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default
+  monitoring:
+    enabled: true
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: openshift-monitoring
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: prometheus
