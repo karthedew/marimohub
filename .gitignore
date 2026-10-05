@@ -12,3 +12,4 @@ dist/
 build/
 backend/.molab-notebooks/
 .bin/
+.kind/

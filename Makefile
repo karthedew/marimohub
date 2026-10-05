@@ -207,6 +207,8 @@ OPERATOR_DIR := marimohub-operator
 CHARTS_DIR := charts/marimohub
 GENERATED_CRD := $(OPERATOR_DIR)/config/crd/bases/marimohub.io_marimosessions.yaml
 KIND_SMOKE := hack/smoke/kind/run.sh
+KIND_UP := hack/kind/up.sh
+KIND_DOWN := hack/kind/down.sh
 OPENSHIFT_SMOKE := hack/smoke/openshift/run.sh
 # Offline `helm lint`/`helm template` fall back to Kubernetes v1.20.0 without
 # a live cluster to ask, which is below the chart's own kubeVersion floor;
@@ -216,7 +218,7 @@ CHART_PROFILES := values-kind.yaml values-openshift.yaml
 
 .PHONY: bootstrap-tools verify-tools generate verify-generated \
 	operator-check operator-test backend-check frontend-check \
-	images helm-check kind-smoke openshift-smoke verify
+	images helm-check kind-up kind-down kind-smoke openshift-smoke verify
 
 bootstrap-tools:
 	@hack/tools/bootstrap.sh
@@ -297,6 +299,17 @@ helm-check:
 		echo "== RBAC/NetworkPolicy/image/security-context assertions ($$profile) =="; \
 		HELM=.bin/helm python3 hack/chart-tests/verify_chart.py $(CHARTS_DIR) "$(CHARTS_DIR)/$$profile"; \
 	done
+
+# A long-lived local cluster running the real Kubernetes Runtime backend,
+# with Workspace storage mocked by a host directory (MARIMOHUB_NFS_DIR,
+# default /data1/nfs). Rerun kind-up after a code change to rebuild and roll
+# the release; SKIP_BUILD=1 reuses existing images. kind-down keeps the
+# Workspace files; PURGE=1 also drops the database volume and .kind/.
+kind-up:
+	@$(KIND_UP)
+
+kind-down:
+	@$(KIND_DOWN)
 
 kind-smoke:
 	@if [ -x "$(KIND_SMOKE)" ]; then \

@@ -1,5 +1,5 @@
 import { get } from 'svelte/store';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { fakeJwt } from '../../test/fakeJwt';
 
@@ -72,5 +72,33 @@ describe('invalid stored auth removal', () => {
 
 		expect(getAuthToken()).toBe(token);
 		expect(isAuthenticated()).toBe(true);
+	});
+});
+
+describe('a session the browser refuses to store', () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('throws with nothing changed, and leaves every other store updating', async () => {
+		const { auth, getAuthToken, isAuthenticated } = await import('./auth');
+		// The instance `./auth` itself just loaded, whatever resetModules did.
+		const { writable } = await import('svelte/store');
+		vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+			throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+		});
+
+		expect(() => auth.setSession(fakeJwt('user-1'), { username: 'ada' })).toThrow(/quota/);
+		expect(getAuthToken()).toBeNull();
+		expect(isAuthenticated()).toBe(false);
+		expect(get(auth)).toEqual({ token: null, currentUser: null });
+
+		// svelte/store runs subscribers from one queue shared by every store, so
+		// a throw from inside a subscriber would stop all of them updating.
+		const other = writable(0);
+		const seen: number[] = [];
+		other.subscribe((value) => seen.push(value));
+		other.set(1);
+		expect(seen).toEqual([0, 1]);
 	});
 });

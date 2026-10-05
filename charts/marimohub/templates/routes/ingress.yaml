@@ -23,6 +23,10 @@ metadata:
     {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "ingress") | nindent 4 }}
   annotations:
     nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    # Session start and Deployment wake requests block until the Runtime is
+    # ready; see runtime.startTimeoutSeconds.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: {{ include "marimohub.routerTimeoutSeconds" . | quote }}
+    nginx.ingress.kubernetes.io/proxy-send-timeout: {{ include "marimohub.routerTimeoutSeconds" . | quote }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   tls:

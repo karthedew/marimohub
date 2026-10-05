@@ -6,6 +6,13 @@
 # get/list/watch -- list/watch back the metadata-only informer cache the
 # reconciler's Secret mapper uses, and the one place Secret content is ever
 # read is a direct, uncached named get (see checkCredentials).
+#
+# update on marimosessions/finalizers is not finalizer use (the operator sets
+# none). Every Pod and Service it creates carries a controller ownerReference
+# with blockOwnerDeletion=true, and the OwnerReferencesPermissionEnforcement
+# admission plugin, on by default in OpenShift, rejects that field unless the
+# caller may update the owner's finalizers subresource. Custom resources serve
+# no finalizers subresource, so this grant opens no write path of its own.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -29,6 +36,9 @@ rules:
   - apiGroups: ["marimohub.io"]
     resources: ["marimosessions"]
     verbs: ["delete", "get", "list", "watch"]
+  - apiGroups: ["marimohub.io"]
+    resources: ["marimosessions/finalizers"]
+    verbs: ["update"]
   - apiGroups: ["marimohub.io"]
     resources: ["marimosessions/status"]
     verbs: ["get", "patch", "update"]

@@ -258,7 +258,13 @@ def upstream_http_server() -> Iterator[_UpstreamServer]:
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             requests.append(
-                {"method": "GET", "path": self.path, "header": self.headers.get("X-Molab-Test")}
+                {
+                    "method": "GET",
+                    "path": self.path,
+                    "header": self.headers.get("X-Molab-Test"),
+                    "authorization": self.headers.get("Authorization"),
+                    "cookie": self.headers.get("Cookie"),
+                }
             )
             if self.path.startswith("/api/proxy/"):
                 base_path = self.path.split("?", 1)[0].rstrip("/")
@@ -281,6 +287,8 @@ def upstream_http_server() -> Iterator[_UpstreamServer]:
                     "method": method,
                     "path": self.path,
                     "header": self.headers.get("X-Molab-Test"),
+                    "authorization": self.headers.get("Authorization"),
+                    "cookie": self.headers.get("Cookie"),
                     "body": body,
                 }
             )
@@ -341,13 +349,17 @@ async def test_http_proxy_preserves_query_headers_body_and_touches_session(
         access_token=_SPACED_AUTH,
     )
 
+    browser_credentials = {
+        "Cookie": "__Host-marimohub_oidc=login-state; theme=dark",
+        "Authorization": "Bearer marimohub-app-jwt",
+    }
     get_response = await api_client.get(
         f"/api/proxy/{session_id}/nested/path?metric=cpu&value=94.2",
-        headers={"X-Molab-Test": "header-value"},
+        headers={"X-Molab-Test": "header-value", **browser_credentials},
     )
     post_response = await api_client.post(
         f"/api/proxy/{session_id}/submit?source=grafana",
-        headers={"X-Molab-Test": "post-header"},
+        headers={"X-Molab-Test": "post-header", **browser_credentials},
         content=b"payload",
     )
 
@@ -358,20 +370,24 @@ async def test_http_proxy_preserves_query_headers_body_and_touches_session(
     assert post_response.content == b"PAYLOAD"
     assert upstream_http_server.requests[0] == {
         "method": "GET",
-        "path": "/nested/path?metric=cpu&value=94.2&access_token=secret+token",
+        "path": "/nested/path?metric=cpu&value=94.2",
         "header": "header-value",
+        "authorization": f"Bearer {_SPACED_AUTH}",
+        "cookie": None,
     }
     assert upstream_http_server.requests[1] == {
         "method": "POST",
-        "path": "/submit?source=grafana&access_token=secret+token",
+        "path": "/submit?source=grafana",
         "header": "post-header",
+        "authorization": f"Bearer {_SPACED_AUTH}",
+        "cookie": None,
         "body": b"payload",
     }
     assert fake_session_manager.touches == [session_id, session_id]
 
 
 @pytest.mark.asyncio
-async def test_http_proxy_preserves_marimo_auth_redirect_and_cookie_headers(
+async def test_http_proxy_passes_redirects_through_but_never_marimos_cookies(
     api_client: AsyncClient,
     fake_session_manager: FakeSessionManager,
     upstream_http_server: _UpstreamServer,
@@ -396,14 +412,16 @@ async def test_http_proxy_preserves_marimo_auth_redirect_and_cookie_headers(
 
     assert response.status_code == 303
     assert response.headers["Location"] == f"{proxy_base}/"
-    assert response.headers.get_list("Set-Cookie") == [
-        f"marimo_auth=ok; Path={proxy_base}; HttpOnly",
-        f"marimo_theme=dark; Path={proxy_base}",
-    ]
+    # Requests upstream never carry cookies (the gateway authenticates every
+    # one with a bearer header), so a cookie marimo sets could only ever come
+    # back to be dropped; it is dropped on the way out instead.
+    assert response.headers.get_list("Set-Cookie") == []
     assert upstream_http_server.requests[-1] == {
         "method": "GET",
-        "path": f"{proxy_base}/?access_token=secret",
+        "path": f"{proxy_base}/",
         "header": None,
+        "authorization": f"Bearer {_PLAIN_AUTH}",
+        "cookie": None,
     }
     assert fake_session_manager.touches == [session_id]
 
@@ -442,8 +460,10 @@ async def test_http_proxy_forwards_body_for_non_post_methods(
     assert response.content == b"PAYLOAD"
     assert upstream_http_server.requests[0] == {
         "method": method,
-        "path": "/api/packages/install?name=polars&access_token=secret+token",
+        "path": "/api/packages/install?name=polars",
         "header": "header-value",
+        "authorization": f"Bearer {_SPACED_AUTH}",
+        "cookie": None,
         "body": b"payload",
     }
     assert fake_session_manager.touches == [session_id]
@@ -531,6 +551,7 @@ def test_websocket_proxy_relays_frames_and_touches_session(
     session_id = uuid4()
     sent_messages: list[str | bytes] = []
     connected_urls: list[str] = []
+    connected_headers: list[dict[str, str]] = []
 
     fake_session_manager.sessions[session_id] = SessionInfo(
         id=session_id,
@@ -574,8 +595,11 @@ def test_websocket_proxy_relays_frames_and_touches_session(
                 await marimo_proxy.asyncio.sleep(0)
             return self._messages.pop(0)
 
-    def fake_connect(url: str) -> FakeUpstream:
+    def fake_connect(
+        url: str, *, additional_headers: dict[str, str], max_size: int | None
+    ) -> FakeUpstream:
         connected_urls.append(url)
+        connected_headers.append(additional_headers)
         return FakeUpstream()
 
     monkeypatch.setattr(marimo_proxy.websockets, "connect", fake_connect)
@@ -587,7 +611,8 @@ def test_websocket_proxy_relays_frames_and_touches_session(
         websocket.send_text("hello")
         assert websocket.receive_text() == "upstream:hello"
 
-    assert connected_urls == ["ws://127.0.0.1:9000/ws?client=browser&access_token=secret"]
+    assert connected_urls == ["ws://127.0.0.1:9000/ws?client=browser"]
+    assert connected_headers == [{"Authorization": f"Bearer {_PLAIN_AUTH}"}]
     assert sent_messages == ["hello"]
     # One mark_active at connect (the gateway's connect edge) plus one per relayed frame
     # (client->upstream and upstream->client).

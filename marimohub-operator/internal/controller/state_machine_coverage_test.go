@@ -21,8 +21,9 @@ package controller
 //       foreign Pod/Service collisions and Service drift: "corrects Service selector/port drift while preserving the ClusterIP"
 //
 // 3.  Pod passes startup and authenticated readiness -> Ready; lastActivity=now;
-//     no idle evaluation in the same reconcile.
+//     no idle evaluation in the same reconcile; requeue one full idle window out.
 //       TestMarimoSessionController: "becomes Ready once the Pod passes authenticated readiness, and does not idle-evaluate in that same reconcile"
+//       idle timers: "schedules the first idle evaluation on the transition to Ready"
 //
 // 4.  New activity token -> acknowledge in status, lastActivity from the controller clock.
 //       idle timers and the wake protocol: "keeps a Runtime alive when an activity token arrives before the deadline, and never moves lastActivity backwards"
@@ -42,6 +43,7 @@ package controller
 //       makes a Sleeping CR's cleared podName safe against being misread as loss;
 //       see failure classification and recovery: "recreates a Pod lost to infrastructure..."
 //       for the contrasting case where podName is deliberately left set.
+//       Pods that go away outside the workload: "leaves an idle-slept deploy Runtime Sleeping, untouched and with no new Pod, while and after its Pod terminates"
 //
 // 7.  Sleeping deploy + unobserved wake request -> persist Starting, acknowledge,
 //     then create the Pod; crash-safe.
@@ -49,6 +51,9 @@ package controller
 //       idle timers and the wake protocol: "ignores a stale wake-request value that was already observed"
 //       idle timers and the wake protocol: "resumes Pod creation after a crash between persisting Starting and creating the Pod, without requiring the wake annotation again"
 //       idle timers and the wake protocol: "does not immediately re-sleep a deploy Runtime that just woke and is still starting"
+//     A wake whose create hits AlreadyExists (the slept Pod is still
+//     terminating) requeues, and finishes the same attempt once that Pod is gone.
+//       Pods that go away outside the workload: "requeues a wake whose Pod create collides with the slept Pod still terminating, and starts the woken Pod once that one is gone"
 //
 // 8.  Quota rejection -> CapacityAvailable=False/QuotaExceeded, consume the
 //     attempt, retain zero compute, no timed retry; only an unobserved wake
@@ -68,6 +73,18 @@ package controller
 //     unless Sleeping, Failed, quota-blocked, or credentials-invalid.
 //       failure classification and recovery: "recreates a Pod lost to infrastructure with bounded backoff, waiting for NotFound first"
 //       failure classification and recovery: "classifies a node that stops reporting as Unknown and recovers infrastructure rather than failing"
+//     While the lost Pod still exists (deletionTimestamp set, reason Evicted,
+//     or DisruptionTarget=True), its container states are never classified:
+//     Ready goes False/InfrastructureLost and the controller requeues. It
+//     deletes a terminal Pod nothing else deletes, leaves a live one to its
+//     disruptor, and recreates through the missing-Pod path once it is gone.
+//       Pods that go away outside the workload: "waits out a Pod deleted out of band, without failing on its stopped container, then recreates it" (deploy exit 143 and 0, edit exit 143)
+//       Pods that go away outside the workload: "deletes a Pod the kubelet evicted, without failing on its killed container, then recreates it"
+//       Pods that go away outside the workload: "stops routing to a live Pod marked for disruption without deleting it, and serves from it again if the disruption is abandoned"
+//       TestClassifyPodBeingDeletedIsInfrastructureLossWhateverItsContainersReport
+//       TestClassifyPodEvictedIsInfrastructureLoss
+//       TestClassifyPodDisruptionTargetIsInfrastructureLoss
+//       TestClassifyPodAbandonedDisruptionIsClassifiedAsUsual
 //       Structural guards (never reached from the excluded states) are reviewed
 //       directly in reconcileFailedPhase, reconcileSleepingPhase, and
 //       reconcileMissingPod's quota-blocked branch, and exercised by:
@@ -82,6 +99,7 @@ package controller
 //       credential Secret validation: "clears Ready and removes the Pod, in that order, when the Secret is deleted after the Runtime was Ready"
 //       credential Secret validation: "re-asserts CredentialsAvailable=True and a cleared message once a missing Secret is repaired"
 //       credential Secret validation: "keeps a Ready deploy Runtime Sleeping after Secret repair until an unobserved wake request arrives"
+//       Pods that go away outside the workload: "keeps a Session whose credentials were revoked Pending while its Pod terminates, and starts a new Pod only once the Secret is repaired and the old Pod is gone"
 //
 // 12. A previously Ready Pod that loses readiness is cleared from routing
 //     immediately; unhealthy grace then Failed; Unknown/node-loss instead
@@ -95,7 +113,8 @@ package controller
 //
 // Failure Classification table
 // -----------------------------------------------------------------------
-// Pod deleted/node lost/eviction/preemption -> bounded recreate:
+// Pod deleted/node lost/eviction/preemption -> bounded recreate, never a
+// workload failure, even while the Pod still exists and reports its exit:
 //   invariant 10 tests above.
 // source API/network 5xx or timeout -> SourceUnavailable, no Pod recreation:
 //   TestClassifyPodFetcherExitCodes (exit 20); invariant 9 tests above.
@@ -126,6 +145,7 @@ package controller
 // Resource update replacement, idle update without replacement, observedGeneration timing:
 //   failure classification and recovery: "replaces the Pod on a spec.resources change and reports progress through Conditions"
 //   failure classification and recovery: "does not replace the Pod when only idleTimeoutSeconds changes"
+//   Pods that go away outside the workload: "still replaces the Pod for a spec.resources change while the old Pod terminates, without calling that infrastructure loss"
 // Status conflicts:
 //   CR deletion and status write conflicts: "retries a status write through a conflicting concurrent update and lands both changes"
 // Manager restart idempotence:

@@ -25,12 +25,21 @@ from fastapi import FastAPI
 
 from app.api.internal import router as internal_router
 from app.core.errors import register_error_handlers
+from app.services.runtime_credentials import close_runtime_credential_verifier
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """No background services to tear down: every route here is a live cluster/DB read."""
-    yield
+    """Close the credential verifier's Kubernetes client on shutdown.
+
+    Every route here is a live cluster/DB read with no background work; the
+    verifier's aiohttp session and connection pool are the only thing left
+    to release.
+    """
+    try:
+        yield
+    finally:
+        await close_runtime_credential_verifier()
 
 
 app = FastAPI(title="MarimoHub Internal API", lifespan=lifespan)

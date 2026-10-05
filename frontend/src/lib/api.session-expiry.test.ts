@@ -48,6 +48,33 @@ describe('expired session handling', () => {
 		expect(gotoMock).not.toHaveBeenCalled();
 	});
 
+	it('keeps a session that replaced the rejected token while the request was in flight', async () => {
+		auth.setSession(fakeJwt('user-old'));
+		let respond: (response: Response) => void = () => {};
+		const fetcher = vi.fn(() => new Promise<Response>((resolve) => (respond = resolve)));
+
+		const pending = apiWithFetch(fetcher).workspaces.list();
+		// e.g. a provider sign-in finishing while a stale request is still out.
+		auth.setSession(fakeJwt('user-new'));
+		const replacement = getAuthToken();
+		respond(unauthorized());
+
+		await expect(pending).rejects.toMatchObject({ status: 401 });
+		expect(getAuthToken()).toBe(replacement);
+		expect(gotoMock).not.toHaveBeenCalled();
+	});
+
+	it('clears an expired session on the provider sign-in callback without redirecting away from it', async () => {
+		window.history.pushState({}, '', '/auth/callback');
+		auth.setSession(fakeJwt('user-1'));
+
+		const fetcher = vi.fn().mockResolvedValue(unauthorized());
+		await expect(apiWithFetch(fetcher).workspaces.list()).rejects.toMatchObject({ status: 401 });
+
+		expect(getAuthToken()).toBeNull();
+		expect(gotoMock).not.toHaveBeenCalled();
+	});
+
 	it('does not redirect on a 401 from a request that opted out of the centralized handler', async () => {
 		auth.setSession(fakeJwt('user-1'));
 

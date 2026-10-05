@@ -1,10 +1,19 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { ApiError, api } from '$lib/api';
+	import { consumeOidcAttempt, oidcErrorMessage } from '$lib/oidc';
 	import { safeNextPath } from '$lib/safeNextPath';
 	import { auth } from '$lib/stores/auth';
+	import { ArrowRight, LockKeyhole, UserRound } from '@lucide/svelte';
 	import Button from '$lib/components/Button.svelte';
+	import ProviderSignIn from '$lib/components/ProviderSignIn.svelte';
+	import { errorBanner, fieldError, fieldLabel } from '$lib/design/classes';
+	import AuthShell from '$lib/design/components/AuthShell.svelte';
+
+	const authInput =
+		'h-11 w-full rounded-md border border-app-line bg-app-card pl-10 pr-3 text-sm text-app-fg outline-none transition placeholder:text-app-muted focus:border-brand-strong aria-[invalid=true]:border-app-danger';
 
 	type LoginErrors = Partial<Record<'username' | 'password' | 'server', string>>;
 
@@ -12,10 +21,24 @@
 	let password = $state('');
 	let errors = $state<LoginErrors>({});
 	let submitting = $state(false);
+	let recoveredNext = $state<string | null>(null);
+	let providerErrorDismissed = $state(false);
 
-	const nextParam = $derived(page.url.searchParams.get('next'));
+	const nextParam = $derived(page.url.searchParams.get('next') ?? recoveredNext);
 	const nextPath = $derived(safeNextPath(nextParam));
 	const registerHref = $derived(nextParam ? `/auth/register?next=${encodeURIComponent(nextParam)}` : '/auth/register');
+	// A provider sign-in that failed comes back here as `?error=<code>`.
+	const providerError = $derived(providerErrorDismissed ? null : oidcErrorMessage(page.url.searchParams.get('error')));
+
+	// That failed attempt's record is dead either way, so it is cleared here —
+	// and the `next` it started with, which the backend's redirect cannot carry,
+	// is picked back up so signing in another way still lands there.
+	onMount(() => {
+		if (!page.url.searchParams.has('error')) return;
+		const attempt = consumeOidcAttempt();
+		const attemptNext = attempt ? safeNextPath(attempt.next) : '/';
+		if (attemptNext !== '/' && !page.url.searchParams.get('next')) recoveredNext = attemptNext;
+	});
 
 	function validate() {
 		const nextErrors: LoginErrors = {};
@@ -26,6 +49,7 @@
 	}
 
 	async function submit() {
+		providerErrorDismissed = true;
 		if (!validate()) return;
 
 		submitting = true;
@@ -46,65 +70,72 @@
 	<title>Login | MarimoHub</title>
 </svelte:head>
 
-<section class="mx-auto grid max-w-5xl gap-10 lg:grid-cols-[minmax(0,1fr)_26rem] lg:items-center">
-	<div class="space-y-5">
-		<p class="w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
-			Welcome back
-		</p>
-		<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Sign in to your notebooks.</h1>
-		<p class="max-w-xl text-lg leading-8 text-slate-700 dark:text-slate-300">
-			Continue building notebooks, publishing demos, and launching marimo sessions from your workspaces.
-		</p>
-	</div>
+<AuthShell
+	eyebrow="Welcome back"
+	title="Sign in to your notebooks."
+	detail="Continue building notebooks, publishing demos, and launching marimo sessions from your workspaces."
+>
+	{#if providerError}
+		<p class="{errorBanner} mb-5" role="alert">{providerError}</p>
+	{/if}
 
-	<form class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-6 shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20" onsubmit={(event) => { event.preventDefault(); void submit(); }} novalidate>
-		<div class="space-y-5">
-			<div>
-				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="username">Username</label>
+	<ProviderSignIn mode="login" next={nextPath} />
+
+	<form class="grid gap-4" onsubmit={(event) => { event.preventDefault(); void submit(); }} novalidate>
+		{#if errors.server}
+			<p class={errorBanner} role="alert">{errors.server}</p>
+		{/if}
+
+		<div class="grid gap-1.5">
+			<label class={fieldLabel} for="username">Username</label>
+			<span class="relative block">
+				<UserRound size={16} class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-app-muted" />
 				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
+					class={authInput}
 					id="username"
 					name="username"
 					type="text"
 					autocomplete="username"
+					placeholder="your-username"
 					aria-invalid={Boolean(errors.username)}
 					aria-describedby={errors.username ? 'username-error' : undefined}
 					bind:value={username}
 				/>
-				{#if errors.username}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="username-error" role="alert">{errors.username}</p>
-				{/if}
-			</div>
+			</span>
+			{#if errors.username}
+				<p class={fieldError} id="username-error" role="alert">{errors.username}</p>
+			{/if}
+		</div>
 
-			<div>
-				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="password">Password</label>
+		<div class="grid gap-1.5">
+			<label class={fieldLabel} for="password">Password</label>
+			<span class="relative block">
+				<LockKeyhole size={16} class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-app-muted" />
 				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
+					class={authInput}
 					id="password"
 					name="password"
 					type="password"
 					autocomplete="current-password"
+					placeholder="Enter your password"
 					aria-invalid={Boolean(errors.password)}
 					aria-describedby={errors.password ? 'password-error' : undefined}
 					bind:value={password}
 				/>
-				{#if errors.password}
-					<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300" id="password-error" role="alert">{errors.password}</p>
-				{/if}
-			</div>
-
-			{#if errors.server}
-				<p class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{errors.server}</p>
+			</span>
+			{#if errors.password}
+				<p class={fieldError} id="password-error" role="alert">{errors.password}</p>
 			{/if}
-
-			<Button class="w-full" type="submit" disabled={submitting}>
-				{submitting ? 'Signing in...' : 'Sign in'}
-			</Button>
-
-			<p class="text-center text-sm text-slate-600 dark:text-slate-300">
-				New to MarimoHub?
-				<a class="font-bold text-hub-700 hover:text-hub-950 dark:text-hub-300 dark:hover:text-hub-200" href={registerHref}>Create an account</a>
-			</p>
 		</div>
+
+		<Button class="mt-1 w-full" size="lg" type="submit" disabled={submitting}>
+			{submitting ? 'Signing in...' : 'Sign in'}
+			{#if !submitting}<ArrowRight size={16} />{/if}
+		</Button>
 	</form>
-</section>
+
+	<p class="mt-6 text-center text-sm text-app-muted">
+		New to MarimoHub?
+		<a class="font-semibold text-brand-strong hover:underline" href={registerHref}>Create an account</a>
+	</p>
+</AuthShell>

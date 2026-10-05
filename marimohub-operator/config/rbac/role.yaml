@@ -52,6 +52,12 @@ rules:
 - apiGroups:
   - marimohub.io
   resources:
+  - marimosessions/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - marimohub.io
+  resources:
   - marimosessions/status
   verbs:
   - get

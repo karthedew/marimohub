@@ -37,9 +37,10 @@ func (r *MarimoSessionReconciler) effectiveIdleTimeout(cr *v1alpha1.MarimoSessio
 // evaluateActivity acknowledges a new activity token using the controller's
 // own clock -- never a client-supplied timestamp -- and schedules the next
 // reconcile for the exact idle deadline rather than a fixed poll interval.
-// It only ever runs for an already-Ready CR: entering Ready itself resets
-// the clock through a separate write, so a fresh Ready transition and its
-// first idle evaluation are never the same reconcile.
+// It only ever runs for an already-Ready CR: entering Ready resets the clock
+// and schedules the first evaluation one full idle window later (see
+// handlePodReady), so a fresh Ready transition and its first idle
+// evaluation are never the same reconcile.
 func (r *MarimoSessionReconciler) evaluateActivity(ctx context.Context, cr *v1alpha1.MarimoSession) (ctrl.Result, error) {
 	activityToken := cr.Annotations[runtimecontract.AnnotationActivity]
 	if activityToken != "" && activityToken != cr.Status.ObservedActivity {

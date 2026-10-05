@@ -46,6 +46,19 @@ logger = logging.getLogger(__name__)
 # idle-sleep. Currently 15 < 30; keep this invariant if either value changes.
 MARK_ACTIVE_COALESCE_SECONDS = 15.0
 
+# The operator retries a deploy Runtime's quota-rejected start only on a
+# fresh wake request, and nothing retries in the background: a visitor's
+# request is the retry trigger. A burst of visitors to a blocked Deployment
+# still sends this replica's API server at most one wake per window.
+QUOTA_RETRY_COALESCE_SECONDS = 5.0
+
+# Every patch this manager sends is a JSON merge patch of annotations, and
+# it must say so. For a custom-object PATCH, kubernetes_asyncio otherwise
+# picks application/json-patch+json, whose body must be a list of
+# operations, so the API server rejects the object body outright. That
+# silently dropped every activity signal and every Deployment wake request.
+_MERGE_PATCH = "application/merge-patch+json"
+
 
 class _Condition(TypedDict, total=False):
     type: str
@@ -94,6 +107,18 @@ def _condition(cr: _CustomResource, condition_type: str) -> _Condition | None:
     for condition in cr.get("status", {}).get("conditions") or []:
         if condition.get("type") == condition_type:
             return condition
+    return None
+
+
+def _quota_rejection(cr: _CustomResource) -> _Condition | None:
+    """Return the CapacityAvailable condition if a ResourceQuota rejected the last start."""
+    capacity = _condition(cr, contract.CONDITION_CAPACITY_AVAILABLE)
+    if (
+        capacity is not None
+        and capacity.get("status") == "False"
+        and capacity.get("reason") == contract.REASON_QUOTA_EXCEEDED
+    ):
+        return capacity
     return None
 
 
@@ -165,6 +190,12 @@ def _decode_secret_key(secret: client.V1Secret, key: str) -> str | None:
     return base64.b64decode(raw).decode("utf-8") if raw is not None else None
 
 
+def _controlled_by(secret: client.V1Secret, owner_uid: str) -> bool:
+    """Whether `secret`'s controller owner reference names the CR whose UID is `owner_uid`."""
+    references = (secret.metadata.owner_references if secret.metadata else None) or []
+    return any(reference.controller and reference.uid == owner_uid for reference in references)
+
+
 def _serving_name(cr: _CustomResource) -> str | None:
     """Return the CR's Service name if it is currently `Ready` and routable.
 
@@ -183,9 +214,10 @@ def _serving_name(cr: _CustomResource) -> str | None:
 
 
 class _ActivityThrottle:
-    """Bounds per-runtime activity-coalescing state with LRU eviction.
+    """Bounds per-runtime coalescing state with LRU eviction.
 
-    A long-lived replica proxies traffic for many runtimes over its process
+    Coalesces activity signals, and (in a second instance) quota retries. A
+    long-lived replica proxies traffic for many runtimes over its process
     lifetime; without a cap this would grow one entry per runtime ID ever
     seen, long after each runtime stopped existing.
     """
@@ -237,6 +269,8 @@ class _CustomObjectsClient(Protocol):
         plural: str,
         name: str,
         body: Mapping[str, Any],
+        *,
+        _content_type: str,
     ) -> Awaitable[dict[str, Any]]: ...
 
     def delete_namespaced_custom_object(
@@ -297,8 +331,13 @@ class KubeSessionManager:
         self._ready_timeout_seconds = ready_timeout_seconds
         self._delete_timeout_seconds = delete_timeout_seconds
         self._custom_objects_api, self._core_v1_api = clients or (None, None)
+        # Only set when this manager built its own client; `shutdown` closes
+        # exactly that one and never an injected pair, which belongs to the
+        # caller.
+        self._api_client: client.ApiClient | None = None
         self._client_lock = asyncio.Lock()
         self._activity_throttle = _ActivityThrottle()
+        self._quota_retry_throttle = _ActivityThrottle()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "KubeSessionManager":
@@ -325,6 +364,7 @@ class KubeSessionManager:
                 except ConfigException:
                     await kube_config.load_kube_config()
                 api_client = client.ApiClient()
+                self._api_client = api_client
                 self._custom_objects_api = CustomObjectsApi(api_client)
                 self._core_v1_api = CoreV1Api(api_client)
         # The generated `CustomObjectsApi` client accepts a wider parameter
@@ -447,8 +487,24 @@ class KubeSessionManager:
             # is left for an authorized redeploy or administrator to resolve.
             await self._ensure_secret(deployment.id, cr=cr, owner_name=name)
             await self._wake(deployment.id)
-        # Pending/Starting/Failed: an attempt is already in flight or
-        # terminal; `_poll_ready` classifies it without a new mutation here.
+        elif phase != "Failed" and _quota_rejection(cr) is not None:
+            # A ResourceQuota rejected the last start, and the operator tries
+            # again only on a fresh wake request: this visit is the retry.
+            # `_poll_ready` still reports this attempt's capacity error; a
+            # later visit sees how the retry went.
+            await self._retry_quota_rejected_start(deployment.id)
+        # Otherwise Pending/Starting/Failed: an attempt is already in flight
+        # or terminal; `_poll_ready` classifies it without a new mutation.
+
+    async def _retry_quota_rejected_start(self, deployment_id: UUID) -> None:
+        """Wake a quota-blocked deploy Runtime, at most once per coalescing window."""
+        now = asyncio.get_running_loop().time()
+        if not self._quota_retry_throttle.ready(deployment_id, now, QUOTA_RETRY_COALESCE_SECONDS):
+            return
+        # Recorded before the PATCH, so visitors arriving while it is in
+        # flight do not each send one too.
+        self._quota_retry_throttle.record(deployment_id, now)
+        await self._wake(deployment_id)
 
     async def _create_deploy_cr(self, notebook: Notebook, deployment: Deployment) -> None:
         custom, _ = await self._clients()
@@ -503,9 +559,10 @@ class KubeSessionManager:
 
     async def _create_secret(self, session_id: UUID, *, owner_uid: str, owner_name: str) -> None:
         _, core = await self._clients()
+        name = contract.secret_name(str(session_id))
         secret = client.V1Secret(
             metadata=client.V1ObjectMeta(
-                name=contract.secret_name(str(session_id)),
+                name=name,
                 owner_references=[
                     client.V1OwnerReference(
                         api_version=contract.API_VERSION,
@@ -528,7 +585,42 @@ class KubeSessionManager:
             # detect mutation after the fact.
             immutable=True,
         )
-        await core.create_namespaced_secret(self._namespace, secret)
+        try:
+            await core.create_namespaced_secret(self._namespace, secret)
+        except ApiException as exc:
+            if exc.status != HTTPStatus.CONFLICT:
+                raise
+            await self._accept_existing_secret(session_id, owner_uid=owner_uid, cause=exc)
+
+    async def _accept_existing_secret(
+        self, session_id: UUID, *, owner_uid: str, cause: ApiException
+    ) -> None:
+        """Treat a conflicting Secret as created only if this exact CR already controls it.
+
+        A 409 here is the expected outcome of two cold visitors starting the
+        same Deployment at once: both find no Secret, both create one, and the
+        slower create collides with the Secret the faster one just minted for
+        this very CR. Anything else under that name -- a leftover from an
+        earlier CR of the same name (a different UID), or a Secret this
+        backend never created -- is not this Runtime's credential source and
+        is reported instead of reused.
+        """
+        _, core = await self._clients()
+        name = contract.secret_name(str(session_id))
+        try:
+            existing = await core.read_namespaced_secret(name, self._namespace)
+        except ApiException as exc:
+            if exc.status != HTTPStatus.NOT_FOUND:
+                raise
+            raise SessionStartError(
+                f"Runtime Secret {name} conflicted on create and then disappeared before "
+                f"it could be checked against MarimoSession {session_id}"
+            ) from cause
+        if not _controlled_by(existing, owner_uid):
+            raise SessionStartError(
+                f"Runtime Secret {name} already exists but is not controlled by MarimoSession "
+                f"{session_id} (uid {owner_uid}); refusing to use it as that Runtime's credentials"
+            ) from cause
 
     async def _wake(self, deployment_id: UUID) -> None:
         # No secret refresh: RUNTIME_CREDENTIAL never expires and the Secret
@@ -546,6 +638,7 @@ class KubeSessionManager:
                     "annotations": {contract.ANNOTATION_WAKE_REQUEST: secrets.token_urlsafe(24)}
                 }
             },
+            _content_type=_MERGE_PATCH,
         )
 
     async def _poll_ready(self, session_id: UUID) -> SessionInfo:
@@ -554,14 +647,10 @@ class KubeSessionManager:
             cr = await self._get_cr(session_id)
             if cr is None:
                 raise SessionStartError(f"Runtime {session_id} disappeared while starting")
-            capacity = _condition(cr, contract.CONDITION_CAPACITY_AVAILABLE)
-            if (
-                capacity is not None
-                and capacity.get("status") == "False"
-                and capacity.get("reason") == contract.REASON_QUOTA_EXCEEDED
-            ):
+            rejection = _quota_rejection(cr)
+            if rejection is not None:
                 raise SessionCapacityError(
-                    _bounded(capacity.get("message")) or "No capacity available"
+                    _bounded(rejection.get("message")) or "No capacity available"
                 )
             status = cr.get("status", {})
             if status.get("phase") == "Ready" and _observed_current_generation(cr):
@@ -656,6 +745,7 @@ class KubeSessionManager:
                         "annotations": {contract.ANNOTATION_ACTIVITY: secrets.token_urlsafe(16)}
                     }
                 },
+                _content_type=_MERGE_PATCH,
             )
         except Exception:  # noqa: BLE001 -- best-effort activity signal, never fault the caller
             logger.debug("mark_active PATCH failed for session %s", session_id, exc_info=True)
@@ -744,4 +834,19 @@ class KubeSessionManager:
         return refs
 
     async def shutdown(self) -> None:
-        """No-op: session state lives in etcd and survives an API restart."""
+        """Close the Kubernetes API client this manager built for itself, if any.
+
+        Runtimes are left running: their state lives in etcd and survives an
+        API restart. What does not survive is the client's aiohttp session and
+        connection pool, which only an explicit close releases; dropping them
+        logs "Unclosed client session" at exit. Injected clients are left
+        alone. A later call builds a fresh client, which needs its own
+        shutdown.
+        """
+        async with self._client_lock:
+            api_client, self._api_client = self._api_client, None
+            if api_client is not None:
+                self._custom_objects_api = None
+                self._core_v1_api = None
+        if api_client is not None:
+            await api_client.close()

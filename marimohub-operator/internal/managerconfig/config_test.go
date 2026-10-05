@@ -2,12 +2,15 @@ package managerconfig
 
 import (
 	"flag"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"github.com/karthedew/marimohub/marimohub-operator/api/v1alpha1"
 	"github.com/karthedew/marimohub/marimohub-operator/internal/session"
 )
 
@@ -168,5 +171,134 @@ func TestResolveRejectsBelowFloorIdleTimeout(t *testing.T) {
 	_, err := resolve(t, args...)
 	if err == nil || !strings.Contains(err.Error(), "--idle-timeout-run-seconds must be at least 30, got 29") {
 		t.Fatalf("Resolve() error = %v, want floor complaint", err)
+	}
+}
+
+func TestResolveLeavesWorkspaceStorageDisabledWithoutClaim(t *testing.T) {
+	cfg, err := resolve(t, append(validArgs(), "--workspace-supplemental-groups=not-a-number")...)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v; the other storage flags must be ignored without a claim", err)
+	}
+	if cfg.WorkspaceStorage.Enabled() {
+		t.Errorf("WorkspaceStorage = %+v, want disabled", cfg.WorkspaceStorage)
+	}
+}
+
+func TestResolveAcceptsWorkspaceStorage(t *testing.T) {
+	cfg, err := resolve(t, append(validArgs(),
+		"--workspace-claim-name=marimohub-workspaces",
+		"--workspace-supplemental-groups=1000, 2000",
+	)...)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	want := session.WorkspaceStorage{
+		ClaimName:          "marimohub-workspaces",
+		MountPath:          "/work/workspace",
+		SupplementalGroups: []int64{1000, 2000},
+	}
+	if cfg.WorkspaceStorage.ClaimName != want.ClaimName || cfg.WorkspaceStorage.MountPath != want.MountPath ||
+		!slices.Equal(cfg.WorkspaceStorage.SupplementalGroups, want.SupplementalGroups) {
+		t.Errorf("WorkspaceStorage = %+v, want %+v", cfg.WorkspaceStorage, want)
+	}
+}
+
+func TestResolveRejectsInvalidWorkspaceStorage(t *testing.T) {
+	const (
+		claimFlag  = "--workspace-claim-name"
+		mountFlag  = "--workspace-mount-path"
+		groupsFlag = "--workspace-supplemental-groups"
+	)
+	cases := []struct{ flag, value string }{
+		{claimFlag, "Not_A_Name"},
+		{mountFlag, "relative/path"},
+		{mountFlag, "/work/../etc"},
+		{mountFlag, "/work"},
+		{mountFlag, "/home/marimo"},
+		{mountFlag, "/var/run/secrets/marimohub/x"},
+		{groupsFlag, "0"},
+		{groupsFlag, "abc"},
+	}
+	for _, c := range cases {
+		args := append(validArgs(), claimFlag+"=marimohub-workspaces", c.flag+"="+c.value)
+		_, err := resolve(t, args...)
+		if err == nil || !strings.Contains(err.Error(), c.flag) {
+			t.Errorf("%s=%s: Resolve() error = %v, want one naming %s", c.flag, c.value, err, c.flag)
+		}
+	}
+}
+
+func TestResolveSharedVolumesAppliesDefaults(t *testing.T) {
+	cfg, err := resolve(t, append(validArgs(),
+		`--shared-volumes=[{"name":"datasets","claimName":"nfs-datasets"},`+
+			`{"name":"scratch","claimName":"nfs-team","subPath":"team/scratch","mountPath":"/data/scratch",`+
+			`"readOnly":false,"modes":["edit"],"supplementalGroups":[2000]}]`,
+	)...)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	want := []session.SharedVolume{
+		{
+			Name:      "datasets",
+			ClaimName: "nfs-datasets",
+			MountPath: "/mnt/datasets",
+			ReadOnly:  true,
+			Modes:     []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit, v1alpha1.RuntimeModeRun},
+		},
+		{
+			Name:               "scratch",
+			ClaimName:          "nfs-team",
+			SubPath:            "team/scratch",
+			MountPath:          "/data/scratch",
+			ReadOnly:           false,
+			Modes:              []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit},
+			SupplementalGroups: []int64{2000},
+		},
+	}
+	if !reflect.DeepEqual(cfg.SharedVolumes, want) {
+		t.Errorf("SharedVolumes = %+v, want %+v", cfg.SharedVolumes, want)
+	}
+}
+
+func TestResolveSharedVolumesEmptyMeansNone(t *testing.T) {
+	for _, raw := range []string{"", "[]", "  "} {
+		cfg, err := resolve(t, append(validArgs(), "--shared-volumes="+raw)...)
+		if err != nil {
+			t.Fatalf("%q: Resolve() error = %v", raw, err)
+		}
+		if len(cfg.SharedVolumes) != 0 {
+			t.Errorf("%q: SharedVolumes = %+v, want none", raw, cfg.SharedVolumes)
+		}
+	}
+}
+
+func TestResolveRejectsInvalidSharedVolumes(t *testing.T) {
+	const ok = `"name":"datasets","claimName":"nfs-datasets"`
+	cases := map[string]string{
+		"not JSON":                      `{`,
+		"chart key instead of flag key": `[{"name":"datasets","existingClaim":"nfs-datasets"}]`,
+		"bad name":                      `[{"name":"Data_Sets","claimName":"nfs-datasets"}]`,
+		"name too long":                 `[{"name":"` + strings.Repeat("a", 57) + `","claimName":"nfs-datasets"}]`,
+		"duplicate name":                `[{` + ok + `},{` + ok + `,"mountPath":"/mnt/other"}]`,
+		"bad claim":                     `[{"name":"datasets","claimName":"Bad_Claim"}]`,
+		"absolute subPath":              `[{` + ok + `,"subPath":"/etc"}]`,
+		"escaping subPath":              `[{` + ok + `,"subPath":"../other"}]`,
+		"unclean subPath":               `[{` + ok + `,"subPath":"a//b"}]`,
+		"relative mountPath":            `[{` + ok + `,"mountPath":"mnt/datasets"}]`,
+		"reserved mountPath":            `[{` + ok + `,"mountPath":"/work"}]`,
+		"inside the credentials":        `[{` + ok + `,"mountPath":"/var/run/secrets/marimohub/data"}]`,
+		"over the Workspace":            `[{` + ok + `,"mountPath":"/work/workspace/datasets"}]`,
+		"overlapping another share":     `[{` + ok + `},{"name":"inner","claimName":"nfs-inner","mountPath":"/mnt/datasets/inner"}]`,
+		"writable share for deploy":     `[{` + ok + `,"readOnly":false,"modes":["edit","deploy"]}]`,
+		"unknown mode":                  `[{` + ok + `,"modes":["edit","admin"]}]`,
+		"no modes":                      `[{` + ok + `,"modes":[]}]`,
+		"repeated mode":                 `[{` + ok + `,"modes":["edit","edit"]}]`,
+		"bad supplemental group":        `[{` + ok + `,"supplementalGroups":[0]}]`,
+	}
+	for name, raw := range cases {
+		args := append(validArgs(), "--workspace-claim-name=marimohub-workspaces", "--shared-volumes="+raw)
+		if _, err := resolve(t, args...); err == nil || !strings.Contains(err.Error(), "--shared-volumes") {
+			t.Errorf("%s: Resolve() error = %v, want one naming --shared-volumes", name, err)
+		}
 	}
 }

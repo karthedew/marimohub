@@ -4,7 +4,11 @@
 	import { ApiError, api, normalizeTagInput, type NotebookCreateRequest } from '$lib/api';
 	import { getActiveWorkspaceId } from '$lib/stores/activeWorkspace';
 	import { auth } from '$lib/stores/auth';
+	import { FilePlus, FileUp, Link2, LockKeyhole, LogIn } from '@lucide/svelte';
 	import Button from '$lib/components/Button.svelte';
+	import { card, errorBanner, fieldError, fieldHint, fieldLabel, input, textarea } from '$lib/design/classes';
+	import Callout from '$lib/design/components/Callout.svelte';
+	import PageHeader from '$lib/design/components/PageHeader.svelte';
 	import WorkspaceTargetPicker from '$lib/components/WorkspaceTargetPicker.svelte';
 
 	type Tab = 'blank' | 'upload' | 'gitlab';
@@ -33,6 +37,12 @@
 	let submitting = $state(false);
 
 	const isAuthenticated = $derived(Boolean($auth.token));
+
+	const tabs: { id: Tab; label: string; icon: typeof FilePlus }[] = [
+		{ id: 'blank', label: 'Blank', icon: FilePlus },
+		{ id: 'upload', label: 'Upload .py', icon: FileUp },
+		{ id: 'gitlab', label: 'GitLab URL', icon: Link2 }
+	];
 
 	function metadata(baseTitle: string, baseDescription: string, baseTags: string): Omit<NotebookCreateRequest, 'workspace_id'> {
 		return {
@@ -159,106 +169,125 @@
 	<title>Create notebook | MarimoHub</title>
 </svelte:head>
 
-<section class="space-y-8">
-	<div class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-end">
-		<div class="space-y-4">
-			<p class="w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
-				Create
-			</p>
-			<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Start a marimo notebook.</h1>
-			<p class="max-w-2xl text-lg leading-8 text-slate-700 dark:text-slate-300">
-				Every new notebook starts as a Private Notebook in the Workspace you choose below, built from a blank
-				notebook, a local Python file, or a GitLab raw file URL.
-			</p>
+<PageHeader
+	title="Start a marimo notebook."
+	eyebrow="Create"
+	icon={FilePlus}
+	description="Every new notebook starts as a Private Notebook in the Workspace you choose below, built from a blank notebook, a local Python file, or a GitLab raw file URL."
+/>
+
+{#if !isAuthenticated}
+	<Callout class="mb-5 max-w-3xl">
+		<p class="font-semibold">Authentication required</p>
+		<p class="mt-1 text-app-muted">Notebook creation and imports require an account.</p>
+		<div class="mt-3 flex flex-wrap gap-2">
+			<Button intent="primary" size="sm" href="/auth/login"><LogIn size={14} />Sign in</Button>
+			<Button intent="secondary" size="sm" href="/auth/register">Create account</Button>
 		</div>
+	</Callout>
+{/if}
 
-		{#if !isAuthenticated}
-			<div class="rounded-[2rem] border border-hub-200 bg-hub-50 p-5 text-sm leading-6 text-hub-950 shadow-lg shadow-hub-950/5 dark:border-hub-300/20 dark:bg-hub-400/10 dark:text-hub-50">
-				<p class="font-black">Authentication required</p>
-				<p class="mt-2">Notebook creation and imports require an account.</p>
-				<div class="mt-4 flex flex-wrap gap-2">
-					<Button intent="primary" size="sm" href="/auth/login">Sign in</Button>
-					<Button intent="secondary" size="sm" href="/auth/register">Create account</Button>
-				</div>
-			</div>
-		{/if}
-	</div>
-
+<div class="{card} max-w-4xl">
 	{#if isAuthenticated}
-		<div class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-5 shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
+		<div class="border-b border-app-line p-5">
 			<WorkspaceTargetPicker bind:value={workspaceId} id="workspace" />
 		</div>
 	{/if}
 
-	<div class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-4 shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20 sm:p-6">
-		<div class="grid gap-2 rounded-[1.5rem] bg-slate-100 p-2 dark:bg-slate-950/40 sm:grid-cols-3" role="tablist" aria-label="Notebook creation method">
-			<button class="rounded-full px-4 py-3 text-sm font-black transition {activeTab === 'blank' ? 'bg-white text-slate-950 shadow-sm dark:bg-white dark:text-slate-950' : 'text-slate-600 hover:bg-white/60 dark:text-slate-300 dark:hover:bg-white/10'}" type="button" role="tab" aria-selected={activeTab === 'blank'} onclick={() => switchTab('blank')}>Blank</button>
-			<button class="rounded-full px-4 py-3 text-sm font-black transition {activeTab === 'upload' ? 'bg-white text-slate-950 shadow-sm dark:bg-white dark:text-slate-950' : 'text-slate-600 hover:bg-white/60 dark:text-slate-300 dark:hover:bg-white/10'}" type="button" role="tab" aria-selected={activeTab === 'upload'} onclick={() => switchTab('upload')}>Upload .py</button>
-			<button class="rounded-full px-4 py-3 text-sm font-black transition {activeTab === 'gitlab' ? 'bg-white text-slate-950 shadow-sm dark:bg-white dark:text-slate-950' : 'text-slate-600 hover:bg-white/60 dark:text-slate-300 dark:hover:bg-white/10'}" type="button" role="tab" aria-selected={activeTab === 'gitlab'} onclick={() => switchTab('gitlab')}>GitLab URL</button>
-		</div>
+	<div class="flex gap-1 overflow-x-auto border-b border-app-line px-3" role="tablist" aria-label="Notebook creation method">
+		{#each tabs as tab (tab.id)}
+			{@const Icon = tab.icon}
+			<button
+				class={`relative inline-flex shrink-0 items-center gap-2 px-3 py-3 text-sm font-medium transition ${activeTab === tab.id ? 'text-brand-strong' : 'text-app-muted hover:text-app-fg'}`}
+				type="button"
+				role="tab"
+				aria-selected={activeTab === tab.id}
+				onclick={() => switchTab(tab.id)}
+			>
+				<Icon size={15} />{tab.label}
+				{#if activeTab === tab.id}<span class="absolute inset-x-2 bottom-[-1px] h-0.5 bg-brand"></span>{/if}
+			</button>
+		{/each}
+	</div>
 
+	<div class="p-5">
 		{#if errors.server}
-			<p class="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{errors.server}</p>
+			<p class="{errorBanner} mb-5" role="alert">{errors.server}</p>
 		{/if}
 
 		{#if activeTab === 'blank'}
-			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitBlank(); }} novalidate>
-				<div class="grid gap-5 md:grid-cols-2">
-					<div>
-						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="title">Title</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="title" bind:value={title} aria-invalid={Boolean(errors.title)} />
-						{#if errors.title}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.title}</p>{/if}
+			<form class="grid gap-4" onsubmit={(event) => { event.preventDefault(); void submitBlank(); }} novalidate>
+				<div class="grid gap-4 md:grid-cols-2">
+					<div class="grid gap-1.5 content-start">
+						<label class={fieldLabel} for="title">Title</label>
+						<input class={input} id="title" bind:value={title} aria-invalid={Boolean(errors.title)} />
+						{#if errors.title}<p class={fieldError}>{errors.title}</p>{/if}
 					</div>
-					<div>
-						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="tags">Tags</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="tags" bind:value={tags} placeholder="signals, demo" />
+					<div class="grid gap-1.5 content-start">
+						<label class={fieldLabel} for="tags">Tags</label>
+						<input class={input} id="tags" bind:value={tags} placeholder="signals, demo" />
 					</div>
 				</div>
-				<div>
-					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="description">Description</label>
-					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="description" bind:value={description}></textarea>
+				<div class="grid gap-1.5">
+					<label class={fieldLabel} for="description">Description</label>
+					<textarea class={textarea} id="description" bind:value={description}></textarea>
 				</div>
-				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}>{submitting ? 'Creating...' : 'Create blank notebook'}</Button>
+				<div class="flex justify-end border-t border-app-line pt-4">
+					<Button intent="primary" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}><FilePlus size={15} />{submitting ? 'Creating...' : 'Create blank notebook'}</Button>
+				</div>
 			</form>
 		{:else if activeTab === 'upload'}
-			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitUpload(); }} novalidate>
-				<div class="rounded-[1.5rem] border border-dashed border-slate-300 bg-slate-50 p-5 dark:border-white/15 dark:bg-slate-950/30">
-					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="file">Python source file</label>
-					<input class="mt-3 block w-full text-sm font-semibold text-slate-700 file:mr-4 file:rounded-full file:border-0 file:bg-hub-700 file:px-4 file:py-2 file:text-sm file:font-bold file:text-white dark:text-slate-200 dark:file:bg-white dark:file:text-slate-950" id="file" type="file" accept=".py,text/x-python" onchange={selectFile} />
-					<p class="mt-3 text-sm text-slate-600 dark:text-slate-300">The file is read in your browser and sent as notebook source.</p>
-					{#if errors.file}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.file}</p>{/if}
+			<form class="grid gap-4" onsubmit={(event) => { event.preventDefault(); void submitUpload(); }} novalidate>
+				<div class="rounded-lg border border-dashed border-app-line-strong bg-app-bg p-5">
+					<label class={fieldLabel} for="file">Python source file</label>
+					<input
+						class="mt-2 block w-full text-sm text-app-muted file:mr-4 file:h-9 file:cursor-pointer file:rounded-md file:border-0 file:bg-brand file:px-3.5 file:text-sm file:font-semibold file:text-on-brand"
+						id="file"
+						type="file"
+						accept=".py,text/x-python"
+						onchange={selectFile}
+					/>
+					<p class="{fieldHint} mt-2">The file is read in your browser and sent as notebook source.</p>
+					{#if errors.file}<p class="{fieldError} mt-1">{errors.file}</p>{/if}
 				</div>
-				<div class="grid gap-5 md:grid-cols-2">
-					<div>
-						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-title">Title</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-title" bind:value={uploadTitle} placeholder="Defaults to filename" aria-invalid={Boolean(errors.title)} />
-						{#if errors.title}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.title}</p>{/if}
+				<div class="grid gap-4 md:grid-cols-2">
+					<div class="grid gap-1.5 content-start">
+						<label class={fieldLabel} for="upload-title">Title</label>
+						<input class={input} id="upload-title" bind:value={uploadTitle} placeholder="Defaults to filename" aria-invalid={Boolean(errors.title)} />
+						{#if errors.title}<p class={fieldError}>{errors.title}</p>{/if}
 					</div>
-					<div>
-						<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-tags">Tags</label>
-						<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-tags" bind:value={uploadTags} placeholder="analysis, teaching" />
+					<div class="grid gap-1.5 content-start">
+						<label class={fieldLabel} for="upload-tags">Tags</label>
+						<input class={input} id="upload-tags" bind:value={uploadTags} placeholder="analysis, teaching" />
 					</div>
 				</div>
-				<div>
-					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="upload-description">Description</label>
-					<textarea class="mt-2 min-h-28 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="upload-description" bind:value={uploadDescription}></textarea>
+				<div class="grid gap-1.5">
+					<label class={fieldLabel} for="upload-description">Description</label>
+					<textarea class={textarea} id="upload-description" bind:value={uploadDescription}></textarea>
 				</div>
-				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}>{submitting ? 'Uploading...' : 'Create from file'}</Button>
+				<div class="flex justify-end border-t border-app-line pt-4">
+					<Button intent="primary" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}><FileUp size={15} />{submitting ? 'Uploading...' : 'Create from file'}</Button>
+				</div>
 			</form>
 		{:else}
-			<form class="mt-6 grid gap-5" onsubmit={(event) => { event.preventDefault(); void submitGitLab(); }} novalidate>
-				<div>
-					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="gitlab-url">GitLab raw file URL</label>
-					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-url" type="url" bind:value={gitlabUrl} placeholder="https://gitlab.com/.../-/raw/main/notebook.py" aria-invalid={Boolean(errors.url)} />
-					{#if errors.url}<p class="mt-2 text-sm font-semibold text-red-700 dark:text-red-300">{errors.url}</p>{/if}
+			<form class="grid gap-4" onsubmit={(event) => { event.preventDefault(); void submitGitLab(); }} novalidate>
+				<div class="grid gap-1.5">
+					<label class={fieldLabel} for="gitlab-url">GitLab raw file URL</label>
+					<input class="{input} font-mono" id="gitlab-url" type="url" bind:value={gitlabUrl} placeholder="https://gitlab.com/.../-/raw/main/notebook.py" aria-invalid={Boolean(errors.url)} />
+					{#if errors.url}<p class={fieldError}>{errors.url}</p>{/if}
 				</div>
-				<div>
-					<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="gitlab-pat">Personal access token <span class="font-semibold text-slate-500 dark:text-slate-400">optional</span></label>
-					<input class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white" id="gitlab-pat" type="password" autocomplete="off" bind:value={gitlabPat} placeholder="Only needed for private files" />
-					<p class="mt-2 text-sm font-semibold text-slate-600 dark:text-slate-300">The token is sent once to fetch this file and is never stored by MarimoHub.</p>
+				<div class="grid gap-1.5">
+					<label class={fieldLabel} for="gitlab-pat">Personal access token <span class="font-normal">optional</span></label>
+					<span class="relative block">
+						<LockKeyhole size={15} class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-app-muted" />
+						<input class="{input} pl-9" id="gitlab-pat" type="password" autocomplete="off" bind:value={gitlabPat} placeholder="Only needed for private files" />
+					</span>
+					<p class={fieldHint}>The token is sent once to fetch this file and is never stored by MarimoHub.</p>
 				</div>
-				<Button intent="primary" class="w-fit" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}>{submitting ? 'Importing...' : 'Import from GitLab'}</Button>
+				<div class="flex justify-end border-t border-app-line pt-4">
+					<Button intent="primary" type="submit" disabled={submitting || !isAuthenticated || !workspaceId}><Link2 size={15} />{submitting ? 'Importing...' : 'Import from GitLab'}</Button>
+				</div>
 			</form>
 		{/if}
 	</div>
-</section>
+</div>

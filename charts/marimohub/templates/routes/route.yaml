@@ -16,6 +16,10 @@ metadata:
   namespace: {{ .Values.namespaces.app }}
   labels:
     {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "backend-public") | nindent 4 }}
+  annotations:
+    # Session start and Deployment wake requests block until the Runtime is
+    # ready; see runtime.startTimeoutSeconds.
+    haproxy.router.openshift.io/timeout: {{ include "marimohub.routerTimeoutSeconds" . }}s
 spec:
   host: {{ .Values.routes.host }}
   path: /api

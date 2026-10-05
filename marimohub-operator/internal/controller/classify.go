@@ -2,10 +2,12 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/karthedew/marimohub/marimohub-operator/api/v1alpha1"
+	"github.com/karthedew/marimohub/marimohub-operator/internal/session"
 )
 
 // verdictKind is the pure classification of a live Pod's current container
@@ -31,6 +33,12 @@ const (
 	// status at all (Ready condition Unknown), the signature of a lost or
 	// unreachable node rather than a workload problem.
 	verdictNodeUnknown
+	// verdictInfrastructureLost means the Pod is going away for a reason
+	// outside the workload: it is being deleted, or the platform evicted or
+	// otherwise disrupted it. Its container states then only say how it was
+	// stopped (exit 143 on SIGTERM, or a clean 0), never how the workload
+	// behaved, so they are not classified at all.
+	verdictInfrastructureLost
 	// verdictImagePulling means a container is waiting on its image; still
 	// within Kubernetes' own pull backoff, subject to the operator's
 	// configured startup deadline.
@@ -51,22 +59,36 @@ type podVerdict struct {
 // identically for the init and main container.
 const containerReasonOOMKilled = "OOMKilled"
 
+// podReasonEvicted is the Pod status Reason the kubelet sets on a Pod it
+// evicts under node pressure. It leaves that Pod behind in the Failed phase,
+// with no deletionTimestamp, until something deletes it.
+const podReasonEvicted = "Evicted"
+
 // classifyPod inspects a live Pod's init and main container status
 // separately, in that order, since the fetcher and marimo are different
 // workloads whose failures must never be conflated: a fetcher exit code
 // means something entirely different from a marimo exit code, and the main
 // container never even starts until every init container has already
-// succeeded.
+// succeeded. A Pod that is going away is checked before either, because
+// stopping it terminates whichever container is running, and that exit
+// would otherwise read as the workload failing.
 func classifyPod(pod *corev1.Pod) podVerdict {
+	if podGoingAway(pod) {
+		return podVerdict{kind: verdictInfrastructureLost}
+	}
+
 	for _, cs := range pod.Status.InitContainerStatuses {
 		switch {
 		case cs.State.Terminated != nil:
 			t := cs.State.Terminated
 			if t.Reason == containerReasonOOMKilled {
-				return podVerdict{kind: verdictFailed, reason: v1alpha1.ReasonOOMKilled, message: "source-fetcher was OOMKilled"}
+				return podVerdict{kind: verdictFailed, reason: v1alpha1.ReasonOOMKilled, message: cs.Name + " was OOMKilled"}
 			}
 			if t.ExitCode == 0 {
-				continue // fetcher succeeded; evaluate the next container.
+				continue // this init container succeeded; evaluate the next one.
+			}
+			if cs.Name == session.WorkspaceInitContainerName {
+				return classifyWorkspaceInitExit(t.ExitCode, t.Message)
 			}
 			return classifyFetcherExit(t.ExitCode, t.Message)
 		case cs.State.Waiting != nil:
@@ -106,6 +128,22 @@ func classifyPod(pod *corev1.Pod) podVerdict {
 	}
 }
 
+// podGoingAway reports whether pod is being deleted, or was evicted or
+// otherwise disrupted. Kubernetes adds a DisruptionTarget condition before
+// every such disruption: eviction API, preemption, taint-based deletion,
+// Pod garbage collection, and kubelet-initiated termination such as
+// node-pressure eviction or node shutdown. The Evicted reason also covers a
+// kubelet that does not set that condition. A disruption the control plane
+// abandons leaves the condition False, and the Pod then counts as live again.
+func podGoingAway(pod *corev1.Pod) bool {
+	if !pod.DeletionTimestamp.IsZero() || pod.Status.Reason == podReasonEvicted {
+		return true
+	}
+	return slices.ContainsFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool {
+		return c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue
+	})
+}
+
 // classifyWaitingReason distinguishes a container still legitimately
 // waiting on its image (transient, subject to a deadline) from one that
 // will never start no matter how long it waits (a malformed image
@@ -141,6 +179,19 @@ func classifyFetcherExit(exitCode int32, message string) podVerdict {
 		return podVerdict{kind: verdictFailed, reason: v1alpha1.ReasonInvalidSpec, message: "source-fetcher misconfiguration: " + message}
 	}
 	return podVerdict{kind: verdictFailed, reason: v1alpha1.ReasonSourceUnavailable, message: "source fetch failed: " + message}
+}
+
+// classifyWorkspaceInitExit treats any failure to create the Workspace
+// directory as InvalidSpec: the only ways mkdir fails here are a missing
+// workspaces/ directory or one the Runtime group cannot write, both of
+// which are storage provisioning mistakes that retrying will not fix and
+// that have nothing to do with this Runtime's Notebook source.
+func classifyWorkspaceInitExit(exitCode int32, message string) podVerdict {
+	return podVerdict{
+		kind:    verdictFailed,
+		reason:  v1alpha1.ReasonInvalidSpec,
+		message: fmt.Sprintf("workspace directory could not be prepared (exit %d): %s", exitCode, message),
+	}
 }
 
 // readinessVerdict distinguishes a genuinely unreachable node (kubelet not

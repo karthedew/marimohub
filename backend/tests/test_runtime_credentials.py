@@ -1,34 +1,53 @@
+import asyncio
 import base64
+from collections.abc import Generator
 import copy
 import inspect
-from typing import Any
+import time
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
+from kubernetes_asyncio.config.config_exception import ConfigException
 import pytest
+from starlette.concurrency import run_in_threadpool
 
+from app.core.config import Settings, get_settings
 from app.core.errors import Unauthenticated
 from app.services import runtime_contract as contract
 import app.services.runtime_credentials as runtime_credentials_module
 from app.services.runtime_credentials import (
     RuntimeCredentialVerifier,
+    VerificationUnavailableError,
     generate_runtime_credential,
+    get_runtime_credential_verifier,
     parse_runtime_token,
 )
 
 _NAMESPACE = "marimohub-sessions"
 
+ClusterResource = Literal["cr", "secret"]
+
+
+def _injected_failure(failures: dict[ClusterResource, int], resource: ClusterResource) -> None:
+    if resource in failures:
+        raise ApiException(status=failures[resource], reason="Unavailable")
+
 
 class _FakeRuntimeReadClient:
     """Only implements `get_namespaced_custom_object`, matching `_RuntimeReadClient`."""
 
-    def __init__(self, objects: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self, objects: dict[str, dict[str, Any]], failures: dict[ClusterResource, int]
+    ) -> None:
         self.objects = objects
+        self.failures = failures
 
     async def get_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, name: str
     ) -> dict[str, Any]:
+        _injected_failure(self.failures, "cr")
         if name not in self.objects:
             raise ApiException(status=404, reason="NotFound")
         return copy.deepcopy(self.objects[name])
@@ -37,10 +56,14 @@ class _FakeRuntimeReadClient:
 class _FakeSecretReadClient:
     """Only implements `read_namespaced_secret`, matching `_SecretReadClient`."""
 
-    def __init__(self, secrets: dict[str, client.V1Secret]) -> None:
+    def __init__(
+        self, secrets: dict[str, client.V1Secret], failures: dict[ClusterResource, int]
+    ) -> None:
         self.secrets = secrets
+        self.failures = failures
 
     async def read_namespaced_secret(self, name: str, namespace: str) -> client.V1Secret:
+        _injected_failure(self.failures, "secret")
         if name not in self.secrets:
             raise ApiException(status=404, reason="NotFound")
         return self.secrets[name]
@@ -62,12 +85,20 @@ class FakeRuntimeCluster:
     def __init__(self) -> None:
         self.objects: dict[str, dict[str, Any]] = {}
         self.secrets: dict[str, client.V1Secret] = {}
+        self.read_failures: dict[ClusterResource, int] = {}
 
     def verifier(self) -> RuntimeCredentialVerifier:
         return RuntimeCredentialVerifier(
             namespace=_NAMESPACE,
-            clients=(_FakeRuntimeReadClient(self.objects), _FakeSecretReadClient(self.secrets)),
+            clients=(
+                _FakeRuntimeReadClient(self.objects, self.read_failures),
+                _FakeSecretReadClient(self.secrets, self.read_failures),
+            ),
         )
+
+    def fail_reads(self, resource: ClusterResource, status: int) -> None:
+        """Fail every read of `resource` with `status`, as a throttled or sick API server would."""
+        self.read_failures[resource] = status
 
     def mint(
         self,
@@ -350,3 +381,101 @@ def test_runtime_credential_verifier_module_never_lists_creates_patches_or_delet
         assert forbidden not in source, (
             f"unexpected {forbidden!r} call in {runtime_credentials_module.__name__}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["cr", "secret"])
+@pytest.mark.parametrize("api_status", [401, 403, 429, 500, 503])
+async def test_verify_reports_unavailable_when_a_read_fails_other_than_not_found(
+    resource: ClusterResource, api_status: int
+) -> None:
+    """A failed cluster read says nothing about the credential, so it must not be a 401.
+
+    The fetcher gives up on a 401 for good, which fails the Runtime; a 503
+    is retried by curl itself.
+    """
+    cluster = FakeRuntimeCluster()
+    _, credential = cluster.mint()
+    cluster.fail_reads(resource, api_status)
+
+    with pytest.raises(VerificationUnavailableError) as exc_info:
+        await cluster.verifier().verify(credential)
+
+    assert exc_info.value.status == 503
+    assert credential not in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_close_leaves_injected_clients_alone() -> None:
+    cluster = FakeRuntimeCluster()
+    runtime_id, credential = cluster.mint()
+    verifier = cluster.verifier()
+
+    await verifier.close()
+
+    assert (await verifier.verify(credential)).runtime_id == runtime_id
+
+
+def _not_in_a_cluster() -> None:
+    raise ConfigException("Service host/port is not set.")
+
+
+async def _no_kubeconfig_to_load() -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_close_closes_the_api_client_the_verifier_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kube_config = runtime_credentials_module.kube_config
+    monkeypatch.setattr(kube_config, "load_incluster_config", _not_in_a_cluster)
+    monkeypatch.setattr(kube_config, "load_kube_config", _no_kubeconfig_to_load)
+    verifier = RuntimeCredentialVerifier(namespace=_NAMESPACE)
+    await verifier._clients()
+    api_client = verifier._api_client
+    assert api_client is not None
+    http_session = api_client.rest_client.pool_manager
+    assert not http_session.closed
+
+    await verifier.close()
+    await verifier.close()  # nothing left to close; must not fail
+
+    assert http_session.closed
+    assert verifier._api_client is None
+
+
+@pytest.fixture
+def _fresh_process_verifier(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """No process-wide verifier yet; the previous one (if any) is restored afterward."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://molab:molab@localhost:5432/molab_test")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-with-at-least-32-bytes")
+    monkeypatch.setitem(runtime_credentials_module._verifier_state, "instance", None)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_process_verifier")
+async def test_concurrent_first_calls_create_exactly_one_verifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FastAPI resolves this sync dependency in its threadpool, as `run_in_threadpool` does."""
+    real_from_settings = RuntimeCredentialVerifier.from_settings
+    created: list[RuntimeCredentialVerifier] = []
+
+    def _slow_from_settings(settings: Settings) -> RuntimeCredentialVerifier:
+        time.sleep(0.05)  # widens the window between the unlocked check and the store
+        verifier = real_from_settings(settings)
+        created.append(verifier)
+        return verifier
+
+    monkeypatch.setattr(RuntimeCredentialVerifier, "from_settings", _slow_from_settings)
+
+    verifiers = await asyncio.gather(
+        *(run_in_threadpool(get_runtime_credential_verifier) for _ in range(50))
+    )
+
+    assert len(created) == 1
+    assert all(verifier is created[0] for verifier in verifiers)

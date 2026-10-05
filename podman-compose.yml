@@ -46,6 +46,16 @@ services:
       IDLE_TIMEOUT_MINUTES: 10
       MAX_CONCURRENT_SESSIONS: 10
       MARIMO_PORT_RANGE: 9000-9099
+      # Sign-in redirect URIs are built from PUBLIC_API_URL; after an
+      # identity-provider sign-in the browser goes back to the SPA at
+      # PUBLIC_APP_URL. Open the app at http://localhost:5173, not 127.0.0.1.
+      PUBLIC_API_URL: http://localhost:8000
+      PUBLIC_APP_URL: http://localhost:5173
+      # Optional "Sign in with Google" client, read from the gitignored
+      # repo-root .env (see README.md); empty values leave Google sign-in off.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_HOSTED_DOMAIN: ${GOOGLE_HOSTED_DOMAIN:-}
     volumes:
       - ./backend:/app/backend
       - backend-venv:/app/backend/.venv

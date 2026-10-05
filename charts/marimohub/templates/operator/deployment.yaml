@@ -84,6 +84,22 @@ spec:
             - --idle-timeout-run-seconds={{ .Values.runtime.idleTimeoutSeconds.run }}
             - --idle-timeout-deploy-seconds={{ .Values.runtime.idleTimeoutSeconds.deploy }}
             - --idle-grace-period-seconds={{ .Values.runtime.activityGraceSeconds }}
+            {{- if .Values.runtime.sharedVolumes }}
+            - {{ printf "--shared-volumes=%s" (include "marimohub.sharedVolumesJson" .) | quote }}
+            {{- end }}
+            {{- with .Values.runtime.workspaceStorage }}
+            {{- if .existingClaim }}
+            - --workspace-claim-name={{ .existingClaim }}
+            - --workspace-mount-path={{ .mountPath }}
+            {{- if .supplementalGroups }}
+            {{- $groups := list }}
+            {{- range .supplementalGroups }}
+            {{- $groups = append $groups (int64 . | toString) }}
+            {{- end }}
+            - --workspace-supplemental-groups={{ join "," $groups }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.monitoring.tls.enabled }}
             - --metrics-cert-dir=/etc/marimohub/metrics-tls
             {{- end }}

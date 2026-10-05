@@ -62,11 +62,18 @@ spec:
               containerPort: {{ .Values.backendPublic.port }}
               protocol: TCP
           {{- if not .Values.backendPublic.existingSecret }}
-          {{- fail "backendPublic.existingSecret is required (an existing Secret with DATABASE_URL, SECRET_KEY, and any OIDC settings)" }}
+          {{- fail "backendPublic.existingSecret is required (an existing Secret with DATABASE_URL, SECRET_KEY, and PUBLIC_API_URL)" }}
           {{- end }}
           envFrom:
             - secretRef:
                 name: {{ .Values.backendPublic.existingSecret }}
+            {{- /* Identity-provider credentials: loaded here and nowhere else, so
+            backend-internal, the migration Job, and the CronJobs never hold the
+            client secret. Listed last, so its keys win over the shared Secret's. */}}
+            {{- with .Values.backendPublic.oidc.existingSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
           env:
             - name: MARIMOHUB_APP
               value: public
@@ -92,6 +99,8 @@ spec:
               value: {{ include "marimohub.runtimeImage" . }}
             - name: ACTIVITY_SIGNAL_INTERVAL_SECONDS
               value: {{ .Values.runtime.activitySignalIntervalSeconds | quote }}
+            - name: SESSION_READY_TIMEOUT_SECONDS
+              value: {{ .Values.runtime.startTimeoutSeconds | quote }}
             {{- if .Values.database.tls.enabled }}
             - name: DATABASE_CA_FILE
               value: /etc/marimohub/db-ca/{{ .Values.database.tls.caSecretKey }}
@@ -106,6 +115,14 @@ spec:
             - name: GITLAB_IMPORT_ALLOWED_HOSTS
               value: {{ toJson .Values.backendPublic.gitlabImport.allowedHosts | quote }}
             {{- end }}
+            {{- with .Values.backendPublic.publicAppUrl }}
+            - name: PUBLIC_APP_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.backendPublic.oidc.proxyUrl }}
+            - name: OIDC_HTTP_PROXY_URL
+              value: {{ . | quote }}
+            {{- end }}
           {{- with .Values.backendPublic.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -119,6 +136,7 @@ spec:
               {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /api/health
@@ -128,6 +146,11 @@ spec:
               {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 20
+            # Generous on purpose: a liveness restart drops every proxied
+            # notebook connection this replica holds, which is far worse than
+            # a few seconds of slow health responses during a load burst.
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: tmp
               mountPath: /tmp

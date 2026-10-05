@@ -259,6 +259,7 @@ erDiagram
         uuid id PK
         string username UK
         string email UK
+        string display_name "nullable, not unique"
         timestamptz created_at
     }
     identities {
@@ -267,6 +268,7 @@ erDiagram
         string provider "local|google|oidc:slug|saml:slug"
         string subject
         string email "nullable, last-login"
+        boolean email_authoritative "provider vouched for email at last login; default false"
         timestamptz created_at
         timestamptz last_login_at "nullable"
     }
@@ -417,6 +419,7 @@ class User(Base):
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     username: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(255))   # migration 0004; DT-5 person search
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False)
     # password_hash REMOVED → local_credentials
@@ -440,6 +443,8 @@ class Identity(Base):
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     subject: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str | None] = mapped_column(String(255))
+    email_authoritative: Mapped[bool] = mapped_column(          # DT-4 linking policy, rule 4
+        Boolean, nullable=False, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -523,9 +528,13 @@ class Notebook(Base):
   workspace ownership flow above; deleting the user then CASCADEs identities/local credentials and
   SET-NULLs `notebooks.created_by`. Username/email both UNIQUE; email is stored in canonical lowercase
   form for trusted verified-email identity linking. Username is a display handle, not a credential.
-- **Identity** — immutable `(provider, subject)`; `email`/`last_login_at` are mutated on each
-  login by DT-4. A partial unique index permits at most one `local` identity per user. A new trusted
-  provider identity may attach to an existing user only from a normalized, verified email claim.
+  `display_name` (nullable, ≤255, not unique) is the person's own name, shown beside the username:
+  set at registration or from the OIDC `name` claim (DT-4), never a credential.
+- **Identity** — immutable `(provider, subject)`; `email`/`email_authoritative`/`last_login_at` are
+  mutated on each login by DT-4. A partial unique index permits at most one `local` identity per user.
+  A new trusted provider identity may attach to an existing user only from a normalized, verified email
+  claim, and only to an account whose own identities were all vouched for as that email's owner (DT-4
+  "Linking policy").
 - **LocalCredential** — present iff the user can log in with a password; absent for pure-SSO users.
   PK is the FK (`user_id`), enforcing 0..1. `password_hash` format unchanged (bcrypt).
 - **Workspace** — explicitly-created ownership boundary with no personal subtype or implicit default.
@@ -554,7 +563,7 @@ class Notebook(Base):
 
 | schema file | change | owning task |
 |---|---|---|
-| `schemas/user.py` `UserOut` | **no change** — already `id/username/email/created_at` | — |
+| `schemas/user.py` `UserOut` | **no DT-1 change** — already `id/username/email/created_at`; later gains `display_name` | DT-5 (person search) |
 | `schemas/notebook.py` `NotebookOut` | drop `user_id`; add `workspace_id: UUID`, `created_by: UUID \| None`; rename parent-attribution `parent_owner_id/parent_owner_username` → `parent_workspace_id/parent_workspace_slug` (final naming DT-6) | DT-6 |
 | `schemas/notebook.py` `NotebookCreate` / `NotebookImport` | add required `workspace_id: UUID`; fork target is required too | DT-6 |
 | `schemas/notebook.py` `NotebookPublish` | no field change; values now `private/unlisted/public` (enum-driven) | DT-6 |
@@ -967,6 +976,7 @@ class OIDCClaims:
     email: str
     email_verified: bool
     preferred_username: str | None = None
+    name: str | None = None     # `name` claim → users.display_name (see "Explicit contracts")
 
 class DuplicateUserError(Exception):
     """Raised when a username or email is already registered."""
@@ -1054,26 +1064,30 @@ class BasicAuthService(AuthService):
 
 # ── external OIDC (one instance per configured provider) ────────────────────
 class OIDCAuthService(AuthService):
-    def __init__(self, db: AsyncSession, provider: str) -> None:
+    def __init__(self, db: AsyncSession, provider: str, *, trusted_email_linking: bool = False) -> None:
         super().__init__(db)
         self.provider = provider              # 'google' | 'oidc:<slug>' | 'saml:<slug>'
+        self.trusted_email_linking = trusted_email_linking
 
     async def complete_login(self, claims: OIDCClaims) -> User:
         user = await self._resolve_identity(claims.provider, claims.subject)
         if user is not None:
             await self._touch_identity(claims.provider, claims.subject, claims.email)
             return user
-        linked = await self._link_by_verified_email(claims)
-        if linked is not None:
-            return linked
-        return await self._provision(          # JIT: first trusted identity and no matching user
+        existing = await self._user_by_email(claims.email)   # normalized match
+        if existing is not None:
+            if not await self._may_link(existing, claims):    # see "Linking policy" below
+                raise OIDCAccountExistsError                  # → ?error=oidc_account_exists
+            return await self._link_identity(existing, claims)
+        return await self._provision(          # JIT: no account owns this email yet
             username=await self._available_username(claims),
             email=claims.email, provider=claims.provider,
             subject=claims.subject, password_hash=None,
-        )
+        )                                       # a lost first-login race re-resolves the winner
 
     async def _available_username(self, claims: OIDCClaims) -> str:
-        """Seed from preferred_username / email local-part, suffixed until free."""
+        """Seed from preferred_username, else the name claim, else a random handle; suffix until free.
+        Never from the email (see "JIT usernames")."""
 ```
 
 **Local `subject` = `str(user.id)` (resolves the inherited DT-1 constraint).** The live path mints
@@ -1088,17 +1102,114 @@ re-resolution find the row. No other local subject scheme (username/email) is us
 ##### OIDC HTTP flow + verification seam (`api/auth.py`)
 
 `OIDCAuthService` consumes **already-verified** `OIDCClaims`, never a raw token — token verification
-(discovery, JWKS, signature, `iss`/`aud`/`exp`) is an isolated adapter (`authlib`) so provisioning
-stays unit-testable without a network. Two new endpoints per provider:
+(discovery, PKCE token exchange, JWKS, signature and claims) is an isolated adapter
+(`services/oidc_verifier.py`, authlib + joserfc) so provisioning stays unit-testable without a
+network. The flow is a browser redirect round trip that ends in a **handoff**, so the bearer JWT
+never appears in a URL, a log line or browser history (RFC 6750 §5.3; RFC 9700 §2.1):
 
-- `GET /api/auth/oidc/{provider}/login` → 307 redirect to the IdP authorize URL (state/nonce set).
-- `GET /api/auth/oidc/{provider}/callback?code=…&state=…` → adapter exchanges code, verifies the
-  id-token → `OIDCClaims` → `OIDCAuthService(db, provider).complete_login(claims)` →
-  `create_access_token(user.id)` → return `Token` (same shape as `/login`).
+1. **SPA, before leaving.** Generates a PKCE `verifier` (base64url of 32 random bytes), stores
+   `{provider, verifier, next, created_at}` under sessionStorage key `marimohub-oidc`, and does a
+   full-page navigation to `GET /api/auth/oidc/{slug}/login?challenge=base64url(SHA-256(verifier))`.
+2. **`GET /api/auth/oidc/{slug}/login`.** Unknown slug → 404 JSON. A missing or malformed
+   `challenge` (not exactly 43 `[A-Za-z0-9_-]`) → 303 to `{PUBLIC_APP_URL}/auth/login?error=oidc_invalid_request`
+   with no cookie; an unreachable provider, or one whose discovery document has an endpoint that
+   is not a parseable http(s) URL with a host → the same with `oidc_failed`. Otherwise a 303 to the IdP
+   authorize URL (`response_type=code`, scopes, `state`, `nonce`, the backend's **own** S256
+   `code_challenge` with `code_challenge_method=S256` always explicit, `prompt` when configured —
+   `select_account` by default for Google — and `hd` when `hosted_domain` is set) plus **one**
+   login cookie: a token signed with a `SECRET_KEY`-derived key carrying `{provider slug, state,
+   nonce, backend PKCE verifier, SPA challenge}`, expiring in 10 minutes. It is `HttpOnly`,
+   `SameSite=Lax` (the IdP returns by top-level GET), named `__Host-marimohub_oidc` with `Secure`
+   and `Path=/` when `PUBLIC_API_URL` is https, else `marimohub_oidc` with `Path=/api/auth/oidc/`.
+3. **`GET /api/auth/oidc/{slug}/callback`** (`code`, `state`, `iss`, `error`, `error_description`,
+   all optional). Always answers **303** with `Referrer-Policy: no-referrer` and
+   `Cache-Control: no-store`, and always deletes the login cookie (so `state` and `nonce` are
+   single-use). Success lands on `{PUBLIC_APP_URL}/auth/callback#handoff=H`; anything else on
+   `{PUBLIC_APP_URL}/auth/login?error=CODE`:
 
-`get_auth_service` (local) is unchanged; add `get_oidc_auth_service(provider)` + a small
-`get_oidc_verifier(provider)` DI. OIDC provider config (issuer, client id/secret, redirect URI) is a
-DT-12 concern; DT-4 only names it.
+   | `CODE` | when |
+   |---|---|
+   | `oidc_expired` | missing, invalid or expired login cookie; `state` mismatch (constant-time); the callback's slug is not the one the login started with (mix-up defense). Checked first, so even IdP error responses need the matching `state`. |
+   | `oidc_denied` | the IdP returned `error=access_denied` (the user cancelled). |
+   | `oidc_failed` | any other IdP `error`; no `code`; discovery, token exchange or id_token verification failed (including an RFC 9207 `iss` mismatch); the provider was removed since login; any unexpected server error. |
+   | `oidc_account_exists` | the email belongs to an account this identity may not be linked to. |
+   | `oidc_domain_not_allowed` | `hosted_domain` is set and the id_token's `hd` claim is not it. |
+   | `oidc_invalid_request` | (login only) bad `challenge`. |
+
+   The handoff `H` is a 60-second token bound to the user id and the SPA's challenge, signed with
+   its own `SECRET_KEY`-derived key. Both it and the login cookie are checked with 5 s of clock-skew
+   leeway (`PURPOSE_TOKEN_CLOCK_LEEWAY`), so a token one replica mints verifies on another whose
+   clock runs slightly behind instead of being "issued in the future".
+4. **`POST /api/auth/oidc/exchange`** `{"handoff": H, "verifier": V}` → 200
+   `{"access_token", "token_type": "bearer", "user": UserOut}` (the user record, so the SPA can show
+   who signed in), or 401 `{"detail"}` when `H` is invalid or expired or
+   `base64url(SHA-256(V))` is not its challenge (constant-time); a value with no UTF-8 encoding (a
+   lone surrogate, which JSON can carry) is just another invalid one. `H` is stateless and not
+   single-use: what makes it useless to anyone else is the verifier, which never left the tab that
+   started the login (the SPA deletes it from sessionStorage before exchanging), so a handoff
+   lifted from history or a log is inert, and login CSRF cannot plant one.
+
+`GET /api/auth/providers` → `[{"slug", "display_name", "kind"}]` (never issuer, client id or secret;
+`[]` when none are configured) drives the provider buttons on the SPA's login and register pages.
+
+**Verifier contract (`OIDCVerifier`).**
+- Discovery is `issuer.rstrip("/") + "/.well-known/openid-configuration"` and its `issuer` must
+  equal the configured issuer exactly (OpenID Connect Discovery §4.3). Issuers are compared as
+  plain strings everywhere, so `Settings` keeps them byte-for-byte as configured.
+- Discovery and JWKS are fetched with a plain httpx client that never carries the IdP's access
+  token; only the token exchange uses authlib's OAuth client (`client_secret_basic`, or
+  `client_secret_post` when discovery offers only that). Every client is closed after use, all
+  calls have a 10 s timeout and use `OIDC_HTTP_PROXY_URL` when set — never the process-wide
+  `HTTP(S)_PROXY`, which would also capture in-cluster Runtime traffic.
+- RFC 9207: an `iss` callback parameter must equal the issuer; when discovery advertises
+  `authorization_response_iss_parameter_supported` (Google does) it is also required. The check
+  runs before the code is redeemed.
+- id_token (OpenID Connect Core §3.1.3.7): RS256 only (`HS256`/`none` refused); essential `iss`,
+  `sub`, `aud`, `exp`, `iat`, `nonce`; 60 s clock-skew leeway; `iss` is the configured issuer, or
+  also `accounts.google.com` for kind `google`; `aud` exactly the client id (a string or a
+  one-element list); `azp`, when present, the client id; `nonce` matches (constant-time);
+  `sub` and `email` at most 255 characters and the email non-empty (both are stored).
+  `email_verified` counts only as JSON `true`; `hd` is exposed as `OIDCClaims.hosted_domain` and
+  enforced against `hosted_domain`. `name`, trimmed, becomes `OIDCClaims.name`; one that is not a
+  string, blank, or over 255 characters is dropped (`None`), never a reason to fail the sign-in.
+- Process-local caches: discovery for 1 h; a key set for its `Cache-Control: max-age` clamped to
+  5 min…24 h. A token whose `kid` is not in the cached set triggers exactly one refetch (key
+  rotation). Every httpx, authlib (`OAuthError`, …), `KeyError` and joserfc (`JoseError`) failure
+  surfaces as one `OIDCProviderError`; a domain mismatch as `OIDCDomainNotAllowedError`.
+
+Dependencies: `get_auth_service` (local) is unchanged; routes read `Settings` through
+`Depends(get_settings)`, and `get_oidc_http_options` (proxy, transport, cache) is the one seam tests
+override to put a fake identity provider behind the real verifier. Provider configuration is
+DT-12's (`OIDC_PROVIDERS`, the `GOOGLE_*` shortcut, `PUBLIC_APP_URL`, `OIDC_HTTP_PROXY_URL`).
+
+##### Linking policy
+
+`trusted_email_linking` stays **false by default**. On an identity miss, when an account already
+owns the (normalized) email, the new identity is linked to it only if all of:
+
+1. the provider is configured with `trusted_email_linking: true`;
+2. the provider is authoritative for that email *now*: for kind `google`, `email_verified` is true
+   **and** the address ends in `@gmail.com` or the token carries an `hd` claim (Google vouches for
+   nothing else — a verified third-party address may have changed hands); for other kinds,
+   `email_verified` is true;
+3. the account has **no local password**. Local sign-up never verifies email, so anyone could
+   pre-register a victim's address with a password and keep that access after the victim's
+   identity was linked in (pre-account hijacking);
+4. **every identity already on the account was vouched for** as this email's owner at its latest
+   sign-in. JIT provisioning still accepts an email no provider vouches for (unverified, or a Google
+   account holding a third-party address), so an attacker can claim a victim's address first through
+   such a sign-in; without this rule the victim's later, trusted identity would be linked into the
+   attacker's account, which the attacker keeps signing in to. `identities.email_authoritative`
+   records rule 2's verdict for each identity: set when it is provisioned or linked, refreshed with
+   `email` on every sign-in, never true for a `local` identity (rows from before the column start
+   false), and it only counts while that identity's `email` is the account's;
+5. the account has **no identity from the same provider** yet. A second account at that provider
+   asserting the same address (a Google consumer account and a Workspace account can share one; a
+   recycled address belongs to a new account) need not be the same person.
+
+Otherwise `complete_login` raises `OIDCAccountExistsError` (`?error=oidc_account_exists`) rather
+than provisioning a second account that could never own that email. Linking an IdP to an existing
+password account is left to an explicit, signed-in "connect provider" action (not built yet).
 
 ##### SAML decision
 
@@ -1118,24 +1229,57 @@ SAML/XML code enters `backend/`. This keeps one protocol adapter (`authlib` OIDC
 - **Local login is verify-only.** `authenticate` never provisions; an unknown username and an
   SSO-only user (no `local_credentials`) are indistinguishable (both → `None` → 401), so identity
   existence never leaks via login.
-- **OIDC login is resolve-link-or-JIT.** Existing `(provider, subject)` wins. On a miss, a configured
-  trusted provider with `email_verified=true` may attach the identity to the user whose canonical
-  email matches. Untrusted/unverified claims never link; absent a safe match, JIT provisions a user.
-  The identity insert and any new user commit atomically; uniqueness constraints are race backstops.
-- **Identity mutability.** `(provider, subject)` is immutable; `email`/`last_login_at` are updated on
-  every successful login (`_touch_identity`), per DT-1.
+- **OIDC login is resolve-link-or-JIT.** Existing `(provider, subject)` wins. On a miss, an account
+  that already owns the email gets the identity linked only under the linking policy above;
+  otherwise the login fails with `OIDCAccountExistsError`. With no such account, JIT provisions a
+  user. The identity insert and any new user commit atomically; uniqueness constraints are race
+  backstops, and a first-login race lost to the same identity resolves to the winner's account.
+- **Identity mutability.** `(provider, subject)` is immutable; `email`/`email_authoritative`/
+  `last_login_at` are updated on every successful login (`_touch_identity`), per DT-1.
+- **Display name.** Local registration takes an optional `display_name` (trimmed; blank means none;
+  over 255 characters is a 422). A JIT-provisioned OIDC account takes it from `OIDCClaims.name`. Any
+  later OIDC sign-in, resolve or link, fills it only while the account has none, with an
+  `UPDATE … WHERE display_name IS NULL`, so a name is never overwritten, even by a concurrent
+  sign-in. A local login never touches it. A Display Name never holds a control character, line or
+  paragraph separator, or invisible formatting character such as a zero-width space or a bidi
+  override (`services/identity_text.check_display_name`; only the zero-width joiner and non-joiner
+  are allowed, which Persian and Indic names and emoji need). Registration refuses such a name with
+  a 422. The OIDC verifier drops such a `name` claim instead, and also one containing `@`: some
+  providers send the email address as the name, and the person search shows Display Names.
+- **Usernames.** Registration refuses (422) a username that could pass for another in the person
+  search (`check_username`): any character `str.isprintable` refuses (controls, NUL, invisible
+  formatting, separators other than the ASCII space), the other default-ignorable characters
+  (Hangul fillers, the combining grapheme joiner, variation selectors), a space at either end, and
+  anything NFKC would change (full-width letters, ligatures, separately composed accents). It
+  refuses rather than normalizes, so a username always signs in exactly as it was typed. Login
+  checks none of this, so older accounts still sign in; it only turns NUL, which PostgreSQL cannot
+  hold, into a 422 instead of a failed query. The registration email gets the same 422 for any
+  control character.
+- **JIT usernames.** A JIT-provisioned OIDC username is never derived from the email. The person
+  search shows a username beside a hint holding the email's domain, so a username equal to the local
+  part, as Google accounts used to get (Google sends no `preferred_username`), spelled out the
+  whole address. The seed is `preferred_username` unless it contains `@`, else the `name` claim,
+  each with accents folded to ASCII and turned into a DNS label; a seed with no ASCII letter or
+  digit is skipped, and with no seed left the account gets `user-<8 hex>`. Collisions are suffixed
+  `-2`, `-3`, …. Existing accounts keep their usernames.
 - **Session boundary unchanged.** The JWT still carries `sub = user.id`; nothing provider-specific
-  enters the token. `create_access_token`/`decode_token`/`hash_password`/`verify_password` are byte
-  identical to today — `core/security.py` is read-only for this task.
+  enters the token, and `create_access_token`/`hash_password`/`verify_password` are unchanged.
+  The OIDC flow adds non-bearer signed tokens (the login cookie, the handoff) via
+  `create_purpose_token`: each purpose signs with its own key, HMAC-SHA256(`SECRET_KEY`,
+  `"marimohub/oidc-login-cookie"` or `"marimohub/oidc-handoff"`), and carries `typ` = that purpose.
+  `decode_token` therefore can never accept one as a bearer token: it verifies with `SECRET_KEY`
+  itself, requires `exp` and `sub`, and refuses any token carrying a `typ` claim.
 
 ##### Impact on adjacent modules
 
 | File | Change |
 |---|---|
-| `core/security.py` | **none** — JWT + bcrypt helpers untouched (the explicit seam guarantee). |
+| `core/security.py` | access-token and bcrypt helpers unchanged; **adds** per-purpose signed tokens (`TokenPurpose`, `create_purpose_token`, `decode_purpose_token`), `pkce_s256_challenge` and `constant_time_equals`; `decode_token` additionally refuses `typ`-carrying tokens and requires `exp`/`sub`. |
 | `api/deps.py` | **none** — `get_current_user_optional` still `decode_token → db.get(User, id)`; `User` keeps `id`, so it resolves unchanged. |
-| `api/auth.py` | `get_auth_service`/`/register`/`/login`/`/logout` bodies unchanged in shape; **add** `get_oidc_auth_service`, `get_oidc_verifier`, and the two `/oidc/{provider}/…` routes. |
-| `schemas/auth.py` | **none** — `UserCreate`/`LoginRequest`/`Token` shapes unchanged. |
+| `api/auth.py` | `get_auth_service`/`/register`/`/login`/`/logout` bodies unchanged in shape; **adds** `GET /providers`, `GET /oidc/{slug}/login`, `GET /oidc/{slug}/callback`, `POST /oidc/exchange` and the `get_oidc_http_options` dependency. |
+| `services/oidc_verifier.py` | **new** — `OIDCVerifier` (discovery, PKCE exchange, id_token verification, TTL caches). |
+| `schemas/auth.py` | `Token` unchanged; `LoginRequest` only refuses NUL; `UserCreate` later gains optional `display_name` (DT-5 person search) and checks username, email and Display Name text ("Usernames", "Display name"); **adds** `OIDCProviderOut`, `OIDCCallbackParams`, `OIDCExchangeRequest`, `OIDCExchangeOut` (`Token` + `user: UserOut`). |
+| `services/identity_text.py` | **new** (with DT-5 person search) — `check_username`, `check_display_name`, `has_control_character`: the character rules registration, the OIDC verifier and the person search share. |
 | `services/auth_service.py` | rewritten per above (kernel + two providers). |
 
 ##### Deletions (by symbol)
@@ -1158,20 +1302,24 @@ flowchart TD
         AV -->|yes| TOK
     end
     subgraph oidc [external OIDC / SAML-via-broker]
-        OL[GET /oidc/:provider/login] -->|307| IdP[(IdP / Dex broker)]
-        IdP --> CB[GET /oidc/:provider/callback]
-        CB --> VER[OIDC verifier adapter<br/>authlib: JWKS, iss/aud/exp]
+        OL[GET /oidc/:slug/login?challenge] -->|303 + signed login cookie| IdP[(IdP / Dex broker)]
+        IdP --> CB[GET /oidc/:slug/callback<br/>cookie + state + slug checks]
+        CB --> VER[OIDCVerifier<br/>RFC 9207 iss, PKCE exchange,<br/>JWKS, iss/aud/azp/exp/nonce]
         VER -->|OIDCClaims| CL[OIDCAuthService.complete_login]
         CL --> RES[_resolve_identity<br/>provider, subject]
-        RES -->|hit| TOUCH[_touch_identity] --> TOK
-        RES -->|miss + trusted verified email match| LINK[attach identity to existing user] --> TOK
-        RES -->|miss + no safe match| PROV
+        RES -->|hit| TOUCH[_touch_identity] --> HO
+        RES -->|miss, email owned, linking policy holds| LINK[attach identity to existing user] --> HO
+        RES -->|miss, email owned, policy fails| AE[303 ?error=oidc_account_exists]
+        RES -->|miss, email free| PROV
+        HO[303 SPA /auth/callback#handoff] --> EX[POST /oidc/exchange<br/>handoff + PKCE verifier]
+        EX --> TOK
     end
     RS --> PROV[_provision<br/>atomic tx]
     PROV --> DB[(user + identity<br/>+ local_credentials?)]
-    PROV --> TOK
+    PROV -->|local| TOK
+    PROV -->|OIDC| HO
     TOUCH --> TOK[create_access_token user.id<br/>HS256 sub=user.id]
-    TOK --> CLIENT[Token]
+    TOK --> CLIENT[Token, + user for OIDC]
     CLIENT -.later Bearer.-> GCU[deps.get_current_user<br/>decode_token → db.get User<br/>UNCHANGED]
 ```
 
@@ -1185,12 +1333,18 @@ flowchart TD
   writes it as a separate optional row (present iff `password_hash is not None`).
 - **Verify the raw OIDC id-token inside `OIDCAuthService`.** Rejected: couples provisioning to network
   I/O and JWKS state; the verifier adapter yields `OIDCClaims` so the service is pure DB + testable.
+- **Return the bearer token from the callback (JSON, or in the redirect's fragment).** Rejected: the
+  callback is a top-level navigation on the API's URL, which the SPA never sees as JSON (another
+  origin in compose; `/api` routes past the SPA in kind), and a JWT in a URL leaks into history and
+  logs. The verifier-bound handoff is useless without the originating tab's PKCE verifier.
+- **Store the login state in the database / server-side session.** Rejected: the signed,
+  path-scoped login cookie needs no table, no sweeper and no shared state between replicas.
 
 ##### Open questions
 
-- **Trusted-provider configuration.** DT-12 must identify which configured OIDC providers may link
-  by verified email. Email normalization is lowercase + surrounding-whitespace removal; provider
-  alias-specific transformations are intentionally not applied.
+- **Trusted-provider configuration.** Decided: `trusted_email_linking` per provider, default false,
+  under the linking policy above. Email normalization is lowercase + surrounding-whitespace removal;
+  provider alias-specific transformations (dots, `+tags`) are intentionally not applied.
 - **Multiple identities per user (account linking UI).** The model supports N identities per user,
   but DT-4 provides no "link another provider to my account" endpoint (only resolve/JIT). Flagged if
   linking is in scope for the workspace/settings surface (relates to DT-5).
@@ -1231,6 +1385,7 @@ no anonymous or public read of a workspace object (a workspace's only read gate 
 | DELETE | `/api/workspaces/{workspace_id}` | Archive workspace and contained resources | `owner` | active → archived | 204 |
 | POST | `/api/workspaces/{workspace_id}/restore` | Restore before purge deadline | archived `owner` | archived → active | 200 `WorkspaceOut` |
 | GET | `/api/workspaces/{workspace_id}/members` | List members | member (`viewer`) | — | 200 `list[WorkspaceMemberOut]` |
+| GET | `/api/workspaces/{workspace_id}/member-candidates?q=` | Person search: find people to add (see below) | `owner` | active only | 200 `list[MemberCandidateOut]` |
 | POST | `/api/workspaces/{workspace_id}/members` | Add a member by `user_id` | `owner` | reject (409) | 201 `WorkspaceMemberOut` |
 | PATCH | `/api/workspaces/{workspace_id}/members/{user_id}` | Change a member's role | `owner` | reject (409) | 200 `WorkspaceMemberOut` |
 | DELETE | `/api/workspaces/{workspace_id}/members/{user_id}` | Remove a member | `owner` | reject (409) | 204 |
@@ -1284,10 +1439,17 @@ class WorkspaceMemberOut(BaseModel):
     workspace_id: UUID
     user_id: UUID
     username: str                           # joined from users for a usable member list
-    email: str
+    display_name: str | None                # joined too; shown beside the username
+    email: str                              # full only on the caller's own row, else "k•••@domain"
     role: WorkspaceRole
     created_at: datetime
     model_config = ConfigDict(from_attributes=True)
+
+class MemberCandidateOut(BaseModel):        # person search result (see "Person search")
+    user_id: UUID
+    username: str
+    display_name: str | None
+    email_hint: str                         # full only for an exact email search, else "k•••@domain"
 ```
 
 `role` on `WorkspaceOut` is the *caller's* authority, not a property of the workspace, so it is
@@ -1326,8 +1488,8 @@ WorkspaceMemberDep = Annotated[WorkspaceContext, Depends(require_workspace(Works
 WorkspaceOwnerDep  = Annotated[WorkspaceContext, Depends(require_workspace(WorkspaceRole.OWNER))]
 ```
 
-`WorkspaceMemberDep` fronts the two read endpoints; `WorkspaceOwnerDep` fronts rename, delete, and
-all three member-management endpoints. Create/list take no `{workspace_id}` and depend on
+`WorkspaceMemberDep` fronts the two read endpoints; `WorkspaceOwnerDep` fronts rename, delete,
+all three member-management endpoints, and the person search. Create/list take no `{workspace_id}` and depend on
 `get_current_user` directly.
 
 ##### Router module — `backend/app/api/workspaces.py` (concrete signatures)
@@ -1437,6 +1599,46 @@ suffix-`-2/-3`-until-free) / `DNS_LABEL_RE` live in a new **`backend/app/service
 Only explicit workspace creation uses these helpers; auth and the squashed baseline never generate
 workspace slugs.
 
+##### Person search — `GET /{workspace_id}/member-candidates`
+
+Add-member takes a `user_id`, which an Owner rarely has. The person search resolves a person to that
+id. Registration is open, so anything it shows an Owner it shows anyone who creates a Workspace. It
+is therefore a narrow lookup, never a user directory or a way to collect email addresses
+(ADR 0004). `services/member_candidates.find_member_candidates(db, workspace_id, query)` holds every
+rule below; the route only authorizes and serializes.
+
+- **Who.** `WorkspaceOwnerDep`, exactly like the other owner-only member routes: 401 anonymous, 404
+  for a missing, archived or non-member workspace, 403 for an editor or viewer. These denials come
+  before the query is validated.
+- **Query.** `q` is trimmed, then must be 2–255 characters with no control character, else 422. The
+  service raises `ValueError` for either too, because an empty name search would match everyone
+  and PostgreSQL cannot compare NUL (it was a 500).
+- **Matching**, by the first rule that applies:
+  1. `q` parses as a UUID: the user with that id, if any (no fallback to a name search).
+  2. `q` contains `@`: the user whose email equals `normalize_email(q)`. Emails are stored
+     canonical, so this is an exact, case-insensitive, index-backed match; a prefix, local part or
+     bare domain finds nobody.
+  3. Otherwise: users whose username or `display_name` contains `q`, case-insensitively (`ILIKE`
+     with `%`, `_` and the `\` escape character in `q` escaped). Never matches emails. Ranked
+     exact username, then username prefix, then `display_name` prefix, then any other match. A user
+     whose username or `display_name` contains `@` is never a name match: an account registered
+     with its address as username, or named by a provider that sends the address as the name,
+     would otherwise show that address to a search for a fragment of its domain. Rules 1 and 2
+     still find them.
+- **Always.** Existing members of this workspace are excluded, ties sort by username, and at most
+  10 results are returned.
+- **Response.** `[{user_id, username, display_name, email_hint}]`. `email_hint` is the full email
+  only for rule 2, where the caller typed it; otherwise it is masked as the local part's first
+  character, `•••@`, and the domain (`k•••@example.com`).
+- **Adding someone found here** reveals no more: `WorkspaceMemberOut.email` is masked the same way
+  for everyone but the member themselves (see "Member emails" below). Otherwise search, add, read
+  the 201's `email`, remove, repeat would collect every user's full address, since excluding members
+  turns the 10-result cap into paging.
+- **Logs.** The production server (`app/serve.py`) drops the query string from every Uvicorn
+  access-log line, so neither search text nor typed addresses reach pod logs (the path stays).
+- **Scale.** Rule 3 scans `users`: substring `ILIKE` cannot use the B-tree indexes. That is fine at
+  MarimoHub's expected user counts; a `pg_trgm` GIN index is the remedy if it ever is not.
+
 ##### Wiring — `backend/app/main.py`
 
 - `from app.api.workspaces import router as workspaces_router` and
@@ -1457,6 +1659,8 @@ workspace slugs.
   to, each carrying the caller's own role.
 - **Read (`get`, `list_members`).** `viewer` and up. Non-members and missing ids are indistinguishable
   (`ResourceHidden` → **404**); an authenticated member with any role can read.
+- **Member emails.** Every `WorkspaceMemberOut` (list, add, role change) carries the member's full
+  email only when the member is the caller; every other row has the person search's masked hint.
 - **Owner-only mutations.** Rename, delete, and all member management require `owner`
   (`PermissionDenied` → **403** for viewer/editor members; **404** for non-members). No self-service
   role change or self-leave in this surface (see open questions).
@@ -1464,7 +1668,11 @@ workspace slugs.
   the final owner returns **409**. This is app-enforced (not a DB constraint) via `_owner_count`.
 - **Add-member.** By `user_id`; unknown user → **404**, existing member → **409** (pre-checked, with
   the composite-PK `IntegrityError` as the concurrency backstop → 409). Any role including `owner`
-  (co-owners) may be granted.
+  (co-owners) may be granted. An Owner who lacks the id finds it with the person search; add-member
+  itself never accepts an email or username.
+- **Person search.** Owner-only and read-only; matches a user id, one exact email, or a username /
+  Display Name substring, excludes current members, returns at most 10, and reveals a full email
+  only for an exact email match (see "Person search" above).
 - **Archive lifecycle.** Delete accepts non-empty workspaces, stamps `archived_at` and a fixed
   `purge_after`, and stops their runtimes. Normal workspace/notebook lookups exclude archived rows.
   Owners list/restore archives through the dedicated surface. `purge_due_workspaces(now)` is
@@ -1490,8 +1698,12 @@ into `services/slug.py` (a consolidation, not a deletion). No obsolete workspace
   couples the workspace read to an unbounded member join and blocks pagination; a sub-collection is
   the idiomatic REST shape.
 - **Add members by `email`/`username`** — rejected for the canonical contract: `user_id` is the
-  stable identifier and avoids email/username-enumeration and rename ambiguity; an email→id
-  directory lookup is a separate surface (open question), not baked into membership.
+  stable identifier and avoids email/username-enumeration and rename ambiguity; resolving a person
+  to an id is the separate person search, not baked into membership.
+- **A user directory (`GET /api/users?q=`), or prefix/substring email search** — rejected
+  (ADR 0004): with open registration either one lets anyone list other people's email addresses.
+  The person search is Owner-only, workspace-scoped, matches emails only exactly, and masks them
+  otherwise.
 - **Immediate cascade-delete on workspace delete** — rejected: archive + restore provides a 30-day
   safety window; cascade deletion occurs only when the persisted purge deadline passes.
 
@@ -1500,9 +1712,27 @@ into `services/slug.py` (a consolidation, not a deletion). No obsolete workspace
 - **Self-leave / self-service role.** Member management is `owner`-only per the task, so a non-owner
   cannot leave a shared workspace on their own. A `DELETE /members/me` (self-leave, still last-owner
   guarded) is a likely follow-up; flagged as a product decision, intentionally out of this surface.
-- **User directory for invites.** Add-member takes `user_id`, but there is no endpoint to resolve a
-  person → id. A minimal `GET /api/users?email=` / search surface is needed for a usable invite UX;
-  scoped to a future task (relates to DT-4's account-linking note), not DT-5.
+- **User directory for invites.** Resolved: there is no user directory. Owners resolve a person to
+  an id with the person search (`GET /{workspace_id}/member-candidates`, rules above, ADR 0004), and
+  add-member keeps taking `user_id`.
+- **Member emails.** Resolved provisionally, pending the product owner's confirmation: other
+  members' emails are masked (see "Explicit contracts"). Adding someone needs no consent, so with
+  full addresses an Owner could add, read and remove person after person found by name until it
+  held every address (a review scripted 27 in 58 requests). The cost is that Owners no longer see
+  their members' addresses. Invitations the person must accept are the alternative that would keep
+  them; both changed an existing contract.
+- **Look-alike candidates.** Usernames and Display Names cannot hide invisible or reordering
+  characters, but Display Names are not unique and registration never verifies an email. So an
+  impostor can still register another username with the same Display Name and an unverified
+  address that masks to the same hint, and an exact username match ranks first. The Owner tells
+  them apart by username. Showing whether a provider vouched for the address
+  (`Identity.email_authoritative`) would help; it would add a field to `MemberCandidateOut`.
+- **Guessable addresses.** An exact email search confirms an address, and the hint shows its
+  domain. So an address made from the person's name (`john.doe@` for "John Doe") can be confirmed
+  in a guess or two, whatever the username. Only a hint without the domain, or limiting exact
+  lookups, would close this. Accounts JIT-provisioned before usernames stopped coming from the
+  email keep a username equal to their local part. Renaming those that have no local password is
+  a one-off data change for the product owner to decide.
 - **Purge scheduling.** `purge_due_workspaces` is scheduler-agnostic and safe to retry. Deployment must
   invoke it periodically through the provided CLI entrypoint; the exact platform scheduler manifest
   is deployment-owned.
@@ -1908,6 +2138,10 @@ that were tangled in the 609-line file now separate cleanly:
 
 - **runtime** (`runtime.py`) — everything about *an OS process*: `_marimo_command`, `_marimo_env`,
   `_current_virtualenv`, `_start_marimo_process`, `_terminate_process`, plus a new `reserve_ephemeral_port()`.
+  The kernel's environment is built from an allowlist (process basics, locale, temp dirs, proxy and CA
+  variables, and `PYTHON*`/`MARIMO_*`/`UV_*`/`XDG_*`), never a copy of the backend's: notebook code can
+  read whatever its kernel inherits, and the backend's holds `SECRET_KEY`, `DATABASE_URL` and
+  identity-provider client secrets.
 - **registry** (`registry.py`) — *tracking live sessions*: the `dict[UUID, LiveSession]` + one lock, and
   `register`/`get`/`pop`/`snapshot`/`drain`. No ports, no capacity, no reserved set, no per-deployment
   lock dance — those concerns are deleted, so the registry shrinks to a guarded map.
@@ -2831,7 +3065,13 @@ deployment root GET is preserved.
   failure (`UpstreamNotReady`/`UpstreamUnreachable`/`SessionManagerError`)→close `1011` (internal error);
   a mid-stream `ConnectionClosed`/`WebSocketDisconnect`/`OSError` ends the relay silently. `accept()` still
   happens inside `_relay_websocket`, i.e. only after a successful resolve, so a rejected session is closed
-  pre-accept exactly as today.
+  pre-accept exactly as today. The relay accepts Runtime messages up to 64 MiB
+  (`UPSTREAM_WS_MAX_MESSAGE_BYTES`): marimo sends a cell's whole output as one message, and the
+  websockets library's 1 MiB default dropped the connection on any large chart or table. When the
+  Runtime ends the connection, the browser's socket is closed with the Runtime's own code and reason,
+  which marimo's frontend acts on (e.g. `MARIMO_ALREADY_CONNECTED`); a code no close frame may carry
+  becomes `1000` (1005, closed without a code) or `1014` (1006, the Runtime vanished without a close
+  frame).
 
 ##### Deletions (by file / symbol)
 
@@ -3035,6 +3275,12 @@ returns `None` for a GC'd CR or an exited subprocess, mapping to `sleeping` eith
   (→429, DT-13) instead of polling to timeout. This lives in the operator (separate repo) + the DT-7
   manager poll; DT-10 fixes the sentinel contract. **Fallback:** until the controller emits it, capacity
   degrades gracefully to a `SessionStartError` timeout (→503) — flagged, not blocking.
+  **Retry (current, per `/IMPLEMENTATION_PLAN.md`):** the sentinel is now the CR's
+  `CapacityAvailable=False/QuotaExceeded` condition, and the operator retries such a start only on a fresh
+  wake request; nothing retries in the background. So a visit that finds a deploy Runtime quota-blocked
+  (any non-`Failed` phase) writes a new wake request — at most one per Deployment per replica every
+  `QUOTA_RETRY_COALESCE_SECONDS` (5 s), however many visitors arrive — and still reports this attempt's
+  `SessionCapacityError`; a later visit sees how the retry went.
 - **Error behaviour.** `deploy`/`delete` raise DT-3 `AccessError` for authz (404/401/403) and let DT-7
   `SessionManagerError` propagate; `create_session` lets `SessionManagerError` propagate
   (429/502/503/404 via DT-13); `delete_session` lets `SessionNotFoundError`→404. No router builds an
@@ -3421,8 +3667,9 @@ convention, and what `.env.example` already speaks) — grouping is expressed by
 sections and cross-field validation, **not** by nested sub-models (which would rename every env var to
 `SESSION__BACKEND` and churn `.env`). The one nested structure is the OIDC provider list, because it is
 a genuinely variable-length collection that cannot flatten. Field defaults in `config.py` are the
-**single source of truth**; `.env.example` is a documentation mirror that sets only the two required,
-no-default keys (`DATABASE_URL`, `SECRET_KEY`) to dev values and shows the rest as commented defaults.
+**single source of truth**; `.env.example` is a documentation mirror that sets the two required,
+no-default keys (`DATABASE_URL`, `SECRET_KEY`) and the host loop's public URLs to dev values and shows
+the rest as commented defaults.
 
 ##### Target design — `backend/app/core/config.py`
 
@@ -3451,11 +3698,15 @@ class OIDCProvider(BaseModel):
     kind: Literal["google", "oidc", "saml"]   # 'saml' is broker-fronted OIDC (DT-4 SAML decision)
     slug: str                                 # DNS-label; used in /oidc/{slug}/… routes
     display_name: str
-    issuer: AnyHttpUrl                         # discovery base: {issuer}/.well-known/openid-configuration
+    issuer: str                               # exact string (validated as an http(s) URL, never
+                                              # normalized): compared verbatim with discovery's
+                                              # `issuer`, the id_token `iss` and RFC 9207 `iss`
     client_id: str
     client_secret: str
-    scopes: list[str] = ["openid", "email", "profile"]
-    trusted_email_linking: bool = False          # requires verified email claim; explicit opt-in
+    scopes: list[str] = ["openid", "email", "profile"]   # must include "openid"
+    trusted_email_linking: bool = False       # explicit opt-in; see DT-4 "Linking policy"
+    hosted_domain: str | None = None          # Google `hd`: enforced against the id_token claim
+    prompt: str | None = None                 # OIDC `prompt`; "select_account" by default for google
 
     @property
     def provider_value(self) -> str:           # the identities.provider string (DT-1/DT-4 scheme)
@@ -3475,7 +3726,12 @@ class Settings(BaseSettings):
     SECRET_KEY: str                                              # required; signs user + session JWTs
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     PUBLIC_API_URL: AnyHttpUrl = "http://localhost:8000"          # external base; OIDC redirect root
+    PUBLIC_APP_URL: AnyHttpUrl | None = None                     # SPA base; post-login redirects; unset → PUBLIC_API_URL
     OIDC_PROVIDERS: list[OIDCProvider] = Field(default_factory=list)   # JSON env value; [] → local-only
+    GOOGLE_CLIENT_ID: str | None = None          # both set → appends the "google" provider (shortcut)
+    GOOGLE_CLIENT_SECRET: str | None = None
+    GOOGLE_HOSTED_DOMAIN: str | None = None      # optional `hd` restriction for that provider
+    OIDC_HTTP_PROXY_URL: AnyHttpUrl | None = None  # egress proxy for IdP calls only
 
     # ── workspace lifecycle ──────────────────────────────────────────────────
     WORKSPACE_ARCHIVE_RETENTION_DAYS: int = 30
@@ -3526,14 +3782,32 @@ def get_settings() -> Settings:
 ```
 
 `OIDC_PROVIDERS` is a JSON-valued env var (pydantic-settings parses a complex field from JSON), e.g.
-`OIDC_PROVIDERS='[{"kind":"google","slug":"google","display_name":"Google","issuer":"https://accounts.google.com","client_id":"…","client_secret":"…","trusted_email_linking":true}]'`.
-DT-4's `get_oidc_auth_service(provider)` / `get_oidc_verifier(provider)` look a provider up by
-`slug`; the verifier builds `redirect_uri = f"{PUBLIC_API_URL}/api/auth/oidc/{slug}/callback"` — derived,
-never stored, so the callback URL has one source.
+`OIDC_PROVIDERS='[{"kind":"oidc","slug":"keycloak","display_name":"Keycloak","issuer":"https://sso.example.com/realms/main","client_id":"…","client_secret":"…","trusted_email_linking":false}]'`.
+The issuer is written exactly as the provider's discovery document states it: Google's is
+`https://accounts.google.com`, with no trailing slash.
+
+**Google shortcut.** `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` (both or neither; empty strings
+count as unset; surrounding whitespace is stripped) append
+`{"kind":"google","slug":"google","display_name":"Google","issuer":"https://accounts.google.com",…}`
+to `OIDC_PROVIDERS`, with `hosted_domain` from `GOOGLE_HOSTED_DOMAIN`. Defining slug `google` in
+`OIDC_PROVIDERS` as well is a startup validation error, as are only one of the pair, or
+`GOOGLE_HOSTED_DOMAIN` without it. Register these redirect URIs on the Google "Web application"
+client: `http://localhost:8000/api/auth/oidc/google/callback` (compose) and
+`https://localhost/api/auth/oidc/google/callback` (kind — Google rejects `*.localhost` hosts).
+
+The routes look a provider up by `slug` and build
+`redirect_uri = f"{PUBLIC_API_URL}/api/auth/oidc/{slug}/callback"` — derived, never stored, so the
+callback URL has one source. Logins end on `{PUBLIC_APP_URL}/auth/callback` or `/auth/login`;
+when `PUBLIC_APP_URL` is set explicitly its origin is also allowed by CORS (alongside the Vite dev
+server's `http://localhost:5173`). Settings validation errors never echo their input, so a
+misconfiguration cannot print a client secret.
 
 ##### Target design — `.env.example` (rewritten)
 
 ```dotenv
+# Host-run backend: copy this file to backend/.env (`cp .env.example backend/.env`).
+# The backend reads .env from its working directory, backend/, never the repo root.
+
 # ── database ───────────────────────────────────────────────
 DATABASE_URL=postgresql+asyncpg://molab:molab@localhost:5432/molab
 
@@ -3541,7 +3815,14 @@ DATABASE_URL=postgresql+asyncpg://molab:molab@localhost:5432/molab
 SECRET_KEY=dev-secret-change-me
 # ACCESS_TOKEN_EXPIRE_MINUTES=60
 PUBLIC_API_URL=http://localhost:8000
-# OIDC_PROVIDERS=[]        # JSON list; trusted_email_linking defaults false
+# SPA base for post-login redirects: the host loop's Vite dev server. Leave it unset only
+# where the SPA shares PUBLIC_API_URL's origin (e.g. behind one ingress).
+PUBLIC_APP_URL=http://localhost:5173
+# OIDC_PROVIDERS=[]        # JSON list; exact issuer strings; trusted_email_linking defaults false
+# GOOGLE_CLIENT_ID=        # with GOOGLE_CLIENT_SECRET: adds the "google" provider
+# GOOGLE_CLIENT_SECRET=
+# GOOGLE_HOSTED_DOMAIN=    # optional: only accounts of this Google Workspace domain
+# OIDC_HTTP_PROXY_URL=     # optional egress proxy for identity-provider calls only
 
 # ── workspace lifecycle ────────────────────────────────────
 # WORKSPACE_ARCHIVE_RETENTION_DAYS=30
@@ -3578,11 +3859,11 @@ constant's definition so the two files stay in agreement.
 ##### Explicit contracts
 
 - **Env default source of truth.** The `Settings` field defaults are authoritative at runtime;
-  `.env.example` is a non-authoritative mirror (dev values for the two required keys, commented defaults
-  for the rest). Nothing reads a default from `.env.example`, so the two cannot drift into a second
-  source. `get_settings()` stays `@lru_cache`d — one validated `Settings` per process, matching DT-7's
-  process-wide `get_session_manager()` singleton (both resolve `SESSION_BACKEND` exactly once at first
-  use).
+  `.env.example` is a non-authoritative mirror (dev values for the two required keys and for the host
+  loop's public URLs, commented defaults for the rest). Nothing reads a default from `.env.example`, so
+  the two cannot drift into a second source. `get_settings()` stays `@lru_cache`d — one validated
+  `Settings` per process, matching DT-7's process-wide `get_session_manager()` singleton (both resolve
+  `SESSION_BACKEND` exactly once at first use).
 - **Backend-selection consistency (DT-7).** `SESSION_BACKEND: SessionBackend` is the one seam selector;
   `get_session_manager()` switches on it. The value type is the `SessionBackend` StrEnum (not a bare
   `Literal`) so the selector is a single named symbol shared by config and manager, and an invalid value
@@ -3630,9 +3911,9 @@ Add to `[project].dependencies`:
 - `kubernetes-asyncio>=32.0.0` — async k8s client for `KubeSessionManager` (`CustomObjectsApi` for
   `marimosessions`, `CoreV1Api` for Secret/Service), driven on the FastAPI event loop; in-cluster via
   `config.load_incluster_config()`, `load_kube_config()` for local `kube` testing (DT-7/DT-8).
-- `authlib>=1.3.0` — OIDC discovery/JWKS/id-token verification adapter behind DT-4's `get_oidc_verifier`;
-  without it `OIDC_PROVIDERS` is inert config. Named here because DT-12 introduces the OIDC settings the
-  adapter consumes.
+- `authlib>=1.3.0` — the OAuth client behind DT-4's `OIDCVerifier` (authorize URL with PKCE, token
+  exchange; `joserfc` verifies the id_token); without it `OIDC_PROVIDERS` is inert config. Named here
+  because DT-12 introduces the OIDC settings the adapter consumes.
 
 Neither is a `dev` group dependency — both run in production. `pydantic`/`pydantic-settings` (already
 present) cover `AnyHttpUrl`, `BaseModel`, and JSON parsing of `OIDC_PROVIDERS`; no addition needed there.

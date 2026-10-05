@@ -1,4 +1,12 @@
-from app.schemas.auth import LoginRequest, Token, UserCreate
+from app.schemas.auth import (
+    LoginRequest,
+    OIDCCallbackParams,
+    OIDCExchangeOut,
+    OIDCExchangeRequest,
+    OIDCProviderOut,
+    Token,
+    UserCreate,
+)
 from app.schemas.data import NotebookDataCreated, NotebookDataOut
 from app.schemas.deployment import DeploymentCreate, DeploymentOut
 from app.schemas.notebook import (
@@ -13,6 +21,8 @@ from app.schemas.notebook import (
 from app.schemas.session import SessionCreate, SessionOut
 from app.schemas.user import UserOut
 from app.schemas.workspace import (
+    MemberCandidateOut,
+    MemberCandidateQuery,
     WorkspaceArchiveOut,
     WorkspaceCreate,
     WorkspaceMemberCreate,
@@ -26,6 +36,8 @@ __all__ = [
     "DeploymentCreate",
     "DeploymentOut",
     "LoginRequest",
+    "MemberCandidateOut",
+    "MemberCandidateQuery",
     "NotebookCreate",
     "NotebookDataCreated",
     "NotebookDataOut",
@@ -35,6 +47,10 @@ __all__ = [
     "NotebookOut",
     "NotebookPublish",
     "NotebookUpdate",
+    "OIDCCallbackParams",
+    "OIDCExchangeOut",
+    "OIDCExchangeRequest",
+    "OIDCProviderOut",
     "SessionCreate",
     "SessionOut",
     "Token",

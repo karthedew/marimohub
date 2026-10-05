@@ -72,6 +72,13 @@ const (
 	// up on if an administrator later removes it; a bounded poll is the
 	// only way this ever self-resolves.
 	foreignCollisionRetryInterval = 30 * time.Second
+
+	// podGoingAwayRetryInterval is how often the controller re-checks a Pod
+	// it is waiting on to disappear: one being deleted, evicted, or
+	// disrupted, or a same-name Pod that made a new attempt's create fail
+	// with AlreadyExists. The Pod's own deletion event normally arrives
+	// first; this bounded poll only covers one that never does.
+	podGoingAwayRetryInterval = 5 * time.Second
 )
 
 // MarimoSessionReconciler reconciles a MarimoSession object.
@@ -127,8 +134,23 @@ type MarimoSessionReconciler struct {
 // never creates, changes, or adopts credential Secrets. There is no Pod
 // logs or exec access at all.
 //
+// update on marimosessions/finalizers is not finalizer use either. Every Pod
+// and Service the operator creates carries a controller ownerReference with
+// blockOwnerDeletion=true (see session.ownerReference), and the
+// OwnerReferencesPermissionEnforcement admission plugin, on by default in
+// OpenShift, only admits that field from a caller allowed to update the
+// owner's finalizers subresource; without this rule every Pod and Service
+// create is Forbidden there. Custom resources serve no finalizers
+// subresource, so the grant opens no write path of its own: that admission
+// check is the only thing that ever consults it.
+//
+// These markers generate only the Runtime-namespace Role. The LeaderElection
+// Event that leader election records on its Lease, in the operator's own
+// namespace, is granted by the hand-maintained leader-election Role instead.
+//
 // +kubebuilder:rbac:groups=marimohub.io,namespace=marimohub-sessions,resources=marimosessions,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=marimohub.io,namespace=marimohub-sessions,resources=marimosessions/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=marimohub.io,namespace=marimohub-sessions,resources=marimosessions/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",namespace=marimohub-sessions,resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=marimohub-sessions,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=marimohub-sessions,resources=secrets,verbs=get;list;watch
@@ -339,7 +361,8 @@ func (r *MarimoSessionReconciler) reconcileActivePhase(ctx context.Context, cr *
 // reconcileExistingPod classifies a live, owned Pod and acts on its
 // verdict. A spec.resources change is checked first and takes priority over
 // whatever the Pod's current container status says: replacing the Pod for
-// a deliberate resize is not something classifyPod needs to know about.
+// a deliberate resize is not something classifyPod needs to know about,
+// even once the replaced Pod is terminating.
 func (r *MarimoSessionReconciler) reconcileExistingPod(ctx context.Context, cr *marimohubv1alpha1.MarimoSession, pod *corev1.Pod) (ctrl.Result, error) {
 	desiredHash := podTemplateHash(cr, r.Options)
 	if cr.Status.PodTemplateHash != "" && cr.Status.PodTemplateHash != desiredHash {
@@ -348,6 +371,8 @@ func (r *MarimoSessionReconciler) reconcileExistingPod(ctx context.Context, cr *
 
 	verdict := classifyPod(pod)
 	switch verdict.kind {
+	case verdictInfrastructureLost:
+		return r.handlePodGoingAway(ctx, cr, pod)
 	case verdictImagePulling:
 		return r.handleImagePulling(ctx, cr, pod)
 	case verdictNodeUnknown:
@@ -437,7 +462,9 @@ func (r *MarimoSessionReconciler) reconcileMissingPod(ctx context.Context, cr *m
 // condition's own LastTransitionTime is the loss clock: the first call
 // after a loss sets Ready False/InfrastructureLost and returns without
 // creating anything, and only once that condition has been in place for at
-// least the backoff window does this actually attempt a new Pod.
+// least the backoff window does this actually attempt a new Pod. When
+// handlePodGoingAway already set it while the lost Pod still existed, the
+// clock started then.
 func (r *MarimoSessionReconciler) recoverFromInfrastructureLoss(ctx context.Context, cr *marimohubv1alpha1.MarimoSession, desiredHash, wakeToken string) (ctrl.Result, error) {
 	readyCond := apimeta.FindStatusCondition(cr.Status.Conditions, marimohubv1alpha1.ConditionTypeReady)
 	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != marimohubv1alpha1.ReasonInfrastructureLost {
@@ -457,6 +484,38 @@ func (r *MarimoSessionReconciler) recoverFromInfrastructureLoss(ctx context.Cont
 		return ctrl.Result{RequeueAfter: wait - elapsed}, nil
 	}
 	return r.startPod(ctx, cr, desiredHash, cr.Status.Attempt+1, wakeToken)
+}
+
+// handlePodGoingAway handles a Pod that is being deleted, or that the
+// platform evicted or disrupted. Routing is cleared at once, as
+// infrastructure loss rather than a workload failure, and nothing is
+// recreated while the Pod still exists. Once it is gone, the ordinary
+// missing-Pod path recreates it, through recoverFromInfrastructureLoss and
+// its backoff while podName still records it. Every deletion the
+// controller makes for its own reasons (idle sleep, credential loss,
+// replacement, failure) clears podName first, so those keep their own
+// outcome. A terminal Pod that nothing is deleting, such as one the kubelet
+// evicted and left behind as Failed, is deleted here, because nothing else
+// ever will. A live Pod is left to whatever disrupted it, which either
+// deletes it or abandons the disruption, after which it classifies as live
+// again.
+func (r *MarimoSessionReconciler) handlePodGoingAway(ctx context.Context, cr *marimohubv1alpha1.MarimoSession, pod *corev1.Pod) (ctrl.Result, error) {
+	if !isConditionFalseWithReason(cr, marimohubv1alpha1.ConditionTypeReady, marimohubv1alpha1.ReasonInfrastructureLost) {
+		if err := r.applyStatus(ctx, cr, statusPatch{
+			conditions: []metav1.Condition{
+				condition(marimohubv1alpha1.ConditionTypeReady, metav1.ConditionFalse, marimohubv1alpha1.ReasonInfrastructureLost, "Pod is being deleted, or was evicted or disrupted"),
+			},
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	terminal := pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+	if terminal && pod.DeletionTimestamp.IsZero() {
+		if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: podGoingAwayRetryInterval}, nil
 }
 
 // handleImagePulling waits out Kubernetes' own image-pull backoff until
@@ -559,7 +618,14 @@ func (r *MarimoSessionReconciler) handlePodReady(ctx context.Context, cr *marimo
 
 	if !wasAlreadyReady {
 		r.Metrics.observeStartupDuration(cr.Spec.Mode, r.Clock.Now().Sub(startedAt))
-		return ctrl.Result{}, nil
+		// The Ready status write above never triggers another reconcile: the
+		// MarimoSession predicate drops status-only updates. Scheduling the
+		// first idle evaluation here is the only thing that brings the
+		// controller back to a Runtime nobody is using. Without it, a
+		// Runtime that never receives an activity annotation, such as a
+		// Session whose user closed the tab during startup or a Deployment
+		// woken by a single request, runs forever and holds quota.
+		return ctrl.Result{RequeueAfter: r.effectiveIdleTimeout(cr) + r.IdleGracePeriod}, nil
 	}
 	return r.evaluateActivity(ctx, cr)
 }
@@ -590,11 +656,14 @@ func (r *MarimoSessionReconciler) startPod(ctx context.Context, cr *marimohubv1a
 	pod := session.BuildPod(cr, r.Options)
 	if err := r.Create(ctx, pod); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Something created it already -- most likely this exact
-			// sequence, retried after a crash right after Create but before
-			// the podName write below. The next reconcile treats it like
-			// any other existing, owned Pod.
-			return ctrl.Result{}, nil
+			// A Pod by this name already exists: the previous one, still
+			// terminating when a wake arrives, or this exact sequence
+			// retried after a crash right after Create but before the
+			// podName write below. The next reconcile treats it like any
+			// other existing Pod, and waits out one that is going away.
+			// The requeue guarantees that reconcile happens, because this
+			// attempt's own status write never triggers one.
+			return ctrl.Result{RequeueAfter: podGoingAwayRetryInterval}, nil
 		}
 		if apierrors.IsForbidden(err) {
 			return r.reconcileCreateForbidden(ctx, cr, pod, err)

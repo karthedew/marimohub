@@ -2,7 +2,13 @@
 	import { invalidateAll } from '$app/navigation';
 	import { ApiError, api, type WorkspaceArchive } from '$lib/api';
 	import { workspaces } from '$lib/stores/workspaces';
+	import { Archive, ArchiveRestore, TriangleAlert } from '@lucide/svelte';
 	import Button from '$lib/components/Button.svelte';
+	import { card, errorBanner } from '$lib/design/classes';
+	import Breadcrumbs from '$lib/design/components/Breadcrumbs.svelte';
+	import Callout from '$lib/design/components/Callout.svelte';
+	import EmptyState from '$lib/design/components/EmptyState.svelte';
+	import PageHeader from '$lib/design/components/PageHeader.svelte';
 
 	let { data } = $props();
 
@@ -35,58 +41,48 @@
 	<title>Archived workspaces | MarimoHub</title>
 </svelte:head>
 
-<section class="space-y-8">
-	<Button intent="secondary" size="sm" class="w-fit" href="/workspaces">Back to workspaces</Button>
+<Breadcrumbs crumbs={[{ label: 'Workspaces', href: '/workspaces' }, { label: 'Archived', href: '/workspaces/archived' }]} />
 
-	<div>
-		<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-5xl">Archived workspaces</h1>
-		<p class="mt-3 max-w-2xl text-lg leading-8 text-slate-700 dark:text-slate-300">
-			Archiving is reversible. A workspace you own stays here, restorable, until its purge date — after that it is
-			permanently removed the next time the scheduled purge job runs.
-		</p>
-	</div>
+<PageHeader
+	title="Archived workspaces"
+	eyebrow="Archive"
+	icon={Archive}
+	description="Archiving is reversible. A workspace you own stays here, restorable, until its purge date — after that it is permanently removed the next time the scheduled purge job runs."
+/>
 
-	{#if archived.length === 0}
-		<p class="rounded-[2rem] border border-slate-900/10 bg-white/70 p-6 text-sm font-semibold text-slate-600 dark:border-white/10 dark:bg-white/10 dark:text-slate-300">
-			You have no archived workspaces.
-		</p>
-	{:else}
-		<div class="space-y-4">
-			{#each archived as workspace (workspace.id)}
-				<div class="rounded-[2rem] border border-slate-900/10 bg-white/80 p-6 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
-					<div class="flex flex-wrap items-center justify-between gap-4">
-						<div>
-							<h2 class="text-xl font-bold text-slate-950 dark:text-white">{workspace.name}</h2>
-							<p class="mt-1 font-mono text-sm text-slate-500 dark:text-slate-400">{workspace.slug}</p>
+{#if archived.length === 0}
+	<EmptyState icon={Archive} title="You have no archived workspaces." detail="Workspaces you archive appear here until they are purged." />
+{:else}
+	<div class="overflow-hidden {card}">
+		<div class="hidden grid-cols-[minmax(0,1fr)_140px_140px_120px] gap-3 border-b border-app-line bg-app-bg px-4 py-2.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-app-muted md:grid">
+			<span>Workspace</span><span>Archived</span><span>Scheduled purge</span><span></span>
+		</div>
+		{#each archived as workspace (workspace.id)}
+			<div class="border-b border-app-line px-4 py-3 last:border-0">
+				<div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_140px_140px_120px] md:items-center">
+					<div class="flex min-w-0 items-center gap-3">
+						<span class="grid size-9 shrink-0 place-items-center rounded-md border border-app-line bg-app-bg text-xs font-bold text-app-muted">{workspace.name.slice(0, 2).toUpperCase()}</span>
+						<div class="min-w-0">
+							<p class="m-0 truncate text-sm font-semibold">{workspace.name}</p>
+							<p class="m-0 truncate font-mono text-xs text-app-muted">{workspace.slug}</p>
 						</div>
-						<Button
-							type="button"
-							intent="secondary"
-							size="sm"
-							onclick={() => void restore(workspace)}
-							disabled={restoringId === workspace.id}
-						>
-							{restoringId === workspace.id ? 'Restoring...' : 'Restore'}
+					</div>
+					<p class="m-0 text-xs text-app-muted"><span class="font-medium text-app-fg md:hidden">Archived </span>{formatDate(workspace.archived_at)}</p>
+					<p class="m-0 text-xs text-app-muted"><span class="font-medium text-app-fg md:hidden">Purge </span>{formatDate(workspace.purge_after)}</p>
+					<div class="md:text-right">
+						<Button type="button" intent="secondary" size="sm" onclick={() => void restore(workspace)} disabled={restoringId === workspace.id}>
+							<ArchiveRestore size={14} />{restoringId === workspace.id ? 'Restoring...' : 'Restore'}
 						</Button>
 					</div>
-					<div class="mt-4 grid gap-3 border-t border-slate-900/10 pt-4 text-sm dark:border-white/10 sm:grid-cols-2">
-						<div>
-							<p class="font-semibold uppercase tracking-[0.16em] text-slate-500 dark:text-slate-400">Archived</p>
-							<p class="mt-1 font-bold text-slate-950 dark:text-white">{formatDate(workspace.archived_at)}</p>
-						</div>
-						<div>
-							<p class="font-semibold uppercase tracking-[0.16em] text-slate-500 dark:text-slate-400">Scheduled purge</p>
-							<p class="mt-1 font-bold text-slate-950 dark:text-white">{formatDate(workspace.purge_after)}</p>
-						</div>
-					</div>
-					<p class="mt-3 text-xs text-slate-500 dark:text-slate-400">
-						Purge is permanent: the workspace, its notebooks, and their deployments cannot be recovered afterward.
-					</p>
-					{#if rowError?.id === workspace.id}
-						<p class="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">{rowError.message}</p>
-					{/if}
 				</div>
-			{/each}
-		</div>
-	{/if}
-</section>
+				{#if rowError?.id === workspace.id}
+					<p class="{errorBanner} mt-3" role="alert">{rowError.message}</p>
+				{/if}
+			</div>
+		{/each}
+	</div>
+	<Callout kind="warn" class="mt-4 flex items-start gap-2">
+		<TriangleAlert size={16} class="mt-0.5 shrink-0 text-app-warn" />
+		<span>Purge is permanent: the workspace, its notebooks, and their deployments cannot be recovered afterward.</span>
+	</Callout>
+{/if}

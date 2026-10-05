@@ -25,6 +25,8 @@ test('signed-in home lists Notebooks from the selected Workspace', async ({ page
 	await expect(page.getByRole('heading', { name: 'Notebooks' })).toBeVisible();
 	await expect(page.getByText('Home Space', { exact: true }).first()).toBeVisible();
 	await expect(page.getByRole('link', { name: new RegExp(title) })).toHaveAttribute('href', `/notebooks/${notebookId}`);
-	await expect(page.getByRole('link', { name: 'New Notebook', exact: true })).toHaveCount(0);
-	await expect(page.getByRole('link', { name: 'New notebook', exact: true })).toBeVisible();
+	// Scoped to the page body: the app sidebar carries its own "New notebook" nav link.
+	const main = page.getByRole('main');
+	await expect(main.getByRole('link', { name: 'New Notebook', exact: true })).toHaveCount(0);
+	await expect(main.getByRole('link', { name: 'New notebook', exact: true })).toBeVisible();
 });

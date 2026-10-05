@@ -6,6 +6,8 @@ import { auth, getAuthToken } from '$lib/stores/auth';
 export type User = {
 	id: string;
 	username: string;
+	// Optional and not unique: wherever it shows, the username shows with it.
+	display_name: string | null;
 	email: string;
 	created_at: string;
 };
@@ -13,6 +15,26 @@ export type User = {
 export type Token = {
 	access_token: string;
 	token_type: 'bearer';
+};
+
+export type AuthProviderKind = 'google' | 'oidc' | 'saml';
+
+// One configured external identity provider, as `GET /api/auth/providers`
+// lists it. Every kind signs in through the same OIDC routes; `kind` only
+// decides how the button is presented.
+export type AuthProvider = {
+	slug: string;
+	display_name: string;
+	kind: AuthProviderKind;
+};
+
+export type OidcExchangeRequest = {
+	handoff: string;
+	verifier: string;
+};
+
+export type OidcExchangeResponse = Token & {
+	user: User;
 };
 
 export type WorkspaceRole = 'owner' | 'editor' | 'viewer';
@@ -34,9 +56,22 @@ export type WorkspaceMember = {
 	workspace_id: string;
 	user_id: string;
 	username: string;
+	display_name: string | null;
+	// Masked (`k•••@example.com`) for everyone but the caller.
 	email: string;
 	role: WorkspaceRole;
 	created_at: string;
+};
+
+// A person an Owner may add to a Workspace, as the member-candidate search
+// returns them: never someone who is already a member. `email_hint` is the
+// full address only when the Owner searched by that exact address; otherwise
+// it is masked (`k•••@example.com`), so a name search cannot harvest emails.
+export type MemberCandidate = {
+	user_id: string;
+	username: string;
+	display_name: string | null;
+	email_hint: string;
 };
 
 export type WorkspaceCreateRequest = {
@@ -88,6 +123,8 @@ export type RegisterRequest = {
 	username: string;
 	email: string;
 	password: string;
+	// Trimmed by the backend; blank or omitted means no display name.
+	display_name?: string | null;
 };
 
 export type LoginRequest = {
@@ -237,6 +274,16 @@ export function deploymentProxyUrl(slug: string) {
 	return resolveApiUrl(buildUrl(`/api/deployments/${slug}/`));
 }
 
+// Where a provider sign-in leaves the SPA: the backend's login route, which
+// redirects on to the identity provider. It is only ever used for a full-page
+// navigation (`window.location.assign`), never `fetch` or `goto` — the browser
+// has to follow the redirect chain itself. Absolute when PUBLIC_API_URL names
+// a separate backend origin (compose), a same-origin `/api` path otherwise
+// (the ingress in kind routes `/api` to the backend).
+export function oidcLoginUrl(slug: string, challenge: string) {
+	return resolveApiUrl(buildUrl(`/api/auth/oidc/${encodeURIComponent(slug)}/login`, { challenge }));
+}
+
 export function normalizeTagInput(tags: string | string[] | undefined) {
 	const values = Array.isArray(tags) ? tags : tags?.split(',') ?? [];
 	return values.map((tag) => tag.trim()).filter((tag) => tag.length > 0);
@@ -262,14 +309,18 @@ export async function readError(response: Response) {
 }
 
 function isAuthRoutePath(pathname: string) {
-	return pathname === '/auth/login' || pathname === '/auth/register';
+	return pathname === '/auth/login' || pathname === '/auth/register' || pathname === '/auth/callback';
 }
 
 // The one place a bearer 401 gets turned into a redirect. Only fires when
 // this request actually sent a token: an anonymous request that happens to
 // 401 (e.g. a notebook that requires sign-in) is not evidence the session
-// expired, so it must never clear a session that never existed.
-function expireSession() {
+// expired, so it must never clear a session that never existed. Nor does it
+// clear a session that replaced the rejected token while the request was in
+// flight — a sign-in that lands just before a stale request's 401 returns
+// must survive it.
+function expireSession(rejectedToken: string | null) {
+	if (getAuthToken() !== rejectedToken) return;
 	auth.clear();
 	if (!browser) return;
 	const { pathname, search } = window.location;
@@ -303,7 +354,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 		body: body === undefined ? undefined : JSON.stringify(body)
 	});
 
-	if (response.status === 401 && tokenSent && handle401) expireSession();
+	if (response.status === 401 && tokenSent && handle401) expireSession(token);
 
 	if (!response.ok) throw new ApiError(response.status, await readError(response));
 	if (response.status === 204) return undefined as T;
@@ -319,7 +370,13 @@ function createLiveApi(fetcher?: typeof fetch) {
 		auth: {
 			register: (body: RegisterRequest) => request<User>('/api/auth/register', { method: 'POST', auth: false, body }),
 			login: (body: LoginRequest) => request<Token>('/api/auth/login', { method: 'POST', auth: false, body }),
-			logout: () => request<void>('/api/auth/logout', { method: 'POST', handle401: false })
+			logout: () => request<void>('/api/auth/logout', { method: 'POST', handle401: false }),
+			providers: () => request<AuthProvider[]>('/api/auth/providers', { auth: false }),
+			// Redeems the one-time handoff from a provider sign-in. Never sends the
+			// current bearer token, so a rejected handoff (401) leaves any existing
+			// session alone.
+			oidcExchange: (body: OidcExchangeRequest) =>
+				request<OidcExchangeResponse>('/api/auth/oidc/exchange', { method: 'POST', auth: false, body })
 		},
 		workspaces: {
 			list: () => request<Workspace[]>('/api/workspaces'),
@@ -337,7 +394,15 @@ function createLiveApi(fetcher?: typeof fetch) {
 				updateRole: (workspaceId: string, userId: string, body: WorkspaceMemberUpdateRequest) =>
 					request<WorkspaceMember>(`/api/workspaces/${workspaceId}/members/${userId}`, { method: 'PATCH', body }),
 				remove: (workspaceId: string, userId: string) =>
-					request<void>(`/api/workspaces/${workspaceId}/members/${userId}`, { method: 'DELETE' })
+					request<void>(`/api/workspaces/${workspaceId}/members/${userId}`, { method: 'DELETE' }),
+				// Owner-only lookup that resolves a person to the `user_id` that `add`
+				// takes: a pasted User ID, an exact email address, or part of a
+				// username or display name. `q` must be 2–255 characters once trimmed.
+				candidates: (workspaceId: string, q: string, options: { signal?: AbortSignal } = {}) =>
+					request<MemberCandidate[]>(`/api/workspaces/${workspaceId}/member-candidates`, {
+						query: { q },
+						signal: options.signal
+					})
 			}
 		},
 		notebooks: {

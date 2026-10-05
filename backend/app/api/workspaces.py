@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,8 @@ from app.core.errors import ConflictError, NotFoundError
 from app.db.database import get_db
 from app.models import User, Workspace, WorkspaceMember, WorkspaceRole
 from app.schemas import (
+    MemberCandidateOut,
+    MemberCandidateQuery,
     WorkspaceArchiveOut,
     WorkspaceCreate,
     WorkspaceMemberCreate,
@@ -22,10 +24,21 @@ from app.schemas import (
 )
 from app.services import workspace_service
 from app.services.access import get_role, load_archived_workspace_for_owner
+from app.services.member_candidates import find_member_candidates, mask_email
 from app.services.session_manager import SessionManager, get_session_manager
 from app.services.slug import to_dns_label, unique_slug
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
+
+
+def _shown_email(email: str, member_id: UUID, viewer: User) -> str:
+    """Return a member's email in full only to that member; anyone else gets the masked hint.
+
+    Adding someone needs no consent from them, and the person search finds
+    anyone by name, so a full address here would let any Owner add, read
+    and remove person after person until it held everyone's email.
+    """
+    return email if member_id == viewer.id else mask_email(email)
 
 
 def _workspace_out(ws: Workspace, role: WorkspaceRole) -> WorkspaceOut:
@@ -47,15 +60,20 @@ def _workspace_archive_out(ws: Workspace, role: WorkspaceRole) -> WorkspaceArchi
     )
 
 
-async def _member_out(db: AsyncSession, member: WorkspaceMember) -> WorkspaceMemberOut:
+async def _member_out(
+    db: AsyncSession, member: WorkspaceMember, viewer: User
+) -> WorkspaceMemberOut:
     identity = (
-        await db.execute(select(User.username, User.email).where(User.id == member.user_id))
+        await db.execute(
+            select(User.username, User.display_name, User.email).where(User.id == member.user_id)
+        )
     ).one()
     return WorkspaceMemberOut(
         workspace_id=member.workspace_id,
         user_id=member.user_id,
         username=identity.username,
-        email=identity.email,
+        display_name=identity.display_name,
+        email=_shown_email(identity.email, member.user_id, viewer),
         role=member.role,
         created_at=member.created_at,
     )
@@ -175,9 +193,9 @@ async def restore_archived_workspace(
 async def list_members(
     ctx: WorkspaceMemberDep, db: Annotated[AsyncSession, Depends(get_db)]
 ) -> list[WorkspaceMemberOut]:
-    """List a workspace's members, oldest first."""
+    """List a workspace's members, oldest first; only the caller's own email is unmasked."""
     rows = await db.execute(
-        select(WorkspaceMember, User.username, User.email)
+        select(WorkspaceMember, User.username, User.display_name, User.email)
         .join(User, User.id == WorkspaceMember.user_id)
         .where(WorkspaceMember.workspace_id == ctx.workspace.id)
         .order_by(WorkspaceMember.created_at.asc())
@@ -187,11 +205,44 @@ async def list_members(
             workspace_id=member.workspace_id,
             user_id=member.user_id,
             username=username,
-            email=email,
+            display_name=display_name,
+            email=_shown_email(email, member.user_id, ctx.actor),
             role=member.role,
             created_at=member.created_at,
         )
-        for member, username, email in rows.all()
+        for member, username, display_name, email in rows.all()
+    ]
+
+
+@router.get("/{workspace_id}/member-candidates", response_model=list[MemberCandidateOut])
+async def search_member_candidates(
+    ctx: WorkspaceOwnerDep,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    q: Annotated[
+        MemberCandidateQuery,
+        Query(
+            description=(
+                "A name or username (2+ characters, matched anywhere in either), a whole "
+                "email address (matched exactly), or a user id."
+            )
+        ),
+    ],
+) -> list[MemberCandidateOut]:
+    """Find people the owner could add as members: at most 10 non-members, best match first.
+
+    Name searches never match emails and only show a masked email hint; an
+    exact email address is the one query that returns the full address.
+    Adding the chosen person is still `POST /members` with their `user_id`.
+    """
+    candidates = await find_member_candidates(db, ctx.workspace.id, q)
+    return [
+        MemberCandidateOut(
+            user_id=candidate.user_id,
+            username=candidate.username,
+            display_name=candidate.display_name,
+            email_hint=candidate.email_hint,
+        )
+        for candidate in candidates
     ]
 
 
@@ -224,7 +275,8 @@ async def add_member(
         workspace_id=member.workspace_id,
         user_id=member.user_id,
         username=target.username,
-        email=target.email,
+        display_name=target.display_name,
+        email=_shown_email(target.email, target.id, ctx.actor),
         role=member.role,
         created_at=member.created_at,
     )
@@ -250,7 +302,7 @@ async def change_member_role(
 
     member.role = payload.role
     await db.commit()
-    return await _member_out(db, member)
+    return await _member_out(db, member, ctx.actor)
 
 
 @router.delete(

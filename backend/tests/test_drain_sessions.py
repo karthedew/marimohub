@@ -3,6 +3,7 @@ from typing import Any
 
 import pytest
 
+from app.commands import drain_sessions as drain_module
 from app.commands.drain_sessions import _Clock, drain_sessions
 from app.services import runtime_contract as contract
 
@@ -164,6 +165,60 @@ async def test_drain_with_no_sessions_and_no_children_returns_immediately() -> N
 
     assert ok is True
     assert clock.sleeps == []
+
+
+class _RecordingApiClient:
+    """Stands in for `kubernetes_asyncio.client.ApiClient`, recording whether it was closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aenter__(self) -> "_RecordingApiClient":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drain_error",
+    [
+        pytest.param(None, id="drain-finishes"),
+        pytest.param(RuntimeError("API server went away"), id="drain-raises"),
+    ],
+)
+async def test_run_closes_its_api_client_on_every_exit_path(
+    monkeypatch: pytest.MonkeyPatch, drain_error: Exception | None
+) -> None:
+    """An unclosed client logs "Unclosed client session" when the hook Job exits."""
+    api_clients: list[_RecordingApiClient] = []
+
+    def _api_client() -> _RecordingApiClient:
+        api_clients.append(_RecordingApiClient())
+        return api_clients[-1]
+
+    async def _config_loaded() -> None:
+        return None
+
+    async def _drain(*args: object, **kwargs: object) -> bool:
+        if drain_error is not None:
+            raise drain_error
+        return True
+
+    monkeypatch.setenv("SESSION_NAMESPACE", _NAMESPACE)
+    monkeypatch.setattr(drain_module, "_load_config", _config_loaded)
+    monkeypatch.setattr(drain_module.client, "ApiClient", _api_client)
+    monkeypatch.setattr(drain_module, "drain_sessions", _drain)
+
+    if drain_error is None:
+        assert await drain_module._run() is True
+    else:
+        with pytest.raises(RuntimeError, match="API server went away"):
+            await drain_module._run()
+
+    assert len(api_clients) == 1
+    assert api_clients[0].closed
 
 
 def test_child_label_selector_is_a_bare_existence_query() -> None:

@@ -1,25 +1,30 @@
 <script lang="ts">
-	import type { Theme } from '$lib/theme';
+	import { Moon, Sun } from '@lucide/svelte';
+	import { applyTheme, type Theme } from '$lib/theme';
 
-	type Props = {
-		theme: Theme;
-		onchange: () => void;
-	};
+	// Self-contained like Huron's ThemeToggle: the inline script in `app.html`
+	// already applied the saved `molab-theme` choice to <html> before first paint,
+	// so the class on the root element is the source of truth to start from.
+	let theme = $state<Theme>('light');
 
-	let { theme, onchange }: Props = $props();
+	$effect(() => {
+		theme = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+	});
+
+	const next = $derived<Theme>(theme === 'dark' ? 'light' : 'dark');
+
+	function toggle() {
+		theme = next;
+		applyTheme(theme);
+	}
 </script>
 
 <button
 	type="button"
-	class="group inline-flex items-center gap-2 rounded-full p-1 text-xs font-semibold text-slate-600 outline-none transition hover:text-slate-950 focus-visible:ring-4 focus-visible:ring-hub-600/20 dark:text-slate-400 dark:hover:text-white"
-	aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
-	aria-pressed={theme === 'dark'}
-	onclick={onchange}
+	class="grid size-9 shrink-0 place-items-center rounded-md border border-app-line bg-app-card text-app-muted transition hover:border-app-line-strong hover:text-app-fg"
+	aria-label={`Switch to ${next} mode`}
+	title={`Switch to ${next} mode`}
+	onclick={toggle}
 >
-	<span class="hidden sm:inline">{theme === 'dark' ? 'Dark' : 'Light'}</span>
-	<span class="relative h-6 w-11 rounded-full bg-slate-300 transition-colors group-hover:bg-slate-400 dark:bg-slate-700 dark:group-hover:bg-slate-600">
-		<span class={`absolute top-1 grid size-4 place-items-center rounded-full bg-white shadow-sm transition-transform ${theme === 'dark' ? 'translate-x-6' : 'translate-x-1'}`}>
-			<span class="size-1.5 rounded-full bg-hub-700"></span>
-		</span>
-	</span>
+	{#if theme === 'dark'}<Sun size={17} />{:else}<Moon size={17} />{/if}
 </button>

@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { ApiError, api, resolveApiUrl, type Session, type SessionMode } from '$lib/api';
 	import { teardownSessionOnUnload } from '$lib/sessionTeardown';
+	import { ArrowLeft, CircleAlert, LoaderCircle, Lock, Play, RotateCcw } from '@lucide/svelte';
 	import Button from '$lib/components/Button.svelte';
 
 	type Props = {
@@ -146,64 +147,64 @@
 	<title>{heading} | MarimoHub</title>
 </svelte:head>
 
-<section class="flex min-h-0 flex-1 flex-col bg-white dark:bg-slate-950">
+<section class="flex min-h-0 flex-1 flex-col bg-app-bg">
 	{#if loading}
-		<div class="grid flex-1 place-items-center bg-white/75 p-8 text-center backdrop-blur dark:bg-slate-950" aria-live="polite">
-			<div>
-				<div class="mx-auto h-3 w-44 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
-					<div class="h-full w-1/2 animate-pulse rounded-full bg-hub-600 dark:bg-hub-300"></div>
-				</div>
-				<p class="text-sm font-semibold uppercase tracking-[0.25em] text-hub-700 dark:text-hub-300">Starting session</p>
-				<p class="mt-4 text-lg font-bold text-slate-950 dark:text-white">Marimo is spinning up. This can take a few seconds.</p>
+		<div class="grid flex-1 place-items-center p-6 text-center" aria-live="polite">
+			<div class="w-full max-w-sm rounded-lg border border-app-line bg-app-card p-8 shadow-[var(--shadow-sm)]">
+				<LoaderCircle size={28} class="mx-auto animate-spin text-brand-strong" />
+				<p class="mt-5 text-xs font-semibold uppercase tracking-[0.14em] text-brand-strong">Starting session</p>
+				<p class="mt-2 text-sm text-app-muted">Marimo is spinning up. This can take a few seconds.</p>
 			</div>
 		</div>
 	{:else if error}
-		{#if errorKind === 'forbidden'}
-			<div class="rounded-[2rem] border border-red-200 bg-red-50 p-6 text-red-900 shadow-xl shadow-red-950/5 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-100" role="alert">
-				<p class="text-lg font-black">Editor role required</p>
-				<p class="mt-2 text-sm font-semibold">{error}</p>
-				<div class="mt-5">
-					<a class="rounded-full border border-red-300/80 px-5 py-3 text-sm font-bold text-red-900 dark:border-red-200/30 dark:text-red-100" href={backHref}>{backLabel}</a>
+		<div class="grid flex-1 place-items-center overflow-y-auto p-6">
+			{#if errorKind === 'forbidden'}
+				<div class="w-full max-w-md rounded-lg border border-app-line bg-app-card p-6 shadow-[var(--shadow-sm)]" role="alert">
+					<span class="grid size-10 place-items-center rounded-md bg-app-warn-bg text-app-warn"><Lock size={18} /></span>
+					<p class="mt-4 text-base font-semibold text-app-fg">Editor role required</p>
+					<p class="mt-1 text-sm text-app-muted">{error}</p>
+					<div class="mt-5">
+						<Button intent="secondary" href={backHref}><ArrowLeft size={15} />{backLabel}</Button>
+					</div>
 				</div>
-			</div>
-		{:else if errorKind === 'notfound'}
-			<section class="mx-auto max-w-2xl rounded-[2rem] border border-slate-900/10 bg-white/80 p-8 text-center shadow-xl shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20" role="alert">
-				<p class="mx-auto w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">404</p>
-				<h1 class="mt-5 text-4xl font-black tracking-tight text-slate-950 dark:text-white">Notebook unavailable</h1>
-				<p class="mt-4 text-slate-700 dark:text-slate-300">{error}</p>
-				<Button intent="primary" class="mt-7 w-fit" href="/discover">Browse notebooks</Button>
-			</section>
-		{:else}
-			<div class="rounded-[2rem] border border-red-200 bg-red-50 p-6 text-red-900 shadow-xl shadow-red-950/5 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-100" role="alert">
-				<p class="text-lg font-black">Session failed</p>
-				<p class="mt-2 text-sm font-semibold">{error}</p>
-				<div class="mt-5 flex flex-wrap gap-3">
-					<Button intent="primary" type="button" onclick={() => void startSession()}>Try again</Button>
-					<a class="rounded-full border border-red-300/80 px-5 py-3 text-sm font-bold text-red-900 dark:border-red-200/30 dark:text-red-100" href={backHref}>{backLabel}</a>
-				</div>
-			</div>
-		{/if}
-	{:else if session}
-		<div class="relative flex min-h-0 flex-1 overflow-hidden bg-white dark:bg-slate-950">
-			{#if frameLoading}
-				<div class="absolute inset-0 z-10 grid place-items-center bg-white/95 p-8 text-center dark:bg-slate-950/95" aria-live="polite">
-					<div>
-						<div class="mx-auto h-3 w-44 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
-							<div class="h-full w-1/2 animate-pulse rounded-full bg-hub-600 dark:bg-hub-300"></div>
-						</div>
-						<p class="mt-5 text-sm font-semibold uppercase tracking-[0.25em] text-hub-700 dark:text-hub-300">Loading frame</p>
-						<p class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-300">Connecting to the marimo session.</p>
+			{:else if errorKind === 'notfound'}
+				<section class="w-full max-w-md rounded-lg border border-app-line bg-app-card p-8 text-center shadow-[var(--shadow-sm)]" role="alert">
+					<p class="text-xs font-semibold uppercase tracking-[0.14em] text-app-muted">404</p>
+					<h1 class="mt-2">Notebook unavailable</h1>
+					<p class="mt-2 text-sm text-app-muted">{error}</p>
+					<Button intent="primary" class="mt-6" href="/discover">Browse notebooks</Button>
+				</section>
+			{:else}
+				<div class="w-full max-w-md rounded-lg border border-app-line bg-app-card p-6 shadow-[var(--shadow-sm)]" role="alert">
+					<span class="grid size-10 place-items-center rounded-md bg-app-danger/10 text-app-danger"><CircleAlert size={18} /></span>
+					<p class="mt-4 text-base font-semibold text-app-fg">Session failed</p>
+					<p class="mt-1 text-sm text-app-muted">{error}</p>
+					<div class="mt-5 flex flex-wrap gap-2">
+						<Button intent="primary" type="button" onclick={() => void startSession()}><RotateCcw size={15} />Try again</Button>
+						<Button intent="secondary" href={backHref}><ArrowLeft size={15} />{backLabel}</Button>
 					</div>
 				</div>
 			{/if}
-			<iframe class="h-full min-h-0 w-full flex-1 border-0 bg-white dark:bg-slate-950" src={iframeSrc} title={`${heading} marimo session`} onload={() => (frameLoading = false)} onerror={() => { frameLoading = false; error = 'The session frame could not be loaded.'; }}></iframe>
+		</div>
+	{:else if session}
+		<div class="relative flex min-h-0 flex-1 overflow-hidden bg-app-card">
+			{#if frameLoading}
+				<div class="absolute inset-0 z-10 grid place-items-center bg-app-bg/95 p-6 text-center" aria-live="polite">
+					<div>
+						<LoaderCircle size={26} class="mx-auto animate-spin text-brand-strong" />
+						<p class="mt-4 text-xs font-semibold uppercase tracking-[0.14em] text-brand-strong">Loading frame</p>
+						<p class="mt-2 text-sm text-app-muted">Connecting to the marimo session.</p>
+					</div>
+				</div>
+			{/if}
+			<iframe class="h-full min-h-0 w-full flex-1 border-0 bg-app-card" src={iframeSrc} title={`${heading} marimo session`} onload={() => (frameLoading = false)} onerror={() => { frameLoading = false; error = 'The session frame could not be loaded.'; }}></iframe>
 		</div>
 	{:else}
-		<div class="grid flex-1 place-items-center bg-white/75 p-8 text-center backdrop-blur dark:bg-slate-950">
-			<div>
-				<p class="text-lg font-black text-slate-950 dark:text-white">Session ended</p>
-				<p class="mt-2 text-sm font-semibold text-slate-600 dark:text-slate-300">Start a new session to continue.</p>
-				<Button intent="primary" class="mt-5" type="button" onclick={() => void startSession()}>Start again</Button>
+		<div class="grid flex-1 place-items-center p-6 text-center">
+			<div class="w-full max-w-sm rounded-lg border border-app-line bg-app-card p-8 shadow-[var(--shadow-sm)]">
+				<p class="text-base font-semibold text-app-fg">Session ended</p>
+				<p class="mt-1 text-sm text-app-muted">Start a new session to continue.</p>
+				<Button intent="primary" class="mt-5" type="button" onclick={() => void startSession()}><Play size={15} />Start again</Button>
 			</div>
 		</div>
 	{/if}

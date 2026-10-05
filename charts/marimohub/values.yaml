@@ -82,12 +82,59 @@ backendPublic:
   imagePullPolicy: IfNotPresent
   port: 8000
   # Existing Secret an administrator populates with DATABASE_URL, SECRET_KEY,
-  # PUBLIC_API_URL, and OIDC_PROVIDERS (JSON). Required; the chart only wires
-  # the reference, never the value.
+  # and PUBLIC_API_URL (the public https:// URL of this install, which every
+  # sign-in redirect URI is built from). Required; the chart only wires the
+  # reference, never the value. backend-internal, the migration Job, and the
+  # maintenance CronJobs load the same Secret, so identity-provider
+  # credentials belong in oidc.existingSecret below instead.
   existingSecret: ""
+  # Absolute URL of the browser app. After an identity-provider sign-in the
+  # backend sends the browser to {publicAppUrl}/auth/callback, or to
+  # {publicAppUrl}/auth/login?error=... when sign-in fails. Empty means
+  # PUBLIC_API_URL, which is right whenever the app and /api share one host,
+  # as they do behind this chart's Route and Ingress.
+  publicAppUrl: ""
+  # Sign-in through Google or another OpenID Connect provider. Off until
+  # existingSecret names a Secret holding credentials.
+  #
+  # Google: create a "Web application" OAuth client in the Google Cloud
+  # console (Google Auth Platform > Clients) with the authorized redirect URI
+  # {PUBLIC_API_URL}/api/auth/oidc/google/callback, written exactly (scheme,
+  # host, and path must all match; no trailing slash), and no JavaScript
+  # origins. Add the host's registrable domain under Branding > Authorized
+  # domains first. The client needs only the openid, email, and profile
+  # scopes.
+  #
+  # Egress: this backend calls the provider itself (Google: discovery at
+  # accounts.google.com, token exchange at oauth2.googleapis.com, signing
+  # keys at www.googleapis.com, all on 443). NetworkPolicy cannot match
+  # hostnames and Google's addresses change often, so the default
+  # network.externalProxy denies this and sign-in fails until either
+  # proxyUrl names an egress proxy that allows those hosts (with the proxy's
+  # address and port in network.externalProxy), or network.externalProxy
+  # opens 0.0.0.0/0 port 443, which is acceptable for development only.
+  oidc:
+    # Existing Secret loaded into backend-public alone, so the client secret
+    # never reaches backend-internal, the migration Job, or the CronJobs. For
+    # Google: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and optionally
+    # GOOGLE_HOSTED_DOMAIN, which admits only accounts from that Google
+    # Workspace domain. Other providers go in OIDC_PROVIDERS (JSON). Keys
+    # here override the same keys in backendPublic.existingSecret.
+    existingSecret: ""
+    # Optional HTTP(S) proxy (OIDC_HTTP_PROXY_URL) for this backend's own
+    # calls to identity providers only. Never set HTTPS_PROXY or HTTP_PROXY
+    # on this Deployment instead: its proxy and WebSocket clients honor
+    # those too, and would send notebook Runtime traffic through the proxy.
+    proxyUrl: ""
+  # Every proxied notebook request and WebSocket frame flows through this
+  # component. With 50 users running notebooks at once, a single replica
+  # capped at 500m was CPU-throttled in a third of all scheduling periods,
+  # failed its health probes, and slowed every Session start. The limit
+  # leaves room for bursts; the request stays low so scheduling is not
+  # affected.
   resources:
-    requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 128Mi }
-    limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi }
+    requests: { cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi }
+    limits: { cpu: "2", memory: 1Gi, ephemeral-storage: 256Mi }
   podDisruptionBudget:
     minAvailable: 1
   priorityClassName: ""
@@ -220,6 +267,15 @@ runtime:
   # throttled or delayed signal can never be mistaken for idleness.
   activitySignalIntervalSeconds: 10
   activityGraceSeconds: 20
+  # How long starting or waking a Runtime may take before the backend gives
+  # up, compensates, and answers 503. The request blocks for that long, so
+  # the API Route (haproxy.router.openshift.io/timeout) and the Ingress
+  # proxy timeouts are set to this plus 30s, or the router would cut it
+  # off first; OpenShift's default router timeout is 30s. 90s absorbs a
+  # cold Runtime image pull on a fresh node, plus the startup queueing seen
+  # when 50 users start Sessions at once (the slowest of 50 took 25s on a
+  # warm node).
+  startTimeoutSeconds: 90
   resources:
     requests: { cpu: 250m, memory: 512Mi, ephemeral-storage: 256Mi }
     limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 1Gi }
@@ -244,6 +300,47 @@ runtime:
     max: { cpu: "2", memory: 4Gi, ephemeral-storage: 2Gi }
   workVolumeSizeLimit: 512Mi
   maxSourceBytes: 10485760
+  # Durable per-Workspace directories on one shared ReadWriteMany claim
+  # (an NFS export in production). Off by default: existingClaim names a
+  # PersistentVolumeClaim in namespaces.sessions that the platform already
+  # bound, which the chart never creates or deletes, like the namespaces
+  # and Secrets above. The claim's root must contain a `workspaces/`
+  # directory writable by the Runtime Pods' group. Each Workspace lives
+  # at workspaces/<workspaceId> and is mounted read-write into edit
+  # Runtimes, read-only into run Runtimes, and not at all into deploy
+  # Runtimes, which serve an immutable snapshot. supplementalGroups are
+  # added to those Pods so a group-owned share stays writable, since NFS
+  # honors neither fsGroup nor an arbitrary UID.
+  workspaceStorage:
+    existingClaim: ""
+    mountPath: /work/workspace
+    supplementalGroups: []
+  # Administrator-provided data volumes, such as a team's datasets on an NFS
+  # export, mounted into every notebook. Unlike workspaceStorage, every
+  # Workspace sees the same files. Each entry names a ReadWriteMany
+  # PersistentVolumeClaim in namespaces.sessions that the platform already
+  # bound; the chart never creates one. Inline `nfs:` Pod volumes are not
+  # allowed under the restricted Pod Security profile or OpenShift's
+  # restricted-v2, so an NFS export is reached through an `nfs:`
+  # PersistentVolume bound to that claim (see deploy/README.md).
+  #   name:               DNS label; the Pod volume is "shared-<name>"
+  #   existingClaim:      the claim to mount
+  #   subPath:            optional directory inside the claim; it must
+  #                       already exist, since a read-only mount cannot
+  #                       create it
+  #   mountPath:          where notebooks see it (default /mnt/<name>)
+  #   readOnly:           default true
+  #   modes:              Runtime modes that mount it (default [edit, run]);
+  #                       deploy Runtimes are public applications, so
+  #                       "deploy" is accepted only for read-only volumes
+  #   supplementalGroups: groups added to Pods that mount it, for exports
+  #                       whose files are group-owned
+  # Example:
+  #   sharedVolumes:
+  #     - name: datasets
+  #       existingClaim: nfs-datasets
+  #       readOnly: true
+  sharedVolumes: []
   # Administrator-managed CIDR/port egress an operator explicitly opts a
   # Runtime into beyond DNS and the internal API -- never a user-facing
   # control. Each entry is `{cidr, port, protocol}`.
@@ -345,11 +442,14 @@ network:
     namespaceSelector: {}
     podSelector: {}
   externalProxy:
-    # Explicit CIDR/port egress for a configured OIDC issuer or GitLab
-    # import proxy. Empty by default: no product feature in this chart
-    # depends on it existing yet, so leaving it empty denies that egress
-    # entirely rather than silently opening the public backend to the
-    # internet.
+    # Explicit CIDR/port egress from backend-public for identity-provider
+    # sign-in (see backendPublic.oidc) and GitLab import: the address of an
+    # egress proxy (backendPublic.oidc.proxyUrl/gitlabImport.proxyUrl), or the
+    # remote services' own ranges. Empty by default, which denies that
+    # egress entirely rather than silently opening the public backend to the
+    # internet; Google sign-in fails until this is set. hack/kind/up.sh opens
+    # ["0.0.0.0/0"] on 443 when Google is configured, a development-only
+    # shortcut.
     cidrs: []
     ports: []
   monitoring:

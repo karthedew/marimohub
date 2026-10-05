@@ -96,6 +96,7 @@ spec:
               {{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /api/health
@@ -105,6 +106,11 @@ spec:
               {{- end }}
             initialDelaySeconds: 10
             periodSeconds: 20
+            # Generous on purpose: a liveness restart drops every proxied
+            # notebook connection this replica holds, which is far worse than
+            # a few seconds of slow health responses during a load burst.
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: tmp
               mountPath: /tmp

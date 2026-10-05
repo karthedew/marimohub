@@ -17,12 +17,34 @@ export const frontendPort = process.env.E2E_FRONTEND_PORT ?? '5173';
 // same host, which strands the iframe in an endless auth redirect. Matching
 // the frontend's `localhost` origin keeps the session frame same-site.
 export const backendBaseUrl = `http://localhost:${backendPort}`;
-// The backend's CORS policy allows exactly one browser origin
-// (`http://localhost:5173`, the Vite dev-server default) and that is backend
-// configuration this suite cannot change. The frontend origin below has to
-// match it byte-for-byte — scheme, host, and port — or every cross-origin
-// fetch the app makes fails preflight before this suite gets to test anything.
+// The backend allows cross-origin calls from `http://localhost:5173` (the Vite
+// dev-server default) plus the origin of `PUBLIC_APP_URL`, which global setup
+// sets to this URL — so E2E_FRONTEND_PORT can move the frontend off 5173, e.g.
+// while `npm run dev` holds it. The same URL is where the backend sends the
+// browser after a provider sign-in (`/auth/callback`, or `/auth/login?error=`).
 export const frontendBaseUrl = `http://localhost:${frontendPort}`;
+
+// The fake OpenID provider from `fakeIdp.ts`, started by global setup.
+export const idpPort = process.env.E2E_IDP_PORT ?? '8111';
+// Test code talks to its control endpoint directly on loopback; only the OIDC
+// flow itself (backend and browser) goes through the issuer URL below.
+export const idpControlUrl = `http://127.0.0.1:${idpPort}`;
+
+// The provider the e2e backend is configured with, in `OIDC_PROVIDERS` shape.
+// The issuer has no trailing slash and must match the fake provider's
+// discovery document and `iss` claims byte-for-byte.
+export const e2eOidcProvider = {
+	kind: 'oidc',
+	slug: 'e2e',
+	display_name: 'Test IdP',
+	issuer: `http://localhost:${idpPort}`,
+	client_id: 'e2e-client',
+	client_secret: 'e2e-secret'
+} as const;
+
+// The only redirect URI the fake provider accepts: the backend derives it
+// from PUBLIC_API_URL, so any drift in that derivation fails sign-in loudly.
+export const e2eOidcRedirectUri = `${backendBaseUrl}/api/auth/oidc/${e2eOidcProvider.slug}/callback`;
 
 /**
  * The dedicated E2E database name. Every setup/teardown step that can drop or

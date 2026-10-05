@@ -102,9 +102,11 @@ var _ = Describe("MarimoSession Controller", func() {
 		// behind.
 		Expect(got.Status.Message).To(BeEmpty())
 		// The Ready transition itself must not also perform idle
-		// evaluation: a zero RequeueAfter here means the next reconcile is
-		// purely event-driven, not "immediately re-checked as if idle."
-		Expect(result.RequeueAfter).To(BeZero())
+		// evaluation, but it must schedule the first one a full idle window
+		// out: the Ready status write is filtered by the predicate, so this
+		// requeue is the only thing that ever brings the controller back to
+		// a Runtime that receives no activity.
+		Expect(result.RequeueAfter).To(Equal(r.effectiveIdleTimeout(got) + r.IdleGracePeriod))
 	})
 })
 

@@ -35,6 +35,14 @@ HELM = os.environ.get("HELM", "helm")
 # explicitly rather than relying on a real API server to supply one.
 KUBE_VERSION = "1.35.0"
 
+# The operator's own RBAC sources, which the chart's operator Roles must
+# mirror: role.yaml is generated from the kubebuilder markers in
+# internal/controller/ by `make generate`; leader_election_role.yaml is
+# maintained by hand.
+OPERATOR_RBAC_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "marimohub-operator", "config", "rbac"
+)
+
 
 def helm_template(chart_dir: str, values_files: list[str]) -> list[dict]:
     cmd = [HELM, "template", RELEASE, chart_dir, "--kube-version", KUBE_VERSION]
@@ -85,13 +93,25 @@ def rule_map(role: dict) -> dict[tuple[str, str], set[str]]:
     more resources under it with a shared verb set, so exploding by
     resource (not by rule index) is what makes an exact per-resource
     comparison possible regardless of how rules happen to be grouped.
+    Verbs from every rule naming the same resource are unioned, because
+    the API server grants their union: keeping only the last rule's verbs
+    would let an earlier, broader rule pass an exact-set check unseen.
     """
     flattened: dict[tuple[str, str], set[str]] = {}
     for rule in role["rules"]:
         for api_group in rule.get("apiGroups", [""]):
             for resource in rule["resources"]:
-                flattened[(api_group, resource)] = set(rule["verbs"])
+                flattened.setdefault((api_group, resource), set()).update(rule["verbs"])
     return flattened
+
+
+def load_role(path: str, name: str) -> dict:
+    """The Role called `name` from a plain (non-template) RBAC manifest."""
+    with open(path) as handle:
+        for doc in yaml.safe_load_all(handle):
+            if doc and doc.get("kind") == "Role" and doc["metadata"]["name"] == name:
+                return doc
+    raise LookupError(f"no Role named {name!r} in {path}")
 
 
 class Check:
@@ -119,6 +139,12 @@ def check_rbac(index: dict, check: Check, ns: dict) -> None:
             ("", "resourcequotas"): {"get", "list"},
             ("", "secrets"): {"get", "list", "watch"},
             ("marimohub.io", "marimosessions"): {"delete", "get", "list", "watch"},
+            # Not finalizer use: OwnerReferencesPermissionEnforcement (on by
+            # default in OpenShift) requires it before the operator may set
+            # blockOwnerDeletion=true on the Pods/Services it creates. update
+            # only, never get/patch/delete: the admission check asks for
+            # nothing else.
+            ("marimohub.io", "marimosessions/finalizers"): {"update"},
             ("marimohub.io", "marimosessions/status"): {"get", "patch", "update"},
         },
     )
@@ -127,7 +153,27 @@ def check_rbac(index: dict, check: Check, ns: dict) -> None:
     check.eq(
         "operator leader-election Role rule set",
         rule_map(leader_role),
-        {("coordination.k8s.io", "leases"): {"get", "list", "watch", "create", "update", "patch", "delete"}},
+        {
+            ("coordination.k8s.io", "leases"): {"get", "list", "watch", "create", "update", "patch", "delete"},
+            # The LeaderElection Event leader election records on its Lease
+            # in this namespace (core/v1 Events). create/patch only.
+            ("", "events"): {"create", "patch"},
+        },
+    )
+
+    # The chart must grant the operator exactly what the operator's own RBAC
+    # sources declare. Pinning both sides catches a kubebuilder marker that
+    # changes without the chart following, or a chart edit that the markers
+    # never learn about.
+    check.eq(
+        "operator Role mirrors marimohub-operator/config/rbac/role.yaml",
+        rule_map(operator_role),
+        rule_map(load_role(os.path.join(OPERATOR_RBAC_DIR, "role.yaml"), "manager-role")),
+    )
+    check.eq(
+        "operator leader-election Role mirrors marimohub-operator/config/rbac/leader_election_role.yaml",
+        rule_map(leader_role),
+        rule_map(load_role(os.path.join(OPERATOR_RBAC_DIR, "leader_election_role.yaml"), "leader-election-role")),
     )
 
     public_role = index[("Role", f"{RELEASE}-backend-public", ns["sessions"])]

@@ -1,8 +1,11 @@
 # Permissions for leader election. controller-runtime's default resource
 # lock is Leases only (the legacy configmapsleases lock is not used), so
-# there is no configmaps rule here; Event creation is a separate concern from
-# leader election and is granted, if and when the reconciler emits Events,
-# alongside the resources it emits Events about rather than bundled here.
+# there is no configmaps rule here. Leader election does record one Event of
+# its own: a LeaderElection Event ("became leader") on the Lease, in the
+# Lease's namespace, through client-go's core/v1 event recorder. create/patch
+# on events is for that Event alone (patch is how the recorder folds a repeat
+# into the existing Event). The reconciler's Events about MarimoSessions are
+# a separate grant, generated into role.yaml for the Runtime namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -23,3 +26,10 @@ rules:
   - update
   - patch
   - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch

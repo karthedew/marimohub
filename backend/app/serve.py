@@ -25,11 +25,14 @@ and is not reimplemented here.
 import asyncio
 from collections.abc import Callable, Mapping
 import contextlib
+import copy
 import logging
 import os
 import ssl
+from typing import Any
 
 import uvicorn
+import uvicorn.config
 
 logger = logging.getLogger("app.serve")
 
@@ -42,6 +45,56 @@ _DEFAULT_HOST = "0.0.0.0"  # noqa: S104 -- the production container's only inter
 _DEFAULT_PORT = 8000
 _DEFAULT_TLS_POLL_INTERVAL_SECONDS = 5.0
 _DEFAULT_GRACEFUL_SHUTDOWN_SECONDS = 30
+
+# Libraries that log full request URLs below WARNING: httpx logs every
+# request line at INFO ("HTTP Request: GET <url> ..."), and httpcore traces
+# the same at DEBUG. The gateway used to put a Runtime's marimo access token
+# in the upstream URL, so at INFO every proxied request wrote that token into
+# the pod log. It now sends the token as a header, but a logged URL still
+# carries whatever query string a browser or identity provider supplied, and
+# one line per proxied request is noise. Warnings and errors still get
+# through.
+_URL_LOGGING_LIBRARIES = ("httpx", "httpcore")
+
+
+def _configure_logging() -> None:
+    """Log at INFO, except for libraries whose INFO lines carry credentials in URLs.
+
+    Uvicorn's own logging setup, applied later when its `Config` is built,
+    only reconfigures the `uvicorn.*` loggers, so these levels survive it.
+    """
+    logging.basicConfig(level=logging.INFO)
+    for name in _URL_LOGGING_LIBRARIES:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+class _DropQueryString(logging.Filter):
+    """Cut the query string out of Uvicorn's access-log request lines; the path stays.
+
+    A query string carries whatever the caller put there: a person search's
+    text (partial names, or a whole email address, on every keystroke), an
+    identity provider's authorization code, a deployed app's own parameters.
+    None of it belongs in the pod log, which records every request, even
+    refused ones.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Rewrite the record's path argument in place; never drop the record."""
+        # Uvicorn logs '%s - "%s %s HTTP/%s" %d' with exactly these five
+        # arguments, which its AccessFormatter unpacks in turn.
+        match record.args:
+            case (client, method, str() as target, http_version, status):
+                path = target.partition("?")[0]
+                record.args = (client, method, path, http_version, status)
+        return True
+
+
+def _log_config() -> dict[str, Any]:
+    """Return Uvicorn's default logging configuration, with `_DropQueryString` on its access log."""
+    config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    config["filters"] = {"drop_query_string": {"()": _DropQueryString}}
+    config["handlers"]["access"]["filters"] = ["drop_query_string"]
+    return config
 
 
 def _app_import_string(env: Mapping[str, str]) -> str:
@@ -127,7 +180,10 @@ def _build_config(
     keyfile: str | None,
     graceful_timeout_seconds: int,
 ) -> uvicorn.Config:
-    """Build the Uvicorn configuration for `app_import_string`."""
+    """Build the Uvicorn configuration for `app_import_string`.
+
+    Building it applies `_log_config` to the `uvicorn.*` loggers.
+    """
     return uvicorn.Config(
         app_import_string,
         host=host,
@@ -137,6 +193,7 @@ def _build_config(
         timeout_graceful_shutdown=graceful_timeout_seconds,
         server_header=False,
         proxy_headers=False,
+        log_config=_log_config(),
     )
 
 
@@ -190,7 +247,7 @@ async def _main(env: Mapping[str, str]) -> None:
 
 def main() -> None:
     """Entrypoint for `python -m app.serve`."""
-    logging.basicConfig(level=logging.INFO)
+    _configure_logging()
     asyncio.run(_main(os.environ))
 
 

@@ -131,17 +131,28 @@ def redirecting_upstream_http_server() -> Iterator[_UpstreamServer]:
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            requests.append({"path": self.path, "cookie": self.headers.get("Cookie")})
-            if self.headers.get("Cookie") != "marimo-session=ready":
+            # Checks credentials the way marimo does: the gateway's bearer
+            # header authenticates; anything else (no credentials, or only a
+            # stale cookie from an earlier process) gets marimo's redirect.
+            requests.append(
+                {
+                    "path": self.path,
+                    "cookie": self.headers.get("Cookie"),
+                    "authorization": self.headers.get("Authorization"),
+                }
+            )
+            if self.headers.get("Authorization") != f"Bearer {_UPSTREAM_AUTH}":
                 self.send_response(303)
                 self.send_header("Location", "/api/deployments/redirect-root/")
-                self.send_header(
-                    "Set-Cookie", "marimo-session=ready; Path=/api/deployments/redirect-root"
-                )
                 self.end_headers()
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            self.send_header(
+                "Set-Cookie",
+                "session_8080_api_deployments_redirect-root=fresh; "
+                "Path=/api/deployments/redirect-root",
+            )
             self.end_headers()
             self.wfile.write(b"deployment-html")
 
@@ -167,7 +178,13 @@ def upstream_http_server() -> Iterator[_UpstreamServer]:
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            requests.append({"path": self.path, "header": self.headers.get("X-Molab-Test")})
+            requests.append(
+                {
+                    "path": self.path,
+                    "header": self.headers.get("X-Molab-Test"),
+                    "authorization": self.headers.get("Authorization"),
+                }
+            )
             self.send_response(200)
             self.send_header("X-Upstream", "ok")
             self.end_headers()
@@ -181,6 +198,7 @@ def upstream_http_server() -> Iterator[_UpstreamServer]:
                     "method": method,
                     "path": self.path,
                     "header": self.headers.get("X-Molab-Test"),
+                    "authorization": self.headers.get("Authorization"),
                     "body": body,
                 }
             )
@@ -624,17 +642,15 @@ async def test_first_deployment_request_wakes_and_proxies_original_request(
     assert fake_deployment_manager.touches == [fake_deployment_manager.spawned[0][1]]
     assert upstream_http_server.requests == [
         {
-            "path": (
-                "/api/deployments/wake-notebook/nested/path"
-                "?metric=cpu&value=94.2&access_token=secret"
-            ),
+            "path": "/api/deployments/wake-notebook/nested/path?metric=cpu&value=94.2",
             "header": "header-value",
+            "authorization": f"Bearer {_UPSTREAM_AUTH}",
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_deployment_root_follows_marimo_auth_redirect(
+async def test_deployment_serves_a_returning_visitor_whose_marimo_cookie_is_stale(
     api_client: AsyncClient,
     db_session: AsyncSession,
     redirecting_upstream_http_server: _UpstreamServer,
@@ -654,15 +670,25 @@ async def test_deployment_root_follows_marimo_auth_redirect(
             json={"slug": "redirect-root"},
         )
 
-        response = await api_client.get("/api/deployments/redirect-root")
+        # Every wake starts a new marimo process with a new random signing
+        # secret, so the cookie an earlier visit earned can no longer be
+        # verified. It must not matter: the gateway authenticates itself.
+        response = await api_client.get(
+            "/api/deployments/redirect-root",
+            headers={"Cookie": "session_8080_api_deployments_redirect-root=from-an-earlier-wake"},
+        )
     finally:
         app.dependency_overrides.pop(get_session_manager, None)
 
     assert response.status_code == 200
     assert response.content == b"deployment-html"
+    assert "set-cookie" not in response.headers
     assert redirecting_upstream_http_server.requests == [
-        {"path": "/api/deployments/redirect-root/?access_token=secret", "cookie": None},
-        {"path": "/api/deployments/redirect-root/", "cookie": "marimo-session=ready"},
+        {
+            "path": "/api/deployments/redirect-root/",
+            "cookie": None,
+            "authorization": f"Bearer {_UPSTREAM_AUTH}",
+        },
     ]
 
 
@@ -698,8 +724,9 @@ async def test_deployment_proxy_forwards_body_for_non_post_methods(
     assert response.content == b"deployment-response"
     assert upstream_http_server.requests[0] == {
         "method": method,
-        "path": "/api/deployments/body-method/api/packages/install?name=polars&access_token=secret",
+        "path": "/api/deployments/body-method/api/packages/install?name=polars",
         "header": "header-value",
+        "authorization": f"Bearer {_UPSTREAM_AUTH}",
         "body": b"payload",
     }
     assert fake_deployment_manager.touches == [fake_deployment_manager.spawned[0][1]]
@@ -720,7 +747,7 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
         source_sha256="deadbeef",
         runtime_image=_RUNTIME_IMAGE,
     )
-    relayed: list[str] = []
+    relayed: list[tuple[str, str]] = []
 
     async def fake_load_active_deployment(db: object, slug: str) -> tuple[Deployment, Notebook]:
         assert slug == "ws-deploy"
@@ -729,10 +756,11 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
     async def fake_relay(
         websocket: WebSocket,
         target_url: str,
+        access_token: str,
         manager: FakeDeploymentSessionManager,
         deployment_id: UUID,
     ) -> None:
-        relayed.append(target_url)
+        relayed.append((target_url, access_token))
         await manager.mark_active(deployment_id)
         await websocket.accept()
         await websocket.close()
@@ -774,7 +802,7 @@ def test_deployment_websocket_wakes_and_relays_to_upstream(
     # probe misses and it wakes via the manager's idempotent spawn_deployment.
     assert fake_deployment_manager.spawned == [(notebook.id, deployment.id, "ws-deploy")]
     assert relayed == [
-        "ws://127.0.0.1:9000/api/deployments/ws-deploy/ws?client=browser&access_token=secret"
+        ("ws://127.0.0.1:9000/api/deployments/ws-deploy/ws?client=browser", _UPSTREAM_AUTH)
     ]
     # One mark_active at connect (the gateway's connect edge) plus one from the frame
     # the fake relay simulates.

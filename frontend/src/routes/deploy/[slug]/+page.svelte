@@ -2,6 +2,8 @@
 	import { untrack } from 'svelte';
 	import { ApiError, api, deploymentProxyUrl } from '$lib/api';
 	import { decideWakeStep, nextWakeDelay, type WakeAttemptResult } from '$lib/deploymentWake';
+	import { LoaderCircle, RotateCcw, Rocket, TriangleAlert } from '@lucide/svelte';
+	import BrandMark from '$lib/components/BrandMark.svelte';
 	import Button from '$lib/components/Button.svelte';
 
 	let { params } = $props();
@@ -106,46 +108,52 @@
 	<title>{params.slug} | MarimoHub deployment</title>
 </svelte:head>
 
-<div class="fixed inset-0 z-50 bg-slate-950 text-white">
+<main id="main" class="fixed inset-0 z-50 bg-app-bg text-app-fg">
 	{#if ready}
 		<div class="relative h-full w-full">
 			{#if !frameLoaded}
-				<div class="absolute inset-0 z-10 grid place-items-center bg-slate-950 px-6 text-center" aria-live="polite">
-					<div class="w-full max-w-md rounded-[2rem] border border-white/10 bg-white/10 p-8 shadow-2xl shadow-black/40 backdrop-blur">
-						<div class="mx-auto h-3 w-40 overflow-hidden rounded-full bg-white/10">
-							<div class="h-full w-1/2 animate-pulse rounded-full bg-hub-300"></div>
-						</div>
-						<p class="mt-7 text-sm font-semibold uppercase tracking-[0.3em] text-hub-200">Opening app</p>
-						<p class="mt-4 text-sm leading-6 text-slate-300">The deployment is awake. Loading the notebook frame now.</p>
+				<div class="absolute inset-0 z-10 grid place-items-center bg-app-bg px-6 text-center" aria-live="polite">
+					<div class="w-full max-w-sm rounded-lg border border-app-line bg-app-card p-8 shadow-[var(--shadow-sm)]">
+						<LoaderCircle size={28} class="mx-auto animate-spin text-brand-strong" />
+						<p class="mt-5 text-xs font-semibold uppercase tracking-[0.14em] text-brand-strong">Opening app</p>
+						<p class="mt-2 text-sm text-app-muted">The deployment is awake. Loading the notebook frame now.</p>
 					</div>
 				</div>
 			{/if}
 			<iframe class="h-full w-full border-0 bg-white" src={iframeSrc} title={`${params.slug} deployment`} onload={() => (frameLoaded = true)} onerror={() => { frameLoaded = true; ready = false; error = 'The deployment frame could not be loaded.'; }}></iframe>
 		</div>
 	{:else}
-		<div class="grid h-full place-items-center px-6">
-			<div class="w-full max-w-xl rounded-[2rem] border border-white/10 bg-white/10 p-8 text-center shadow-2xl shadow-black/40 backdrop-blur">
-				{#if error}
-					<p class="text-sm font-semibold uppercase tracking-[0.3em] text-red-200">Deployment unavailable</p>
-					<h1 class="mt-5 text-3xl font-black tracking-tight sm:text-5xl">Unable to open this app.</h1>
-					{#if capacityExhausted}
-						<p class="mt-4 text-sm leading-6 text-slate-300">This deployment is at capacity right now. Wait a moment and try again.</p>
+		<div class="grid h-full place-items-center overflow-y-auto px-5 py-10">
+			<div class="w-full max-w-md">
+				<a href="/" class="mb-8 flex w-fit items-center gap-2.5 text-app-fg no-underline" aria-label="MarimoHub home">
+					<BrandMark />
+					<span class="text-[17px] font-semibold tracking-[-0.02em]">MarimoHub</span>
+				</a>
+				<div class="rounded-lg border border-app-line bg-app-card p-7 shadow-[var(--shadow-sm)]">
+					{#if error}
+						<span class="grid size-10 place-items-center rounded-md bg-app-danger/10 text-app-danger"><TriangleAlert size={18} /></span>
+						<p class="mt-5 text-xs font-semibold uppercase tracking-[0.14em] text-app-danger">Deployment unavailable</p>
+						<h1 class="mt-2 text-[1.6rem]">Unable to open this app.</h1>
+						{#if capacityExhausted}
+							<p class="mt-2 text-sm leading-6 text-app-muted">This deployment is at capacity right now. Wait a moment and try again.</p>
+						{:else}
+							<p class="mt-2 text-sm leading-6 text-app-muted">{error}</p>
+						{/if}
+						<Button intent="primary" class="mt-6" type="button" onclick={() => void wakeDeployment(params.slug)}>
+							<RotateCcw size={15} />Try again
+						</Button>
 					{:else}
-						<p class="mt-4 text-sm leading-6 text-slate-300">{error}</p>
+						<span class="grid size-10 place-items-center rounded-md bg-brand-soft text-brand-strong"><Rocket size={18} /></span>
+						<p class="mt-5 text-xs font-semibold uppercase tracking-[0.14em] text-brand-strong">Waking up...</p>
+						<h1 class="mt-2 break-words text-[1.6rem]">Starting {params.slug}</h1>
+						<p class="mt-2 text-sm leading-6 text-app-muted">Cold deployments can take a few seconds before the notebook is ready.</p>
+						<div class="mt-6 flex items-center gap-2 border-t border-app-line pt-4 text-xs text-app-muted" aria-live="polite">
+							<LoaderCircle size={14} class="animate-spin text-brand-strong" />
+							<span>Attempt {attempts}</span>
+						</div>
 					{/if}
-					<Button intent="primary" onDark class="mt-7" type="button" onclick={() => void wakeDeployment(params.slug)}>
-						Try again
-					</Button>
-				{:else}
-					<div class="mx-auto h-3 w-40 overflow-hidden rounded-full bg-white/10">
-						<div class="h-full w-1/2 animate-pulse rounded-full bg-hub-300"></div>
-					</div>
-					<p class="mt-7 text-sm font-semibold uppercase tracking-[0.3em] text-hub-200">Waking up...</p>
-					<h1 class="mt-5 text-3xl font-black tracking-tight sm:text-5xl">Starting {params.slug}</h1>
-					<p class="mt-4 text-sm leading-6 text-slate-300">Cold deployments can take a few seconds before the notebook is ready.</p>
-					<p class="mt-5 text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Attempt {attempts}</p>
-				{/if}
+				</div>
 			</div>
 		</div>
 	{/if}
-</div>
+</main>

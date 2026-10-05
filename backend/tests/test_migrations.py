@@ -1,11 +1,17 @@
 from uuid import uuid4
 
+from alembic import command
+from alembic.config import Config
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Deployment, DeploymentDesiredState, Notebook, Workspace
+
+# The revision `users.display_name` (20261004_0004) builds on.
+PRE_DISPLAY_NAME_REVISION = "20261004_0003"
 
 
 @pytest.mark.asyncio
@@ -101,6 +107,94 @@ async def test_local_identity_partial_unique_index_enforces_one_per_user(
         ),
         {"id": uuid4(), "user_id": user_id, "subject": "google-subject"},
     )
+
+
+@pytest.mark.asyncio
+async def test_identity_email_authoritative_is_not_null_and_defaults_to_false(
+    db_session: AsyncSession,
+) -> None:
+    column = (
+        await db_session.execute(
+            text(
+                "SELECT is_nullable, column_default FROM information_schema.columns "
+                "WHERE table_name = 'identities' AND column_name = 'email_authoritative'"
+            )
+        )
+    ).one()
+    assert column.is_nullable == "NO"
+    assert column.column_default == "false"
+
+    # A row written without the column never counts as a vouched-for email.
+    user_id = uuid4()
+    await db_session.execute(
+        text("INSERT INTO users (id, username, email) VALUES (:id, :username, :email)"),
+        {"id": user_id, "username": "unproven", "email": "unproven@example.com"},
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO identities (id, user_id, provider, subject) "
+            "VALUES (:id, :user_id, 'oidc:corp', 'corp-subject')"
+        ),
+        {"id": uuid4(), "user_id": user_id},
+    )
+    authoritative = await db_session.scalar(
+        text("SELECT email_authoritative FROM identities WHERE user_id = :user_id"),
+        {"user_id": user_id},
+    )
+    assert authoritative is False
+
+
+@pytest.mark.asyncio
+async def test_users_display_name_is_an_optional_varchar_255(db_session: AsyncSession) -> None:
+    column = (
+        await db_session.execute(
+            text(
+                "SELECT data_type, character_maximum_length, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'display_name'"
+            )
+        )
+    ).one()
+    assert column.data_type == "character varying"
+    assert column.character_maximum_length == 255
+    assert column.is_nullable == "YES"
+    assert column.column_default is None
+
+    # A row written without the column, as every pre-existing account was, has none.
+    user_id = uuid4()
+    await db_session.execute(
+        text("INSERT INTO users (id, username, email) VALUES (:id, :username, :email)"),
+        {"id": user_id, "username": "nameless", "email": "nameless@example.com"},
+    )
+    display_name = await db_session.scalar(
+        text("SELECT display_name FROM users WHERE id = :id"), {"id": user_id}
+    )
+    assert display_name is None
+
+
+def _users_columns(database_url: str) -> set[str]:
+    engine = create_engine(make_url(database_url).set(drivername="postgresql+psycopg"))
+    try:
+        with engine.connect() as connection:
+            return {column["name"] for column in inspect(connection).get_columns("users")}
+    finally:
+        engine.dispose()
+
+
+def test_display_name_migration_round_trips(test_database_url: str) -> None:
+    # Synchronous on purpose: Alembic's env.py drives its async engine with
+    # asyncio.run, which cannot start inside a test's running event loop.
+    config = Config("alembic.ini")
+    try:
+        assert "display_name" in _users_columns(test_database_url)
+
+        command.downgrade(config, PRE_DISPLAY_NAME_REVISION)
+        assert "display_name" not in _users_columns(test_database_url)
+
+        command.upgrade(config, "head")
+        assert "display_name" in _users_columns(test_database_url)
+    finally:
+        command.upgrade(config, "head")  # never leave later tests on an old schema
 
 
 @pytest.mark.asyncio

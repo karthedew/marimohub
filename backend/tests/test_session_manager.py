@@ -1,20 +1,27 @@
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 import os
 from pathlib import Path
 import shutil
 import sys
+import time
 from typing import cast
 from uuid import uuid4
 
 import pytest
+from starlette.concurrency import run_in_threadpool
 
+from app.core.config import Settings, get_settings
 from app.models import Deployment, Notebook
+from app.services import session_manager as session_manager_module
 from app.services.session_manager import (
     NotebookStartupError,
+    SessionManager,
     SessionNotFoundError,
     SessionPhase,
     SessionStartError,
+    get_session_manager,
+    shutdown_session_manager,
 )
 from app.services.subprocess_backend import (
     SubprocessSessionManager,
@@ -281,6 +288,43 @@ def test_marimo_env_drops_uv_project_markers(monkeypatch: pytest.MonkeyPatch) ->
     assert env["UV_CACHE_DIR"].endswith("molab-uv-cache")
 
 
+def test_marimo_env_keeps_the_backends_secrets_from_the_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The kernel runs notebook code, which can read every variable it inherits.
+    backend_only = {
+        "SECRET_KEY": "backend-signing-key",
+        "DATABASE_URL": "postgresql+asyncpg://molab:db-password@db:5432/molab",
+        "GOOGLE_CLIENT_ID": "1234-abc.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": "GOCSPX-canary",
+        "OIDC_PROVIDERS": '[{"client_secret": "oidc-canary"}]',
+        "OIDC_HTTP_PROXY_URL": "http://user:pass@proxy.internal:3128",
+        "GITLAB_IMPORT_PROXY_URL": "http://gitlab-proxy.internal:3128",
+        "AWS_SECRET_ACCESS_KEY": "aws-canary",
+    }
+    needed = {
+        "PATH": "/usr/local/bin:/usr/bin",
+        "HOME": "/home/molab",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TMPDIR": "/tmp/molab",  # noqa: S108 -- a value to pass through, never used as a path
+        "PYTHONPATH": "/srv/lib",
+        "MARIMO_OUTPUT_MAX_BYTES": "10000000",
+        "UV_INDEX_URL": "https://pypi.internal/simple",
+        "XDG_CONFIG_HOME": "/home/molab/.config",
+    }
+    for name, value in {**backend_only, **needed}.items():
+        monkeypatch.setenv(name, value)
+
+    env = runtime_module.marimo_env()
+
+    assert sorted(env.keys() & backend_only.keys()) == []  # names only, never values
+    assert {name: env[name] for name in needed if name != "PATH"} == {
+        name: value for name, value in needed.items() if name != "PATH"
+    }
+    assert env["PATH"].endswith(needed["PATH"])
+
+
 def test_marimo_command_runs_notebooks_in_uv_sandbox() -> None:
     notebook_path = "/work/notebook.py"
     command = runtime_module.marimo_command(
@@ -307,6 +351,79 @@ async def test_stop_unknown_session_raises_domain_error() -> None:
 
     with pytest.raises(SessionNotFoundError):
         await manager.stop(uuid4())
+
+
+# More first requests than anyio's default threadpool (40 workers) runs at once.
+_CONCURRENT_FIRST_REQUESTS = 50
+
+
+@pytest.fixture
+def _fresh_process_manager(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """No process-wide manager yet, and settings that select the subprocess backend.
+
+    The previous instance (if another test created one) is restored afterward.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://molab:molab@localhost:5432/molab_test")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-with-at-least-32-bytes")
+    monkeypatch.delenv("SESSION_BACKEND", raising=False)
+    monkeypatch.setitem(session_manager_module._manager_state, "instance", None)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_process_manager")
+async def test_concurrent_first_calls_create_exactly_one_session_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a burst of first requests used to build one manager per worker thread.
+
+    FastAPI resolves this sync dependency in its threadpool, which is
+    exactly what `run_in_threadpool` does here. Each extra Kube manager
+    built its own Kubernetes client on first use and was dropped unclosed.
+    """
+    real_from_settings = SubprocessSessionManager.from_settings
+    created: list[SessionManager] = []
+
+    def _slow_from_settings(settings: Settings) -> SubprocessSessionManager:
+        # Widens the window between the unlocked check and the store, as the
+        # first import of kubernetes_asyncio does in production.
+        time.sleep(0.05)
+        manager = real_from_settings(settings)
+        created.append(manager)
+        return manager
+
+    monkeypatch.setattr(SubprocessSessionManager, "from_settings", _slow_from_settings)
+
+    managers = await asyncio.gather(
+        *(run_in_threadpool(get_session_manager) for _ in range(_CONCURRENT_FIRST_REQUESTS))
+    )
+
+    assert len(created) == 1
+    assert all(manager is created[0] for manager in managers)
+    assert get_session_manager() is created[0]
+
+
+class _ShutdownCountingManager:
+    def __init__(self) -> None:
+        self.shutdowns = 0
+
+    async def shutdown(self) -> None:
+        self.shutdowns += 1
+        await asyncio.sleep(0)  # lets a concurrent caller run mid-shutdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_fresh_process_manager")
+async def test_shutdown_session_manager_shuts_the_instance_down_once_and_forgets_it() -> None:
+    manager = _ShutdownCountingManager()
+    session_manager_module._manager_state["instance"] = cast("SessionManager", manager)
+
+    await asyncio.gather(shutdown_session_manager(), shutdown_session_manager())
+
+    assert manager.shutdowns == 1
+    assert session_manager_module._manager_state["instance"] is None
 
 
 @pytest.mark.integration

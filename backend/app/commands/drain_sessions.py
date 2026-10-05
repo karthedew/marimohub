@@ -88,13 +88,11 @@ class _CoreV1Client(Protocol):
     ) -> Awaitable[_ListResult]: ...
 
 
-async def _load_clients() -> tuple[CustomObjectsApi, CoreV1Api]:
+async def _load_config() -> None:
     try:
         kube_config.load_incluster_config()
     except ConfigException:
         await kube_config.load_kube_config()
-    api_client = client.ApiClient()
-    return CustomObjectsApi(api_client), CoreV1Api(api_client)
 
 
 async def _list_session_names(custom: _CustomObjectsClient, namespace: str) -> list[str]:
@@ -206,20 +204,23 @@ async def _run() -> bool:
     poll_interval_seconds = float(
         os.environ.get("DRAIN_POLL_INTERVAL_SECONDS", _DEFAULT_POLL_INTERVAL_SECONDS)
     )
-    custom, core = await _load_clients()
-    # The generated clients accept a wider parameter set (e.g.
-    # `grace_period_seconds`) than the narrow Protocols above actually call
-    # through, so the structural match is asserted here rather than
-    # satisfied automatically -- the same pattern
-    # `kube_session_manager.KubeSessionManager._clients` uses for the same
-    # reason.
-    return await drain_sessions(
-        cast("_CustomObjectsClient", custom),
-        cast("_CoreV1Client", core),
-        namespace,
-        timeout_seconds=timeout_seconds,
-        poll_interval_seconds=poll_interval_seconds,
-    )
+    await _load_config()
+    # `async with` closes the client's aiohttp session and connection pool on
+    # every exit path; dropping them unclosed logs "Unclosed client session".
+    async with client.ApiClient() as api_client:
+        # The generated clients accept a wider parameter set (e.g.
+        # `grace_period_seconds`) than the narrow Protocols above actually
+        # call through, so the structural match is asserted here rather than
+        # satisfied automatically -- the same pattern
+        # `kube_session_manager.KubeSessionManager._clients` uses for the
+        # same reason.
+        return await drain_sessions(
+            cast("_CustomObjectsClient", CustomObjectsApi(api_client)),
+            cast("_CoreV1Client", CoreV1Api(api_client)),
+            namespace,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
 
 def main() -> None:

@@ -86,6 +86,15 @@
         "imagePullPolicy": { "$ref": "#/definitions/pullPolicy" },
         "port": { "$ref": "#/definitions/port" },
         "existingSecret": { "type": "string" },
+        "publicAppUrl": { "type": "string", "pattern": "^$|^https?://[^/?#@\\s]+(/[^?#\\s]*)?$" },
+        "oidc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string", "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "maxLength": 253 },
+            "proxyUrl": { "type": "string", "pattern": "^$|^https?://\\S+$" }
+          }
+        },
         "resources": { "$ref": "#/definitions/resources" },
         "podDisruptionBudget": { "$ref": "#/definitions/podDisruptionBudget" },
         "priorityClassName": { "type": "string" },
@@ -209,7 +218,10 @@
         "quota",
         "limitRange",
         "workVolumeSizeLimit",
-        "maxSourceBytes"
+        "maxSourceBytes",
+        "workspaceStorage",
+        "startTimeoutSeconds",
+        "sharedVolumes"
       ],
       "properties": {
         "defaultImageFlavor": { "type": "string", "minLength": 1 },
@@ -282,6 +294,45 @@
               "cidr": { "type": "string" },
               "port": { "type": "integer" },
               "protocol": { "type": "string", "enum": ["TCP", "UDP"] }
+            }
+          }
+        },
+        "startTimeoutSeconds": { "type": "integer", "minimum": 1 },
+        "sharedVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "existingClaim"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 56 },
+              "existingClaim": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "maxLength": 253 },
+              "subPath": { "type": "string", "pattern": "^[^/]" },
+              "mountPath": { "type": "string", "pattern": "^/" },
+              "readOnly": { "type": "boolean" },
+              "modes": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": ["edit", "run", "deploy"] }
+              },
+              "supplementalGroups": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+              }
+            }
+          }
+        },
+        "workspaceStorage": {
+          "type": "object",
+          "required": ["existingClaim", "mountPath", "supplementalGroups"],
+          "additionalProperties": false,
+          "properties": {
+            "existingClaim": { "type": "string", "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "maxLength": 253 },
+            "mountPath": { "type": "string", "pattern": "^/" },
+            "supplementalGroups": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
             }
           }
         }

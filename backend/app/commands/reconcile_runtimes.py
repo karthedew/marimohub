@@ -24,6 +24,7 @@ from app.services.session_manager import (
     SessionManager,
     SessionNotFoundError,
     get_session_manager,
+    shutdown_session_manager,
 )
 
 logger = logging.getLogger("app.commands.reconcile_runtimes")
@@ -75,8 +76,13 @@ async def reconcile_stale_runtimes(db: AsyncSession, manager: SessionManager) ->
 
 async def _run() -> int:
     manager = get_session_manager()
-    async with get_sessionmaker()() as db:
-        return await reconcile_stale_runtimes(db, manager)
+    try:
+        async with get_sessionmaker()() as db:
+            return await reconcile_stale_runtimes(db, manager)
+    finally:
+        # Releases the manager's Kubernetes client; without it every run
+        # ends by logging "Unclosed client session".
+        await shutdown_session_manager()
 
 
 def main() -> None:

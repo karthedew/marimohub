@@ -1,6 +1,12 @@
 <script lang="ts">
+	import { ArrowRight, ChevronLeft, ChevronRight, Compass, FileText, GitFork, RotateCcw, Search, SearchX, Sparkles, Tag } from '@lucide/svelte';
 	import { navigating } from '$app/state';
 	import Button from '$lib/components/Button.svelte';
+	import { VISIBILITY_EXPLANATIONS } from '$lib/notebookVisibility';
+	import { errorBanner, iconTile, tagChip } from '$lib/design/classes';
+	import Badge from '$lib/design/components/Badge.svelte';
+	import EmptyState from '$lib/design/components/EmptyState.svelte';
+	import PageHeader from '$lib/design/components/PageHeader.svelte';
 
 	let { data } = $props();
 	const loading = $derived(navigating.to !== null);
@@ -8,6 +14,9 @@
 	const totalPages = $derived(Math.max(1, Math.ceil(data.notebooks.total / data.notebooks.page_size)));
 	const showingFrom = $derived(data.notebooks.total === 0 ? 0 : (data.notebooks.page - 1) * data.notebooks.page_size + 1);
 	const showingTo = $derived(Math.min(data.notebooks.page * data.notebooks.page_size, data.notebooks.total));
+	const filtered = $derived(Boolean(data.filters.q || data.filters.tags));
+
+	const visibilityTone = { public: 'ok', unlisted: 'warn', private: 'neutral' } as const;
 
 	function pageHref(page: number) {
 		const params = new URLSearchParams();
@@ -24,126 +33,127 @@
 	<title>Discover | MarimoHub</title>
 </svelte:head>
 
-<section class="space-y-8">
-	<div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-		<div class="space-y-3">
-			<p class="w-fit rounded-full bg-hub-50 px-4 py-2 text-sm font-semibold text-hub-950 dark:bg-hub-400/10 dark:text-hub-200">
-				Discover
-			</p>
-			<h1 class="text-4xl font-black tracking-tight text-slate-950 dark:text-white sm:text-6xl">Browse notebooks</h1>
-			<p class="max-w-2xl text-slate-700 dark:text-slate-300">
-				Discover shows every Public Notebook, plus every Notebook in a Workspace you belong to, whatever its
-				Visibility. An Unlisted Notebook outside your Workspaces stays reachable only by direct link.
+<PageHeader
+	title="Browse notebooks"
+	eyebrow="Discover"
+	icon={Compass}
+	description="Discover shows every Public Notebook, plus every Notebook in a Workspace you belong to, whatever its Visibility. An Unlisted Notebook outside your Workspaces stays reachable only by direct link."
+/>
+
+<form class="mb-6 rounded-lg border border-app-line bg-app-card p-2 shadow-[var(--shadow-sm)]" method="GET" role="search">
+	<div class="flex items-center gap-2">
+		<label class="relative block min-w-0 flex-1" for="q">
+			<span class="visually-hidden">Search</span>
+			<Search size={19} class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-app-muted" />
+			<input
+				class="h-11 w-full rounded-md border-0 bg-transparent pl-10 pr-3 text-[15px] text-app-fg outline-none placeholder:text-app-muted"
+				id="q"
+				name="q"
+				type="search"
+				value={data.filters.q}
+				placeholder="Signals, dashboards, optimization"
+			/>
+		</label>
+		<Button intent="ink" type="submit" disabled={loading}>
+			{loading ? 'Searching...' : 'Search'}
+		</Button>
+	</div>
+
+	<div class="mt-2 flex flex-col gap-2 border-t border-app-line px-1 pt-2 sm:flex-row sm:items-center sm:gap-4">
+		<div class="flex min-w-0 items-center gap-2 sm:w-80">
+			<label class="flex shrink-0 items-center gap-1.5 text-xs font-semibold text-app-muted" for="tags"><Tag size={14} />Tags</label>
+			<input
+				class="h-8 w-full min-w-0 rounded-md border border-app-line bg-app-bg px-2.5 text-xs text-app-fg outline-none transition placeholder:text-app-muted focus:border-brand-strong"
+				id="tags"
+				name="tags"
+				type="text"
+				value={data.filters.tags}
+				placeholder="grafana, iot"
+			/>
+		</div>
+		<label class="flex w-fit items-center gap-2 text-xs font-medium text-app-muted">
+			<input class="size-3.5 accent-[var(--brand-strong)]" type="checkbox" name="semantic" value="1" checked={data.filters.semantic} />
+			<Sparkles size={13} />Semantic search
+		</label>
+	</div>
+</form>
+
+<section aria-labelledby="results-heading">
+	<div class="mb-3 flex flex-wrap items-end justify-between gap-3">
+		<div>
+			<h2 id="results-heading" class="m-0 border-0 p-0 text-base font-semibold">
+				{data.filters.q ? `Results for “${data.filters.q}”` : filtered ? 'Tagged results' : 'All visible'}
+			</h2>
+			<p class="mt-0.5 text-xs text-app-muted">
+				{#if data.error}
+					Results unavailable
+				{:else}
+					{data.notebooks.total} {data.notebooks.total === 1 ? 'notebook' : 'notebooks'}{data.filters.tags ? ` · tagged ${data.filters.tags}` : ''}{data.filters.semantic ? ' · semantic' : ''}
+				{/if}
 			</p>
 		</div>
 	</div>
 
-	<form
-		class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-5 shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20"
-		method="GET"
-	>
-		<div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(13rem,0.45fr)_auto] lg:items-end">
-			<div>
-				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="q">Search</label>
-				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
-					id="q"
-					name="q"
-					type="search"
-					value={data.filters.q}
-					placeholder="Signals, dashboards, optimization"
-				/>
-			</div>
-
-			<div>
-				<label class="text-sm font-bold text-slate-800 dark:text-slate-100" for="tags">Tags</label>
-				<input
-					class="mt-2 w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-slate-950 outline-none transition focus:border-hub-500 focus:ring-4 focus:ring-hub-500/15 dark:border-white/15 dark:bg-slate-950/50 dark:text-white"
-					id="tags"
-					name="tags"
-					type="text"
-					value={data.filters.tags}
-					placeholder="grafana, iot"
-				/>
-			</div>
-
-			<Button intent="primary" type="submit" disabled={loading}>
-				{loading ? 'Searching...' : 'Search'}
-			</Button>
-		</div>
-
-		<label class="mt-4 flex w-fit items-center gap-3 rounded-full bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 dark:bg-white/10 dark:text-slate-200">
-			<input class="size-4 accent-hub-600" type="checkbox" name="semantic" value="1" checked={data.filters.semantic} />
-			Semantic search
-		</label>
-	</form>
-
 	{#if data.error}
-		<div class="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-800 dark:border-red-400/20 dark:bg-red-500/10 dark:text-red-200" role="alert">
-			<p class="font-black">Unable to load notebooks</p>
-			<p class="mt-1 font-semibold">{data.error}</p>
-			<Button intent="primary" size="sm" class="mt-4" href={pageHref(data.notebooks.page)}>Try again</Button>
+		<div class={errorBanner} role="alert">
+			<p class="font-semibold">Unable to load notebooks</p>
+			<p class="mt-1">{data.error}</p>
+			<Button intent="secondary" size="sm" class="mt-3" href={pageHref(data.notebooks.page)}><RotateCcw size={14} />Try again</Button>
 		</div>
 	{:else if loading}
-		<div class="grid gap-4 md:grid-cols-2" aria-label="Loading notebooks">
-			{#each Array(4) as _}
-				<div class="h-56 animate-pulse rounded-[1.75rem] border border-slate-900/10 bg-white/55 dark:border-white/10 dark:bg-white/10"></div>
+		<div class="overflow-hidden rounded-lg border border-app-line bg-app-card" aria-label="Loading notebooks">
+			{#each Array(4) as _, index (index)}
+				<div class="flex items-start gap-3 border-b border-app-line px-4 py-4 last:border-0">
+					<div class="size-9 shrink-0 animate-pulse rounded-md bg-app-sidebar-hover"></div>
+					<div class="flex-1 space-y-2">
+						<div class="h-3.5 w-1/3 animate-pulse rounded bg-app-sidebar-hover"></div>
+						<div class="h-3 w-2/3 animate-pulse rounded bg-app-sidebar-hover"></div>
+					</div>
+				</div>
 			{/each}
 		</div>
 	{:else if data.notebooks.items.length === 0}
-		<div class="rounded-[2rem] border border-slate-900/10 bg-white/75 p-8 text-center shadow-lg shadow-slate-900/5 backdrop-blur dark:border-white/10 dark:bg-white/10 dark:shadow-black/20">
-			<p class="text-2xl font-black text-slate-950 dark:text-white">No notebooks found</p>
-			<p class="mt-2 text-sm leading-6 text-slate-600 dark:text-slate-300">Try a broader search or remove tag filters.</p>
-		</div>
+		<EmptyState icon={SearchX} title="No notebooks found" detail="Try a broader search or remove tag filters.">
+			{#if filtered}<Button intent="secondary" size="sm" href="/discover">Clear filters</Button>{/if}
+		</EmptyState>
 	{:else}
-		<div class="flex flex-col gap-3 text-sm font-semibold text-slate-600 dark:text-slate-300 sm:flex-row sm:items-center sm:justify-between">
-			<p>Showing {showingFrom}-{showingTo} of {data.notebooks.total}</p>
-			<p>Page {data.notebooks.page} of {totalPages}</p>
-		</div>
-
-		<div class="grid gap-4 md:grid-cols-2">
-			{#each data.notebooks.items as notebook}
-				<a
-					class="group rounded-[1.75rem] border border-slate-900/10 bg-white/75 p-6 shadow-lg shadow-slate-900/5 backdrop-blur transition hover:-translate-y-0.5 hover:shadow-xl dark:border-white/10 dark:bg-white/10 dark:shadow-black/20"
-					href={`/notebooks/${notebook.id}`}
-				>
-					<div class="flex items-start justify-between gap-4">
-						<div>
-							<p class="text-sm font-semibold uppercase tracking-[0.2em] text-hub-700 dark:text-hub-300">{notebook.visibility}</p>
-							<h2 class="mt-3 text-2xl font-black text-slate-950 group-hover:text-hub-700 dark:text-white dark:group-hover:text-hub-200">
-								{notebook.title}
-							</h2>
+		<div class="overflow-hidden rounded-lg border border-app-line bg-app-card">
+			{#each data.notebooks.items as notebook (notebook.id)}
+				<a class="group block border-b border-app-line px-4 py-4 no-underline last:border-0 hover:bg-app-sidebar-hover" href={`/notebooks/${notebook.id}`}>
+					<div class="flex items-start gap-3">
+						<span class="{iconTile} mt-0.5 size-9"><FileText size={17} /></span>
+						<div class="min-w-0 flex-1">
+							<div class="flex flex-wrap items-center gap-2">
+								<h3 class="m-0 text-sm font-semibold text-app-fg group-hover:text-brand-strong">{notebook.title}</h3>
+								<Badge tone={visibilityTone[notebook.visibility]} title={VISIBILITY_EXPLANATIONS[notebook.visibility]}>{notebook.visibility}</Badge>
+							</div>
+							<p class="mt-1 line-clamp-2 max-w-3xl text-sm text-app-muted">{notebook.description ?? 'No description provided.'}</p>
+							<div class="mt-2 flex flex-wrap items-center gap-1.5">
+								{#if notebook.tags.length > 0}
+									{#each notebook.tags as tag (tag)}<span class={tagChip}>{tag}</span>{/each}
+								{:else}
+									<span class="text-[11px] text-app-muted">No tags</span>
+								{/if}
+								<span class="ml-1 inline-flex items-center gap-1 text-[11px] text-app-muted"><GitFork size={12} />{notebook.fork_count} {notebook.fork_count === 1 ? 'fork' : 'forks'}</span>
+							</div>
 						</div>
-						<span class="rounded-full bg-slate-900 px-3 py-1 text-sm font-bold text-white dark:bg-white dark:text-slate-950">
-							{notebook.fork_count} forks
-						</span>
-					</div>
-
-					<p class="mt-4 line-clamp-2 text-sm leading-6 text-slate-600 dark:text-slate-300">{notebook.description ?? 'No description provided.'}</p>
-
-					<div class="mt-5 flex flex-wrap gap-2">
-						{#if notebook.tags.length > 0}
-							{#each notebook.tags as tag}
-								<span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700 dark:bg-white/10 dark:text-slate-200">{tag}</span>
-							{/each}
-						{:else}
-							<span class="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-500 dark:bg-white/10 dark:text-slate-400">No tags</span>
-						{/if}
+						<ArrowRight size={16} class="mt-2 shrink-0 text-app-muted transition group-hover:translate-x-0.5 group-hover:text-brand-strong" />
 					</div>
 				</a>
 			{/each}
 		</div>
 
-		<div class="flex items-center justify-between gap-3">
-			{#if data.notebooks.page > 1}
-				<Button intent="secondary" href={pageHref(data.notebooks.page - 1)}>Previous</Button>
-			{:else}
-				<span></span>
-			{/if}
-
-			{#if data.notebooks.page < totalPages}
-				<Button intent="primary" href={pageHref(data.notebooks.page + 1)}>Next</Button>
-			{/if}
-		</div>
+		<nav class="mt-3 flex flex-wrap items-center gap-3 text-xs text-app-muted" aria-label="Discover pagination">
+			<span class="tabular-nums">Showing {showingFrom}–{showingTo} of {data.notebooks.total}</span>
+			<span class="ml-auto tabular-nums">Page {data.notebooks.page} of {totalPages}</span>
+			<div class="flex items-center gap-1.5">
+				{#if data.notebooks.page > 1}
+					<Button intent="secondary" size="sm" href={pageHref(data.notebooks.page - 1)}><ChevronLeft size={14} />Previous</Button>
+				{/if}
+				{#if data.notebooks.page < totalPages}
+					<Button intent="secondary" size="sm" href={pageHref(data.notebooks.page + 1)}>Next<ChevronRight size={14} /></Button>
+				{/if}
+			</div>
+		</nav>
 	{/if}
 </section>

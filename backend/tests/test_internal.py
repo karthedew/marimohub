@@ -1,3 +1,4 @@
+from typing import cast
 from uuid import UUID, uuid4
 
 from httpx import AsyncClient
@@ -6,11 +7,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token
-from app.internal_main import app as internal_app
+from app.internal_main import app as internal_app, lifespan as internal_lifespan
 from app.models import Deployment, DeploymentDesiredState, Notebook, NotebookData
-from app.services.runtime_credentials import get_runtime_credential_verifier
+import app.services.runtime_credentials as runtime_credentials_module
+from app.services.runtime_credentials import (
+    RuntimeCredentialVerifier,
+    get_runtime_credential_verifier,
+)
 from test_notebooks import create_notebook, json_dict, register_and_login
-from test_runtime_credentials import FakeRuntimeCluster
+from test_runtime_credentials import ClusterResource, FakeRuntimeCluster
 
 
 def _bearer(token: str) -> dict[str, str]:
@@ -171,6 +176,54 @@ async def test_recreated_cr_with_new_uid_cannot_use_old_token(
     )
 
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["cr", "secret"])
+@pytest.mark.parametrize("api_status", [403, 429, 500])
+async def test_cluster_read_failure_returns_503_so_the_fetcher_retries(
+    internal_api_client: AsyncClient, resource: ClusterResource, api_status: int
+) -> None:
+    """Only a missing CR/Secret revokes; a throttled or failing read is retryable.
+
+    The source fetcher exits for good on 401 (failing the Runtime), while
+    curl retries a 503 on its own.
+    """
+    cluster = FakeRuntimeCluster()
+    _use_cluster(cluster)
+    runtime_id, credential = cluster.mint()
+    cluster.fail_reads(resource, api_status)
+
+    response = await internal_api_client.get(
+        f"/api/internal/runtimes/{runtime_id}/source", headers=_bearer(credential)
+    )
+
+    assert response.status_code == 503
+    assert credential not in response.text
+
+
+class _ClosingVerifier:
+    def __init__(self) -> None:
+        self.closes = 0
+
+    async def close(self) -> None:
+        self.closes += 1
+
+
+@pytest.mark.asyncio
+async def test_lifespan_closes_the_process_wide_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    verifier = _ClosingVerifier()
+    monkeypatch.setitem(
+        runtime_credentials_module._verifier_state,
+        "instance",
+        cast("RuntimeCredentialVerifier", verifier),
+    )
+
+    async with internal_lifespan(internal_app):
+        assert verifier.closes == 0
+
+    assert verifier.closes == 1
+    assert runtime_credentials_module._verifier_state["instance"] is None
 
 
 @pytest.mark.asyncio

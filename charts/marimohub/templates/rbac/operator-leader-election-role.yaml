@@ -1,7 +1,13 @@
 # controller-runtime's default resource lock is Leases only; there is no
 # configmaps rule because the legacy configmapsleases lock is never used.
-# Scoped to namespaces.controller only -- the operator never needs Lease
-# access anywhere else.
+# Leader election also records a LeaderElection Event ("became leader") on
+# that Lease, in this same namespace, through client-go's core/v1 event
+# recorder; create/patch on events is for that Event alone (patch is how the
+# recorder folds a repeat into the existing Event). Without it the API server
+# rejects the Event and the operator logs "events is forbidden" on every
+# leadership change. Mirrors marimohub-operator/config/rbac/
+# leader_election_role.yaml. Scoped to namespaces.controller only -- the
+# operator never needs Lease or Event access here for anything else.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -13,3 +19,6 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]

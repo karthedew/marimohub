@@ -83,6 +83,32 @@ and the operator/backend disagree about a number neither side ever varies.
 {{- end -}}
 
 {{/*
+Router timeout, in seconds, for the public API: the backend's own Runtime
+start timeout plus headroom, so the router never cuts off a start or wake
+request the backend is still legitimately waiting on.
+*/}}
+{{- define "marimohub.sharedVolumesJson" -}}
+{{- /*
+The operator's --shared-volumes value: runtime.sharedVolumes with the chart's
+existingClaim key renamed to the operator's claimName, and nothing else
+changed. Defaults (read-only, edit and run, /mnt/<name>) are applied and
+validated in one place, the operator, so a values file and a hand-written
+flag can never disagree about them.
+*/ -}}
+{{- $volumes := list -}}
+{{- range .Values.runtime.sharedVolumes -}}
+{{- $volume := omit . "existingClaim" -}}
+{{- $_ := set $volume "claimName" .existingClaim -}}
+{{- $volumes = append $volumes $volume -}}
+{{- end -}}
+{{- toJson $volumes -}}
+{{- end -}}
+
+{{- define "marimohub.routerTimeoutSeconds" -}}
+{{- add .Values.runtime.startTimeoutSeconds 30 -}}
+{{- end -}}
+
+{{/*
 "<repository>@<digest>" for a chart-managed image, failing fast if either
 half is missing rather than rendering a bare repository that would resolve
 to a mutable "latest" tag.

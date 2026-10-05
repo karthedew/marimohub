@@ -49,6 +49,31 @@ var _ = Describe("idle timers and the wake protocol", func() {
 		r.Options.IdleTimeout = session.IdleTimeoutDefaults{}
 	})
 
+	// The other specs here advance the fake clock and then call Reconcile by
+	// hand, which a real manager never does on its own. What actually brings
+	// the manager back to an unused Runtime is the RequeueAfter returned by
+	// the transition to Ready, because the predicate drops that status-only
+	// write. These pin it for both idle behaviors (delete and sleep).
+	DescribeTable("schedules the first idle evaluation on the transition to Ready",
+		func(newCR func() *marimohubv1alpha1.MarimoSession) {
+			r.Options.IdleTimeout = session.IdleTimeoutDefaults{EditSeconds: 30, RunSeconds: 30, DeploySeconds: 30}
+			r.IdleGracePeriod = 7 * time.Second
+			cr := createSession(newCR())
+			createValidSecret(cr)
+			Expect(reconcileUntil(r, cr, func(s *marimohubv1alpha1.MarimoSession) bool { return s.Status.PodName != "" })).To(Succeed())
+			markMainReady(getPod(cr))
+
+			result, err := r.Reconcile(ctx, reconcileRequest(cr))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getSession(keyOf(cr)).Status.Phase).To(Equal(marimohubv1alpha1.RuntimePhaseReady))
+			Expect(result.RequeueAfter).To(Equal(37 * time.Second))
+
+			deleteAndWait(cr)
+		},
+		Entry("edit Session", func() *marimohubv1alpha1.MarimoSession { return newValidSession() }),
+		Entry("deploy Runtime", func() *marimohubv1alpha1.MarimoSession { return asDeploy(newValidSession(), 1) }),
+	)
+
 	It("deletes an idle edit/run CR after its idle timeout elapses", func() {
 		cr := createSession(newValidSession())
 		r.Options.IdleTimeout.EditSeconds = 30

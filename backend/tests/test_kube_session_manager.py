@@ -1,6 +1,6 @@
 import asyncio
 import base64
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 import copy
 import pathlib
 from typing import Any, cast
@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
+from kubernetes_asyncio.config.config_exception import ConfigException
 import pytest
 import yaml
 
@@ -62,6 +63,8 @@ class FakeCustomObjectsApi:
         self.delete_calls: list[tuple[str, object | None]] = []
         self.on_create: Any = None
         self.events: list[str] = events if events is not None else []
+        # False leaves a woken CR as it was, as before the controller acts on it.
+        self.wake_makes_ready = True
 
     async def create_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, body: Mapping[str, Any]
@@ -93,7 +96,14 @@ class FakeCustomObjectsApi:
         plural: str,
         name: str,
         body: Mapping[str, Any],
+        *,
+        _content_type: str | None = None,
     ) -> dict[str, Any]:
+        # Like the real API server: an object body is only valid as a merge
+        # patch. Without an explicit content type, kubernetes_asyncio sends
+        # JSON Patch, and the server rejects the request.
+        if _content_type != "application/merge-patch+json":
+            raise ApiException(status=400, reason="BadRequest")
         if name not in self.objects:
             raise ApiException(status=404, reason="NotFound")
         self.patch_calls.append((name, copy.deepcopy(dict(body))))
@@ -101,10 +111,11 @@ class FakeCustomObjectsApi:
         annotations = body.get("metadata", {}).get("annotations", {})
         cr.setdefault("metadata", {}).setdefault("annotations", {}).update(annotations)
         if contract.ANNOTATION_WAKE_REQUEST in annotations:
-            cr["status"] = {
-                "phase": "Ready",
-                "serviceName": cr["status"].get("serviceName", "msess-svc"),
-            }
+            if self.wake_makes_ready:
+                cr["status"] = {
+                    "phase": "Ready",
+                    "serviceName": cr["status"].get("serviceName", "msess-svc"),
+                }
             self.events.append(f"wake_annotation:{name}")
         return copy.deepcopy(cr)
 
@@ -155,6 +166,9 @@ class FakeCoreV1Api:
     def __init__(self) -> None:
         self.secrets: dict[str, client.V1Secret] = {}
         self.create_calls: list[client.V1Secret] = []
+        # Runs just before a create is processed, so a test can land another
+        # replica's same-name Secret between this replica's read and create.
+        self.before_create: Callable[[client.V1Secret], object] | None = None
 
     @staticmethod
     def _encode(string_data: dict[str, str]) -> dict[str, str]:
@@ -166,6 +180,10 @@ class FakeCoreV1Api:
     async def create_namespaced_secret(
         self, namespace: str, body: client.V1Secret
     ) -> client.V1Secret:
+        if self.before_create is not None:
+            self.before_create(body)
+        if body.metadata.name in self.secrets:
+            raise ApiException(status=409, reason="AlreadyExists")
         stored = client.V1Secret(
             metadata=body.metadata,
             data=self._encode(body.string_data or {}),
@@ -251,6 +269,31 @@ def _mark_failed(cr: dict[str, Any], *, reason: str = "RuntimeExited") -> None:
             {"type": "Ready", "status": "False", "reason": reason, "message": "container exited 1"}
         ],
     }
+
+
+def _owner_reference(cr_name: str, uid: str, *, controller: bool = True) -> client.V1OwnerReference:
+    return client.V1OwnerReference(
+        api_version=contract.API_VERSION,
+        kind=contract.KIND,
+        name=cr_name,
+        uid=uid,
+        controller=controller,
+    )
+
+
+def _existing_secret(
+    secret_name: str, owner_references: list[client.V1OwnerReference] | None
+) -> client.V1Secret:
+    """A complete Runtime Secret already in the namespace, owned as the test says."""
+    return client.V1Secret(
+        metadata=client.V1ObjectMeta(name=secret_name, owner_references=owner_references),
+        data={
+            "MARIMO_TOKEN": base64.b64encode(b"token").decode(),
+            "RUNTIME_CREDENTIAL": base64.b64encode(b"mh_rt_v1.x.abc").decode(),
+        },
+        type="Opaque",
+        immutable=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -617,6 +660,139 @@ async def test_spawn_raises_capacity_error_on_quota_condition() -> None:
         await manager.spawn(_notebook(), "run")
 
 
+def _quota_blocked_deploy_cr(
+    notebook: Notebook, deployment: Deployment, *, phase: str = "Starting"
+) -> dict[str, Any]:
+    """A deploy CR whose last start a ResourceQuota rejected, as the operator leaves it."""
+    name = str(deployment.id)
+    return {
+        "apiVersion": contract.API_VERSION,
+        "kind": contract.KIND,
+        "metadata": {
+            "name": name,
+            "uid": f"uid-{name}",
+            "annotations": {contract.ANNOTATION_WAKE_REQUEST: "earlier-visit"},
+        },
+        "spec": {
+            "notebookId": str(notebook.id),
+            "workspaceId": str(notebook.workspace_id),
+            "creatorId": None,
+            "mode": "deploy",
+            "baseUrl": f"/api/deployments/{deployment.slug}",
+            "deploymentRevision": deployment.revision,
+        },
+        "status": {
+            "phase": phase,
+            "observedWakeRequest": "earlier-visit",
+            "conditions": [
+                {
+                    "type": "CapacityAvailable",
+                    "status": "False",
+                    "reason": "QuotaExceeded",
+                    "message": "pods quota exhausted",
+                }
+            ],
+        },
+    }
+
+
+def _wake_requests(custom: FakeCustomObjectsApi) -> list[str]:
+    return [
+        body["metadata"]["annotations"][contract.ANNOTATION_WAKE_REQUEST]
+        for _, body in custom.patch_calls
+        if contract.ANNOTATION_WAKE_REQUEST in body.get("metadata", {}).get("annotations", {})
+    ]
+
+
+def _quota_blocked_deployment() -> tuple[FakeCustomObjectsApi, Notebook, Deployment]:
+    custom = FakeCustomObjectsApi()
+    custom.wake_makes_ready = False  # the operator has not retried yet
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    custom.objects[str(deployment.id)] = _quota_blocked_deploy_cr(notebook, deployment)
+    return custom, notebook, deployment
+
+
+@pytest.mark.asyncio
+async def test_visit_to_a_quota_blocked_deployment_requests_a_retry() -> None:
+    """The operator retries a quota-rejected start only on a fresh wake request."""
+    custom, notebook, deployment = _quota_blocked_deployment()
+    manager = _manager(custom, FakeCoreV1Api())
+
+    with pytest.raises(SessionCapacityError, match="pods quota exhausted"):
+        await manager.spawn_deployment(notebook, deployment)
+
+    (wake,) = _wake_requests(custom)
+    assert wake != "earlier-visit"
+
+
+@pytest.mark.asyncio
+async def test_burst_of_visitors_to_a_quota_blocked_deployment_requests_one_retry() -> None:
+    custom, notebook, deployment = _quota_blocked_deployment()
+    real_patch = custom.patch_namespaced_custom_object
+
+    async def _patch_in_flight(
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+        body: Mapping[str, Any],
+        *,
+        _content_type: str | None = None,
+    ) -> dict[str, Any]:
+        await asyncio.sleep(0.01)  # other visitors arrive while the PATCH is in flight
+        return await real_patch(
+            group, version, namespace, plural, name, body, _content_type=_content_type
+        )
+
+    custom.patch_namespaced_custom_object = _patch_in_flight  # ty: ignore[invalid-assignment]
+    manager = _manager(custom, FakeCoreV1Api())
+
+    outcomes = await asyncio.gather(
+        *(manager.spawn_deployment(notebook, deployment) for _ in range(5)),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(outcome, SessionCapacityError) for outcome in outcomes)
+    assert len(_wake_requests(custom)) == 1
+
+
+@pytest.mark.asyncio
+async def test_quota_blocked_deployment_is_retried_again_once_the_window_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kube_module, "QUOTA_RETRY_COALESCE_SECONDS", 0.05)
+    custom, notebook, deployment = _quota_blocked_deployment()
+    manager = _manager(custom, FakeCoreV1Api())
+
+    for _ in range(2):
+        with pytest.raises(SessionCapacityError):
+            await manager.spawn_deployment(notebook, deployment)
+    assert len(_wake_requests(custom)) == 1
+
+    await asyncio.sleep(0.06)
+    with pytest.raises(SessionCapacityError):
+        await manager.spawn_deployment(notebook, deployment)
+
+    assert len(_wake_requests(custom)) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_deployment_is_never_woken_even_with_a_quota_condition() -> None:
+    custom = FakeCustomObjectsApi()
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    cr = _quota_blocked_deploy_cr(notebook, deployment, phase="Failed")
+    custom.objects[str(deployment.id)] = cr
+    manager = _manager(custom, FakeCoreV1Api())
+
+    with pytest.raises(SessionCapacityError):
+        await manager.spawn_deployment(notebook, deployment)
+
+    assert _wake_requests(custom) == []
+
+
 @pytest.mark.asyncio
 async def test_spawn_raises_session_start_error_on_poll_timeout(
     monkeypatch: pytest.MonkeyPatch,
@@ -800,6 +976,98 @@ async def test_missing_owned_secret_is_repaired_on_wake() -> None:
 
 
 @pytest.mark.asyncio
+async def test_secret_create_conflict_is_success_when_this_cr_controls_the_secret() -> None:
+    """Two cold visitors start one Deployment, and both find no Secret.
+
+    Both create one; the slower create conflicts with the Secret the faster
+    one just minted for this very CR. That visitor must go on to the ready
+    Runtime rather than fail.
+    """
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
+    secret_name = f"msess-{name}-env"
+    winner = _existing_secret(secret_name, [_owner_reference(name, f"uid-{name}")])
+    core.before_create = lambda body: core.secrets.setdefault(body.metadata.name, winner)
+    manager = _manager(custom, core)
+
+    session = await manager.spawn_deployment(notebook, deployment)
+
+    assert session.phase == SessionPhase.READY
+    assert core.secrets[secret_name] is winner
+    assert core.create_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "owner_references",
+    [
+        pytest.param(
+            lambda cr_name: [_owner_reference(cr_name, "uid-of-an-earlier-cr")],
+            id="controlled-by-an-earlier-cr-of-the-same-name",
+        ),
+        pytest.param(
+            lambda cr_name: [_owner_reference(cr_name, f"uid-{cr_name}", controller=False)],
+            id="owned-but-not-controlled-by-this-cr",
+        ),
+        pytest.param(lambda cr_name: None, id="no-owner"),
+    ],
+)
+async def test_secret_create_conflict_fails_clearly_when_this_cr_does_not_control_it(
+    owner_references: Callable[[str], list[client.V1OwnerReference] | None],
+) -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+    name = str(deployment.id)
+    secret_name = f"msess-{name}-env"
+    foreign = _existing_secret(secret_name, owner_references(name))
+    core.before_create = lambda body: core.secrets.setdefault(body.metadata.name, foreign)
+    manager = _manager(custom, core)
+
+    with pytest.raises(SessionStartError, match=f"{secret_name} .*not controlled by"):
+        await manager.spawn_deployment(notebook, deployment)
+
+    assert core.secrets[secret_name] is foreign  # neither replaced nor adopted
+    assert core.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_secret_create_conflict_fails_clearly_when_the_secret_then_vanishes() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    notebook = _notebook()
+    deployment = _deployment(notebook)
+
+    def _conflict_with_a_secret_that_is_then_gone(body: client.V1Secret) -> None:
+        raise ApiException(status=409, reason="AlreadyExists")
+
+    core.before_create = _conflict_with_a_secret_that_is_then_gone
+    manager = _manager(custom, core)
+
+    with pytest.raises(SessionStartError, match="disappeared"):
+        await manager.spawn_deployment(notebook, deployment)
+
+
+@pytest.mark.asyncio
+async def test_spawn_compensates_when_a_secret_it_does_not_control_is_in_the_way() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    core.before_create = lambda body: core.secrets.setdefault(
+        body.metadata.name, _existing_secret(body.metadata.name, None)
+    )
+    manager = _manager(custom, core)
+
+    with pytest.raises(SessionStartError, match="not controlled by"):
+        await manager.spawn(_notebook(), "run")
+
+    assert custom.objects == {}  # the edit/run CR it created was deleted again
+
+
+@pytest.mark.asyncio
 async def test_stop_deletes_cr_with_foreground_propagation_and_waits_for_not_found() -> None:
     custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
     custom.on_create = _mark_ready
@@ -861,10 +1129,50 @@ async def test_reconcilable_runtimes_lists_every_cr_in_the_namespace() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shutdown_is_a_no_op() -> None:
-    manager = _manager(FakeCustomObjectsApi(), FakeCoreV1Api())
+async def test_shutdown_leaves_injected_clients_alone() -> None:
+    custom, core = FakeCustomObjectsApi(), FakeCoreV1Api()
+    custom.on_create = _mark_ready
+    manager = _manager(custom, core)
 
     await manager.shutdown()
+
+    # Still served by the injected pair: nothing was closed or swapped out.
+    session = await manager.spawn(_notebook(), "run")
+    assert str(session.id) in custom.objects
+
+
+def _not_in_a_cluster() -> None:
+    raise ConfigException("Service host/port is not set.")
+
+
+async def _no_kubeconfig_to_load() -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_api_client_the_manager_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(kube_module.kube_config, "load_incluster_config", _not_in_a_cluster)
+    monkeypatch.setattr(kube_module.kube_config, "load_kube_config", _no_kubeconfig_to_load)
+    manager = KubeSessionManager(
+        namespace=_NAMESPACE,
+        service_dns_suffix=_DNS_SUFFIX,
+        service_port=_PORT,
+        runtime_image=_RUNTIME_IMAGE,
+        ready_timeout_seconds=5.0,
+    )
+    await manager._clients()
+    api_client = manager._api_client
+    assert api_client is not None
+    http_session = api_client.rest_client.pool_manager
+    assert not http_session.closed
+
+    await manager.shutdown()
+    await manager.shutdown()  # nothing left to close; must not fail
+
+    assert http_session.closed
+    assert manager._api_client is None
 
 
 # Risk register #4: kube backend correctness is unprovable without a real

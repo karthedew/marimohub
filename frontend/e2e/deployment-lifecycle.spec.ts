@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
 
 import { backendBaseUrl } from './env';
-import { createBlankNotebook, createWorkspace, openWorkspace, register, unique, userId } from './helpers';
+import { addMember, createBlankNotebook, createWorkspace, openWorkspace, register, unique, userId } from './helpers';
 
 async function authToken(page: import('@playwright/test').Page) {
 	return page.evaluate(() => {
@@ -28,15 +28,14 @@ test('a reader sees the active Deployment link; only an Editor/Owner sees Stop',
 	const viewerPage = await viewerContext.newPage();
 
 	try {
+		const viewerName = unique('deployviewer');
 		await register(ownerPage, unique('deployowner'));
-		await register(viewerPage, unique('deployviewer'));
+		await register(viewerPage, viewerName);
 		const viewerId = await userId(viewerPage);
 
 		await createWorkspace(ownerPage, 'Deploy Space');
 		await openWorkspace(ownerPage, 'Deploy Space');
-		await ownerPage.getByLabel('User ID').fill(viewerId);
-		await ownerPage.getByLabel('Role').selectOption('viewer');
-		await ownerPage.getByRole('button', { name: 'Add member' }).click();
+		await addMember(ownerPage, viewerName, 'viewer');
 		await expect(ownerPage.locator('tr', { hasText: viewerId })).toBeVisible();
 
 		await ownerPage.goto('/workspaces');
@@ -168,15 +167,14 @@ test('a Viewer who opens the edit route directly is told an Editor role is requi
 	const viewerPage = await viewerContext.newPage();
 
 	try {
+		const viewerName = unique('editauthviewer');
 		await register(ownerPage, unique('editauthowner'));
-		await register(viewerPage, unique('editauthviewer'));
+		await register(viewerPage, viewerName);
 		const viewerId = await userId(viewerPage);
 
 		await createWorkspace(ownerPage, 'Edit Auth Space');
 		await openWorkspace(ownerPage, 'Edit Auth Space');
-		await ownerPage.getByLabel('User ID').fill(viewerId);
-		await ownerPage.getByLabel('Role').selectOption('viewer');
-		await ownerPage.getByRole('button', { name: 'Add member' }).click();
+		await addMember(ownerPage, viewerName, 'viewer');
 		await expect(ownerPage.locator('tr', { hasText: viewerId })).toBeVisible();
 
 		await ownerPage.goto('/workspaces');

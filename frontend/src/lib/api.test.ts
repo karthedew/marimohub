@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { fakeJwt } from '../test/fakeJwt';
-import { api, apiWithFetch, normalizeTagInput, readError } from './api';
+import { api, apiWithFetch, normalizeTagInput, oidcLoginUrl, readError } from './api';
 import { auth, getAuthToken } from './stores/auth';
 
 describe('normalizeTagInput', () => {
@@ -103,6 +103,32 @@ describe('request bodies match the frozen backend contract', () => {
 		await apiWithFetch(loginFetch).auth.login({ username: 'ada', password: 'password123' });
 		expect(JSON.parse(String(loginCalls[0].init.body))).toEqual({ username: 'ada', password: 'password123' });
 		expect(new Headers(loginCalls[0].init.headers).has('Authorization')).toBe(false);
+	});
+
+	it('sends an optional display name with registration only when the caller gives one', async () => {
+		const account = {
+			id: 'u1',
+			username: 'ada',
+			display_name: 'Ada Lovelace',
+			email: 'ada@example.com',
+			created_at: '2026-01-01T00:00:00Z'
+		};
+		const { fetcher, calls } = mockFetcher(jsonAnswer(201, account));
+
+		await expect(
+			apiWithFetch(fetcher).auth.register({
+				username: 'ada',
+				email: 'ada@example.com',
+				password: 'password123',
+				display_name: 'Ada Lovelace'
+			})
+		).resolves.toEqual(account);
+		expect(JSON.parse(String(calls[0].init.body))).toEqual({
+			username: 'ada',
+			email: 'ada@example.com',
+			password: 'password123',
+			display_name: 'Ada Lovelace'
+		});
 	});
 
 	it('sends the workspace create and member-add bodies verbatim', async () => {
@@ -219,6 +245,120 @@ describe('request bodies match the frozen backend contract', () => {
 		} finally {
 			auth.clear();
 		}
+	});
+});
+
+describe('member-candidate search', () => {
+	const candidates = [
+		{ user_id: 'u2', username: 'bea', display_name: 'Bea Example', email_hint: 'b•••@example.com' },
+		{ user_id: 'u3', username: 'beatrix', display_name: null, email_hint: 'b•••@example.org' }
+	];
+
+	it('GETs the workspace candidate search with the query and the bearer token', async () => {
+		auth.setSession(fakeJwt('user-1'));
+		try {
+			const { fetcher, calls } = mockFetcher(jsonAnswer(200, candidates));
+
+			await expect(apiWithFetch(fetcher).workspaces.members.candidates('w1', 'bea ex')).resolves.toEqual(candidates);
+			const url = new URL(calls[0].url, 'http://localhost');
+			expect(url.pathname).toBe('/api/workspaces/w1/member-candidates');
+			expect(url.searchParams.get('q')).toBe('bea ex');
+			expect([...url.searchParams.keys()]).toEqual(['q']);
+			expect(calls[0].init.method ?? 'GET').toBe('GET');
+			expect(calls[0].init.body).toBeUndefined();
+			expect(new Headers(calls[0].init.headers).get('Authorization')).toBe(`Bearer ${getAuthToken()}`);
+		} finally {
+			auth.clear();
+		}
+	});
+
+	it('encodes an email query so `+` and `@` reach the backend intact', async () => {
+		const { fetcher, calls } = mockFetcher(jsonAnswer(200, []));
+		await apiWithFetch(fetcher).workspaces.members.candidates('w1', 'bea+team@example.com');
+
+		expect(calls[0].url).toBe('/api/workspaces/w1/member-candidates?q=bea%2Bteam%40example.com');
+		expect(new URL(calls[0].url, 'http://localhost').searchParams.get('q')).toBe('bea+team@example.com');
+	});
+
+	it('hands the abort signal to fetch so a superseded search can be cancelled', async () => {
+		const { fetcher, calls } = mockFetcher(jsonAnswer(200, []));
+		const controller = new AbortController();
+		await apiWithFetch(fetcher).workspaces.members.candidates('w1', 'bea', { signal: controller.signal });
+
+		expect(calls[0].init.signal).toBe(controller.signal);
+	});
+
+	it('surfaces the backend detail of a refused search', async () => {
+		const { fetcher } = mockFetcher(jsonAnswer(403, { detail: 'Requires workspace owner role' }));
+
+		await expect(apiWithFetch(fetcher).workspaces.members.candidates('w1', 'bea')).rejects.toMatchObject({
+			status: 403,
+			detail: 'Requires workspace owner role'
+		});
+	});
+});
+
+describe('identity provider sign-in', () => {
+	const user = { id: 'u1', username: 'ada', email: 'ada@example.com', created_at: '2026-01-01T00:00:00Z' };
+
+	it('lists providers with a plain GET that never carries the bearer token', async () => {
+		auth.setSession(fakeJwt('user-1'));
+		try {
+			const providers = [{ slug: 'google', display_name: 'Google', kind: 'google' }];
+			const { fetcher, calls } = mockFetcher(jsonAnswer(200, providers));
+
+			await expect(apiWithFetch(fetcher).auth.providers()).resolves.toEqual(providers);
+			expect(calls[0].url).toBe('/api/auth/providers');
+			expect(calls[0].init.method ?? 'GET').toBe('GET');
+			expect(calls[0].init.body).toBeUndefined();
+			expect(new Headers(calls[0].init.headers).has('Authorization')).toBe(false);
+		} finally {
+			auth.clear();
+		}
+	});
+
+	it('posts exactly {handoff, verifier} to the exchange, without the bearer token', async () => {
+		auth.setSession(fakeJwt('user-1'));
+		try {
+			const session = { access_token: 'tok', token_type: 'bearer', user };
+			const { fetcher, calls } = mockFetcher(jsonAnswer(200, session));
+
+			await expect(
+				apiWithFetch(fetcher).auth.oidcExchange({ handoff: 'h-1', verifier: 'v'.repeat(43) })
+			).resolves.toEqual(session);
+			expect(calls[0].url).toBe('/api/auth/oidc/exchange');
+			expect(calls[0].init.method).toBe('POST');
+			expect(JSON.parse(String(calls[0].init.body))).toEqual({ handoff: 'h-1', verifier: 'v'.repeat(43) });
+			expect(new Headers(calls[0].init.headers).get('Content-Type')).toBe('application/json');
+			expect(new Headers(calls[0].init.headers).has('Authorization')).toBe(false);
+		} finally {
+			auth.clear();
+		}
+	});
+
+	it('leaves an existing session alone when the backend rejects a handoff', async () => {
+		auth.setSession(fakeJwt('user-1'));
+		try {
+			const token = getAuthToken();
+			const { fetcher } = mockFetcher(jsonAnswer(401, { detail: 'Invalid or expired sign-in handoff' }));
+
+			await expect(
+				apiWithFetch(fetcher).auth.oidcExchange({ handoff: 'h-1', verifier: 'v'.repeat(43) })
+			).rejects.toMatchObject({ status: 401, detail: 'Invalid or expired sign-in handoff' });
+			expect(getAuthToken()).toBe(token);
+		} finally {
+			auth.clear();
+		}
+	});
+
+	it('builds a same-origin login URL carrying the challenge when PUBLIC_API_URL is unset', () => {
+		expect(oidcLoginUrl('google', 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM')).toBe(
+			'/api/auth/oidc/google/login?challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
+		);
+	});
+
+	it('encodes the provider slug as a single path segment', () => {
+		expect(oidcLoginUrl('../admin', 'c')).toBe('/api/auth/oidc/..%2Fadmin/login?challenge=c');
 	});
 });
 

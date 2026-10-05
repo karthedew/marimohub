@@ -18,7 +18,10 @@ openshift:
 ingress:
   enabled: true
   className: nginx
-  host: marimohub.kind.local
+  # hack/kind/up.sh replaces this with MARIMOHUB_HOST (default localhost).
+  # Google accepts OAuth redirect URIs only on localhost or a public domain,
+  # never *.localhost or *.local.
+  host: localhost
 
 # One-replica development values: a constrained kind cluster (typically a
 # single Docker-network node) has no real multi-node spread to gain from two
@@ -35,6 +38,10 @@ frontend:
 backendPublic:
   replicaCount: 1
   existingSecret: marimohub-backend-env
+  # Sign-in through Google is wired by hack/kind/up.sh, not here: it always
+  # creates the marimohub-backend-oidc Secret (empty while Google is off) and
+  # points oidc.existingSecret at it, and opens network.externalProxy only
+  # when Google credentials are given.
   tls:
     enabled: true
     secretName: marimohub-backend-public-tls
@@ -50,6 +57,19 @@ operator:
   replicaCount: 1
 
 runtime:
+  # Sized for the local target of 50 users actively running notebooks, each
+  # Runtime requesting the default 250m/512Mi: 80 Pods leaves room for
+  # awake Deployments and users with two Sessions open. The shipped default
+  # caps at exactly 50 Runtimes, which one awake Deployment would exhaust.
+  quota:
+    hard:
+      pods: "80"
+      requests.cpu: "20"
+      requests.memory: "40Gi"
+      requests.ephemeral-storage: "20Gi"
+      limits.cpu: "80"
+      limits.memory: "160Gi"
+      limits.ephemeral-storage: "80Gi"
   internalApiCA:
     # The self-signed backend-internal certificate's own CA, mirrored into
     # namespaces.sessions so Runtime Pods can validate it. The chart never

@@ -1,10 +1,46 @@
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 from app.models import WorkspaceRole
+from app.services.identity_text import has_control_character
+from app.services.member_candidates import MAX_QUERY_LENGTH, MIN_QUERY_LENGTH
 from app.services.slug import DNS_LABEL_RE
+
+
+def _strip(value: object) -> object:
+    # Python's str.strip, exactly as `find_member_candidates` trims: pydantic's
+    # own strip_whitespace keeps characters such as "\x1c" that str.strip
+    # removes, so a query could pass here yet be too short for the service.
+    return value.strip() if isinstance(value, str) else value
+
+
+def _refuse_control_characters(value: str) -> str:
+    # No name holds one, and PostgreSQL cannot store NUL: searching for it
+    # would fail the query with a 500 rather than this 422.
+    if has_control_character(value):
+        raise ValueError("a person search must not contain control characters")
+    return value
+
+
+# The person-search text (`?q=`): trimmed first (the outer validator runs
+# first), then length-checked, then checked for control characters.
+MemberCandidateQuery = Annotated[
+    str,
+    StringConstraints(min_length=MIN_QUERY_LENGTH, max_length=MAX_QUERY_LENGTH),
+    AfterValidator(_refuse_control_characters),
+    BeforeValidator(_strip),
+]
 
 
 class WorkspaceCreate(BaseModel):
@@ -48,7 +84,7 @@ class WorkspaceArchiveOut(WorkspaceOut):
 
 
 class WorkspaceMemberCreate(BaseModel):
-    """Add a member to a workspace by id."""
+    """Add a member to a workspace by id (find the id with the member-candidates search)."""
 
     user_id: UUID
     role: WorkspaceRole = WorkspaceRole.EDITOR
@@ -66,8 +102,24 @@ class WorkspaceMemberOut(BaseModel):
     workspace_id: UUID
     user_id: UUID
     username: str
+    display_name: str | None
+    # In full only on the caller's own membership; anyone else's is masked
+    # like a person-search hint ("k•••@example.com"). Adding a member needs
+    # no consent, so a full address here would hand every Owner the email of
+    # anyone the person search finds (docs/adr/0004).
     email: str
     role: WorkspaceRole
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class MemberCandidateOut(BaseModel):
+    """A person an Owner could add to the workspace, as the person search reveals them."""
+
+    user_id: UUID
+    username: str
+    display_name: str | None
+    # The full email only when the search was that exact address; otherwise
+    # masked as its first character, "•••@" and the domain.
+    email_hint: str

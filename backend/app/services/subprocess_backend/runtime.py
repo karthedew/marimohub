@@ -13,6 +13,41 @@ SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 CommandFactory = Callable[[Path, RuntimeMode, int, str, str], Sequence[str]]
 
+# The backend's environment variables a marimo kernel inherits (see
+# `marimo_env`): the process basics, locale and temp dirs, how to reach and
+# trust package indexes and other hosts, and anything addressed to Python,
+# marimo, uv or the XDG config/cache/data dirs marimo and uv keep files in.
+_KERNEL_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TZ",
+        "LANG",
+        "LANGUAGE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LD_LIBRARY_PATH",
+        "VIRTUAL_ENV",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
+_KERNEL_ENV_PREFIXES = ("LC_", "PYTHON", "MARIMO_", "UV_", "XDG_")
+
 
 def reserve_ephemeral_port() -> int:
     """Ask the OS for an unused loopback TCP port.
@@ -52,11 +87,21 @@ def marimo_command(
 
 
 def marimo_env() -> dict[str, str]:
-    """Build the subprocess environment for a marimo runtime."""
+    """Build the subprocess environment for a marimo runtime.
+
+    Notebook code can read every variable its kernel inherits, so the kernel
+    inherits only what Python, uv (which runs ``--sandbox`` notebooks) and
+    marimo need, never the backend's own configuration: ``SECRET_KEY``,
+    ``DATABASE_URL``, identity-provider client secrets and the like.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in _KERNEL_ENV_NAMES or name.startswith(_KERNEL_ENV_PREFIXES)
+    }
     # Keep the kernel on the backend venv, but don't let marimo mistake the
     # backend project itself for the notebook's dependency project. Sandbox mode
     # tracks notebook deps in PEP 723 metadata and uses uv-managed envs.
-    env = dict(os.environ)
     for key in ("UV", "UV_PROJECT_ENVIRONMENT"):
         env.pop(key, None)
     venv = env.get("VIRTUAL_ENV") or _current_virtualenv()

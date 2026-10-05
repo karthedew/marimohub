@@ -1,25 +1,22 @@
-import http from 'node:http';
-import type { AddressInfo } from 'node:net';
-
 import { expect, test } from '@playwright/test';
 
-import { createBlankNotebook, createWorkspace, idFromEditUrl, openWorkspace, register, submitBlankNotebook, unique, userId } from './helpers';
+import { backendBaseUrl } from './env';
+import {
+	addMember,
+	createBlankNotebook,
+	createWorkspace,
+	idFromEditUrl,
+	openWorkspace,
+	register,
+	submitBlankNotebook,
+	unique,
+	userId
+} from './helpers';
 
 const MARIMO_SOURCE =
 	'import marimo as mo\n\napp = mo.App()\n\n\n@app.cell\ndef _():\n    mo.md("# Imported")\n    return\n\n\nif __name__ == "__main__":\n    app.run()\n';
 
-async function serveNotebookSource(source: string) {
-	const server = http.createServer((_req, res) => {
-		res.writeHead(200, { 'Content-Type': 'text/plain' });
-		res.end(source);
-	});
-	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-	const { port } = server.address() as AddressInfo;
-	return {
-		url: `http://127.0.0.1:${port}/notebook.py`,
-		close: () => new Promise<void>((resolve) => server.close(() => resolve()))
-	};
-}
+const GITLAB_RAW_URL = 'https://gitlab.example.com/data/notebooks/-/raw/main/notebook.py';
 
 test('a caller with exactly one writable Workspace gets it preselected, and creation sends it', async ({ page }) => {
 	await register(page, unique('onetarget'));
@@ -60,7 +57,8 @@ test('multiple writable Workspaces require a deliberate choice before creating',
 	await workspaceSelect.selectOption({ label: 'Alpha Team' });
 	const id = await submitBlankNotebook(page, unique('Alpha Notebook'));
 	await page.goto(`/notebooks/${id}`);
-	await expect(page.getByText('Alpha Team')).toBeVisible();
+	// Scoped to the page body: the header's workspace switcher also names the active Workspace.
+	await expect(page.getByRole('main').getByText('Alpha Team')).toBeVisible();
 });
 
 test('an uploaded file and a GitLab URL import both send the chosen Workspace', async ({ page }) => {
@@ -79,28 +77,48 @@ test('an uploaded file and a GitLab URL import both send the chosen Workspace', 
 	await page.waitForURL(/\/notebooks\/[^/]+\/edit$/);
 	const uploadedId = await idFromEditUrl(page);
 	await page.goto(`/notebooks/${uploadedId}`);
-	await expect(page.getByText('Import Space')).toBeVisible();
+	await expect(page.getByRole('main').getByText('Import Space')).toBeVisible();
 
-	const fixture = await serveNotebookSource(MARIMO_SOURCE);
-	try {
-		await page.goto('/notebooks/new');
-		await page.getByRole('tab', { name: 'GitLab URL' }).click();
-		await page.getByLabel('GitLab raw file URL').fill(fixture.url);
-		const patField = page.getByLabel('Personal access token', { exact: false });
-		await patField.fill('super-secret-token');
-		await page.getByRole('button', { name: 'Import from GitLab' }).click();
-		await page.waitForURL(/\/notebooks\/[^/]+\/edit$/);
-		const importedId = await idFromEditUrl(page);
-		await page.goto(`/notebooks/${importedId}`);
-		await expect(page.getByText('Import Space')).toBeVisible();
+	// GitLab import is off in the e2e backend, and its SSRF gate refuses any URL
+	// this suite could serve, so the import is answered here: the browser's own
+	// request, sent on to the plain create endpoint with the Workspace it named.
+	// The backend's tests cover the real fetch (backend/tests/test_gitlab_import.py).
+	// Playwright answers the CORS preflight itself, so only the POST gets here.
+	await page.route('**/api/notebooks/import', async (route) => {
+		const { workspace_id } = route.request().postDataJSON() as { workspace_id: string };
+		const created = await route.fetch({
+			url: `${backendBaseUrl}/api/notebooks`,
+			postData: { title: unique('Imported Notebook'), source: MARIMO_SOURCE, workspace_id }
+		});
+		await route.fulfill({ response: created });
+	});
 
-		// The PAT is never retained past the request that used it.
-		await page.goto('/notebooks/new');
-		await page.getByRole('tab', { name: 'GitLab URL' }).click();
-		await expect(page.getByLabel('Personal access token', { exact: false })).toHaveValue('');
-	} finally {
-		await fixture.close();
-	}
+	await page.goto('/notebooks/new');
+	// The single writable Workspace, preselected.
+	const workspaceSelect = page.getByLabel('Workspace', { exact: true });
+	await expect(workspaceSelect).toBeDisabled();
+	const workspaceId = await workspaceSelect.inputValue();
+	await page.getByRole('tab', { name: 'GitLab URL' }).click();
+	await page.getByLabel('GitLab raw file URL').fill(GITLAB_RAW_URL);
+	await page.getByLabel('Personal access token', { exact: false }).fill('super-secret-token');
+	const importRequest = page.waitForRequest(
+		(request) => request.url().endsWith('/api/notebooks/import') && request.method() === 'POST'
+	);
+	await page.getByRole('button', { name: 'Import from GitLab' }).click();
+	expect((await importRequest).postDataJSON()).toEqual({
+		url: GITLAB_RAW_URL,
+		pat: 'super-secret-token',
+		workspace_id: workspaceId
+	});
+	await page.waitForURL(/\/notebooks\/[^/]+\/edit$/);
+	const importedId = await idFromEditUrl(page);
+	await page.goto(`/notebooks/${importedId}`);
+	await expect(page.getByRole('main').getByText('Import Space')).toBeVisible();
+
+	// The PAT is never retained past the request that used it.
+	await page.goto('/notebooks/new');
+	await page.getByRole('tab', { name: 'GitLab URL' }).click();
+	await expect(page.getByLabel('Personal access token', { exact: false })).toHaveValue('');
 });
 
 test('fork always requires an explicit target confirmation, even with a single writable Workspace', async ({ browser }) => {
@@ -139,7 +157,7 @@ test('fork always requires an explicit target confirmation, even with a single w
 		const forkId = await idFromEditUrl(forkerPage);
 		expect(forkId).not.toBe(notebookId);
 		await forkerPage.goto(`/notebooks/${forkId}`);
-		await expect(forkerPage.getByText('Fork Space')).toBeVisible();
+		await expect(forkerPage.getByRole('main').getByText('Fork Space')).toBeVisible();
 	} finally {
 		await ownerContext.close();
 		await forkerContext.close();
@@ -153,15 +171,14 @@ test('a Viewer sees no write controls; promoting to Editor reveals them', async 
 	const memberPage = await memberContext.newPage();
 
 	try {
+		const memberName = unique('capmember');
 		await register(ownerPage, unique('capowner'));
-		await register(memberPage, unique('capmember'));
+		await register(memberPage, memberName);
 		const memberId = await userId(memberPage);
 
 		await createWorkspace(ownerPage, 'Capability Space');
 		await openWorkspace(ownerPage, 'Capability Space');
-		await ownerPage.getByLabel('User ID').fill(memberId);
-		await ownerPage.getByLabel('Role').selectOption('viewer');
-		await ownerPage.getByRole('button', { name: 'Add member' }).click();
+		await addMember(ownerPage, memberName, 'viewer');
 		await expect(ownerPage.locator('tr', { hasText: memberId })).toBeVisible();
 
 		await ownerPage.goto('/workspaces');

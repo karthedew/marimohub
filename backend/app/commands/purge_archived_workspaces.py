@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 import logging
 
 from app.db.database import get_sessionmaker
-from app.services.session_manager import get_session_manager
+from app.services.session_manager import get_session_manager, shutdown_session_manager
 from app.services.workspace_service import purge_due_workspaces
 
 logger = logging.getLogger("app.commands.purge_archived_workspaces")
@@ -18,8 +18,12 @@ logger = logging.getLogger("app.commands.purge_archived_workspaces")
 
 async def _run() -> int:
     manager = get_session_manager()
-    async with get_sessionmaker()() as db:
-        return await purge_due_workspaces(db, manager, datetime.now(UTC))
+    try:
+        async with get_sessionmaker()() as db:
+            return await purge_due_workspaces(db, manager, datetime.now(UTC))
+    finally:
+        # Releases the manager's Kubernetes client, if a purge needed one.
+        await shutdown_session_manager()
 
 
 def main() -> None:

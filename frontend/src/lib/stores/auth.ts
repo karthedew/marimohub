@@ -1,9 +1,10 @@
 import { browser } from '$app/environment';
 import { writable } from 'svelte/store';
 
-// There is no "get current user" endpoint (see CONTEXT.md: no user directory),
-// so identity beyond the JWT subject is only ever what register/login handed
-// back in the moment — never re-fetched, never verified again client-side.
+// There is no "get current user" endpoint, so identity beyond the JWT subject
+// is only ever what sign-in handed back in the moment (the account register or
+// a provider sign-in returned, or the username typed at login) — never
+// re-fetched, never verified again client-side.
 export type AuthUser = {
 	id: string;
 	username: string;
@@ -73,18 +74,29 @@ function persistState(state: AuthState) {
 
 let snapshot = readStoredState();
 
+// Storage is written outside the store's subscriber: svelte/store runs every
+// subscriber from one queue shared by all stores, so a throw from inside one
+// (localStorage over quota, say) would stop every store in the app updating.
 function createAuthStore() {
 	const store = writable<AuthState>(snapshot);
 
 	store.subscribe((value) => {
 		snapshot = value;
-		persistState(value);
 	});
 
 	return {
 		subscribe: store.subscribe,
-		setSession: (token: string, user: Partial<AuthUser> | null = null) => store.set(deriveState(token, user)),
-		clear: () => store.set(SIGNED_OUT)
+		// Stored before it is published, so a session the browser refuses to
+		// store throws with nothing changed rather than half signed in.
+		setSession: (token: string, user: Partial<AuthUser> | null = null) => {
+			const state = deriveState(token, user);
+			persistState(state);
+			store.set(state);
+		},
+		clear: () => {
+			store.set(SIGNED_OUT);
+			persistState(SIGNED_OUT);
+		}
 	};
 }
 

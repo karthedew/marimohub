@@ -155,6 +155,8 @@ func run() error {
 			ImagePullPolicy:    cfg.ImagePullPolicy,
 			ServiceAccountName: cfg.ServiceAccountName,
 			ImagePullSecrets:   cfg.ImagePullSecrets,
+			WorkspaceStorage:   cfg.WorkspaceStorage,
+			SharedVolumes:      cfg.SharedVolumes,
 		},
 		ImagePullDeadline: controller.DefaultImagePullDeadline,
 		UnhealthyTimeout:  controller.DefaultUnhealthyTimeout,
@@ -176,6 +178,8 @@ func run() error {
 		"runtimeNamespace", cfg.RuntimeNamespace,
 		"fetcherImage", cfg.FetcherImage,
 		"internalAPIURL", cfg.InternalAPIURL,
+		"workspaceClaim", cfg.WorkspaceStorage.ClaimName,
+		"sharedVolumes", len(cfg.SharedVolumes),
 	)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		return fmt.Errorf("manager exited: %w", err)

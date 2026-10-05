@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { ChevronRight, FolderKanban, LogOut, Settings } from '@lucide/svelte';
 	import type { AuthUser } from '$lib/stores/auth';
 
 	type Props = {
@@ -9,10 +10,18 @@
 
 	let { user, avatar, onlogout }: Props = $props();
 	let menu: HTMLDetailsElement;
-	const initial = $derived(user.username.slice(0, 1).toUpperCase());
+	let open = $state(false);
+
+	const initials = $derived(initialsFor(user.username));
+
+	function initialsFor(name: string) {
+		const parts = name.split(/[\s._-]+/).filter(Boolean);
+		const letters = parts.length > 1 ? parts.map((part) => part[0]).join('') : name;
+		return letters.slice(0, 2).toUpperCase();
+	}
 
 	function close() {
-		menu.open = false;
+		open = false;
 	}
 
 	function logout() {
@@ -35,21 +44,55 @@
 	});
 </script>
 
-<details class="group relative" bind:this={menu}>
-	<summary class="grid size-9 cursor-pointer list-none place-items-center overflow-hidden rounded-full bg-slate-900 text-sm font-black text-white outline-none ring-2 ring-transparent transition hover:ring-hub-600/25 focus-visible:ring-4 focus-visible:ring-hub-600/25 dark:bg-slate-100 dark:text-slate-950 [&::-webkit-details-marker]:hidden" aria-label="Open profile menu">
+<details class="relative" bind:this={menu} bind:open>
+	<summary
+		class="grid size-9 cursor-pointer list-none place-items-center overflow-hidden rounded-full bg-[#26333b] text-xs font-semibold text-white ring-offset-2 ring-offset-app-bg transition hover:ring-2 hover:ring-brand [&::-webkit-details-marker]:hidden"
+		aria-label="Open profile menu"
+	>
 		{#if avatar}
 			<img class="size-full object-cover" src={avatar} alt="" />
 		{:else}
-			{initial}
+			{initials}
 		{/if}
 	</summary>
 
-	<div class="absolute right-0 z-50 mt-2 w-64 overflow-hidden rounded-2xl border border-slate-900/10 bg-white p-2 shadow-2xl shadow-slate-950/15 dark:border-white/10 dark:bg-[#181a1b] dark:shadow-black/40">
-		<div class="border-b border-slate-900/10 px-3 py-3 dark:border-white/10">
-			<p class="truncate text-sm font-bold text-slate-950 dark:text-white">{user.username}</p>
-			{#if user.email}<p class="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">{user.email}</p>{/if}
+	{#if open}
+		<div class="absolute right-0 top-[calc(100%+0.6rem)] z-50 w-72 overflow-hidden rounded-lg border border-app-line bg-app-raised shadow-[var(--shadow-popover)]">
+			<div class="border-b border-app-line p-4">
+				<div class="flex items-center gap-3">
+					<span class="grid size-10 shrink-0 place-items-center overflow-hidden rounded-full bg-[#26333b] text-xs font-semibold text-white">
+						{#if avatar}<img class="size-full object-cover" src={avatar} alt="" />{:else}{initials}{/if}
+					</span>
+					<div class="min-w-0">
+						<p class="m-0 truncate text-sm font-semibold text-app-fg">{user.username}</p>
+						{#if user.email}<p class="m-0 truncate text-xs text-app-muted">{user.email}</p>{/if}
+					</div>
+				</div>
+			</div>
+			<div class="p-1.5">
+				<a
+					href="/settings"
+					onclick={close}
+					class="flex items-center gap-3 rounded-md px-3 py-2.5 text-sm text-app-muted hover:bg-app-sidebar-hover hover:text-app-fg"
+				>
+					<Settings size={16} /><span class="flex-1">Profile settings</span><ChevronRight size={14} />
+				</a>
+				<a
+					href="/workspaces"
+					onclick={close}
+					class="flex items-center gap-3 rounded-md px-3 py-2.5 text-sm text-app-muted hover:bg-app-sidebar-hover hover:text-app-fg"
+				>
+					<FolderKanban size={16} /><span class="flex-1">Your workspaces</span><ChevronRight size={14} />
+				</a>
+				<div class="my-1 border-t border-app-line"></div>
+				<button
+					type="button"
+					onclick={logout}
+					class="flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm text-app-muted hover:bg-app-sidebar-hover hover:text-app-danger"
+				>
+					<LogOut size={16} /> Log out
+				</button>
+			</div>
 		</div>
-		<a class="mt-2 block rounded-xl px-3 py-2.5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-white/5 dark:hover:text-white" href="/settings" onclick={close}>Profile settings</a>
-		<button class="block w-full rounded-xl px-3 py-2.5 text-left text-sm font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-950 dark:text-slate-300 dark:hover:bg-white/5 dark:hover:text-white" type="button" onclick={logout}>Log out</button>
-	</div>
+	{/if}
 </details>

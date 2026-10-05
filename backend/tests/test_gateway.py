@@ -1,6 +1,11 @@
 import asyncio
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+import contextlib
 from datetime import UTC, datetime
 import logging
+import os
+import socket
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -11,9 +16,14 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 from starlette.websockets import WebSocketDisconnect
+import uvicorn
+from websockets.asyncio.client import ClientConnection, connect as connect_websocket
+from websockets.asyncio.server import ServerConnection, serve as serve_websocket
+from websockets.exceptions import ConnectionClosed
 
 from app.api.deployments import DeploymentResolver
 from app.api.proxy import SessionResolver, edit_save_callback
+from app.core.config import get_settings
 from app.core.errors import DomainError
 from app.models import Deployment, DeploymentDesiredState, Notebook, Workspace
 from app.services import marimo_proxy
@@ -352,6 +362,117 @@ async def test_proxy_http_propagates_gateway_error_from_resolver() -> None:
         )
 
 
+# ── _forward_http: the gateway authenticates upstream, the browser never does ─
+
+_SESSION_ID = UUID("6f1c1d0e-5a4b-4c3d-8e2f-0123456789ab")
+_RUNTIME_ORIGIN = "http://msess-6f1c1d0e.marimohub-sessions.svc:8080"
+# The browser's own credentials: MarimoHub's login cookie and bearer JWT, a
+# cookie from another app on the same host, and a marimo cookie signed by an
+# earlier process of this same Runtime (which a woken Deployment can no
+# longer verify). None of them may reach the Runtime.
+_BROWSER_COOKIES = (
+    "__Host-marimohub_oidc=signed-login-state; theme=dark; "
+    f"session_8080_api_proxy_{_SESSION_ID}=stale-signature"
+)
+_BROWSER_BEARER = "Bearer marimohub-app-jwt"
+
+
+def _browser_request(*, query_string: bytes = b"") -> Request:
+    headers = [
+        (b"cookie", _BROWSER_COOKIES.encode("latin-1")),
+        (b"authorization", _BROWSER_BEARER.encode("latin-1")),
+        (b"x-molab-test", b"kept"),
+    ]
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": headers,
+            "query_string": query_string,
+        }
+    )
+
+
+async def _forward_and_record(
+    monkeypatch: pytest.MonkeyPatch, request: Request, target: SessionTarget
+) -> tuple[httpx.Request, Response]:
+    """Forward `request` to a recording stand-in for the Runtime; return what it got and sent."""
+    seen: list[httpx.Request] = []
+    real_async_client = httpx.AsyncClient
+
+    def _recording_client(*, follow_redirects: bool, timeout: httpx.Timeout) -> httpx.AsyncClient:
+        def _runtime(upstream_request: httpx.Request) -> httpx.Response:
+            seen.append(upstream_request)
+            # What marimo answers a bearer-authenticated request with.
+            return httpx.Response(
+                200,
+                headers=[
+                    ("set-cookie", f"session_8080_api_proxy_{_SESSION_ID}=fresh; Path=/"),
+                    ("x-upstream", "ok"),
+                ],
+            )
+
+        return real_async_client(
+            transport=httpx.MockTransport(_runtime),
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+        )
+
+    async def _ignore_body(response: httpx.Response, body: bytes) -> None:
+        return None
+
+    monkeypatch.setattr(marimo_proxy.httpx, "AsyncClient", _recording_client)
+    lease = ActivityLease(cast("SessionManager", _FakeManager()), _SESSION_ID, interval_seconds=60)
+
+    response = await marimo_proxy._forward_http(
+        request, target, "", lease=lease, response_body_callback=_ignore_body
+    )
+
+    (upstream_request,) = seen
+    return upstream_request, response
+
+
+_PROXY_TARGET = SessionTarget(
+    http_base_url=f"{_RUNTIME_ORIGIN}/api/proxy/{_SESSION_ID}",
+    ws_base_url=f"ws://msess-6f1c1d0e.marimohub-sessions.svc:8080/api/proxy/{_SESSION_ID}",
+    access_token=_UPSTREAM_AUTH,
+)
+
+
+@pytest.mark.asyncio
+async def test_forward_http_authenticates_with_the_runtime_token_and_never_the_browsers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upstream gets the Runtime's bearer token and none of the browser's credentials.
+
+    That is what keeps a returning visitor working after a Deployment wakes
+    (marimo's earlier cookie can no longer be verified), keeps unrelated
+    cookies on a shared host from mattering, and keeps MarimoHub's own login
+    cookie and JWT away from notebook code.
+    """
+    upstream, _ = await _forward_and_record(
+        monkeypatch, _browser_request(query_string=b"metric=cpu"), _PROXY_TARGET
+    )
+
+    assert upstream.headers.get_list("authorization") == [f"Bearer {_UPSTREAM_AUTH}"]
+    assert "cookie" not in upstream.headers
+    assert upstream.headers["x-molab-test"] == "kept"
+    assert upstream.url.path == f"/api/proxy/{_SESSION_ID}/"
+    assert dict(upstream.url.params) == {"metric": "cpu"}
+
+
+@pytest.mark.asyncio
+async def test_forward_http_drops_marimos_session_cookie_from_the_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, response = await _forward_and_record(monkeypatch, _browser_request(), _PROXY_TARGET)
+
+    header_names = {key.decode("latin-1").lower() for key, _ in response.raw_headers}
+    assert "set-cookie" not in header_names
+    assert "x-upstream" in header_names
+
+
 # ── proxy_websocket: close-code mapping + connect/frame mark_active ─────────
 
 
@@ -384,6 +505,7 @@ def test_proxy_websocket_marks_active_at_connect_and_per_frame(
     manager = _FakeManager()
     resolver = _StaticResolver(GatewayRoute(session_id, _TARGET))
     connected_urls: list[str] = []
+    connected_headers: list[dict[str, str]] = []
 
     class FakeUpstream:
         def __init__(self) -> None:
@@ -409,10 +531,15 @@ def test_proxy_websocket_marks_active_at_connect_and_per_frame(
                 await marimo_proxy.asyncio.sleep(0)
             return self._messages.pop(0)
 
-    def fake_connect(url: str) -> FakeUpstream:
+    def fake_connect(
+        url: str, *, additional_headers: dict[str, str], max_size: int | None
+    ) -> FakeUpstream:
         connected_urls.append(url)
+        connected_headers.append(additional_headers)
+        connected_max_sizes.append(max_size)
         return FakeUpstream()
 
+    connected_max_sizes: list[int | None] = []
     monkeypatch.setattr(marimo_proxy.websockets, "connect", fake_connect)
     app = _build_ws_app(cast("SessionManager", manager), resolver)
 
@@ -420,11 +547,131 @@ def test_proxy_websocket_marks_active_at_connect_and_per_frame(
         websocket.send_text("hello")
         assert websocket.receive_text() == "upstream:hello"
 
-    assert connected_urls == ["ws://upstream/ws?access_token=t"]
+    assert connected_urls == ["ws://upstream/ws"]
+    assert connected_headers == [{"Authorization": f"Bearer {_UPSTREAM_AUTH}"}]
+    assert connected_max_sizes == [64 * 2**20]
     assert resolver.calls == 1
     # One connect-edge mark_active plus one for the client frame and one for the
     # upstream echo frame the fake relay produces.
     assert manager.mark_active_calls == [session_id, session_id, session_id]
+
+
+# ── the WebSocket relay end to end: a real Runtime-side server, a real gateway ─
+
+
+@pytest.fixture
+def _gateway_settings(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Settings the gateway can load whichever tests ran before (it reads the lease interval)."""
+    for name, default in (
+        ("DATABASE_URL", "postgresql+asyncpg://molab:molab@localhost:5432/molab_test"),
+        ("SECRET_KEY", "test-secret-with-at-least-32-bytes"),
+    ):
+        monkeypatch.setenv(name, os.environ.get(name, default))
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@contextlib.asynccontextmanager
+async def _relay_in_front_of(
+    runtime: Callable[[ServerConnection], Awaitable[None]],
+) -> AsyncGenerator[str, None]:
+    """Serve `runtime` as a Runtime's WebSocket behind the real relay; yield the browser's URL.
+
+    The relay runs in a real Uvicorn server, as in production, so frames and
+    close codes cross real sockets in both hops.
+    """
+    async with serve_websocket(runtime, "127.0.0.1", 0) as upstream:
+        port = upstream.sockets[0].getsockname()[1]
+        target = SessionTarget(
+            http_base_url=f"http://127.0.0.1:{port}",
+            ws_base_url=f"ws://127.0.0.1:{port}",
+            access_token=_UPSTREAM_AUTH,
+        )
+        app = _build_ws_app(
+            cast("SessionManager", _FakeManager()), _StaticResolver(GatewayRoute(uuid4(), target))
+        )
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            gateway = uvicorn.Server(uvicorn.Config(app, lifespan="off", log_level="warning"))
+            serving = asyncio.create_task(gateway.serve(sockets=[listener]))
+            try:
+                for _ in range(500):  # up to 5 s
+                    if gateway.started:
+                        break
+                    await asyncio.sleep(0.01)
+                yield f"ws://127.0.0.1:{listener.getsockname()[1]}/ws"
+            finally:
+                gateway.should_exit = True
+                await serving
+
+
+# A cell output the size of a large chart: more than the websockets library's
+# default 1 MiB message limit.
+_BIG_OUTPUT = "x" * (3 * 2**19)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_gateway_settings")
+async def test_websocket_relay_delivers_a_message_over_one_mib() -> None:
+    async def runtime(connection: ServerConnection) -> None:
+        await connection.send(_BIG_OUTPUT)
+        await connection.wait_closed()
+
+    async with (
+        _relay_in_front_of(runtime) as url,
+        connect_websocket(url, max_size=None) as browser,
+    ):
+        message = await asyncio.wait_for(browser.recv(), timeout=10)
+
+    assert message == _BIG_OUTPUT
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_gateway_settings")
+async def test_websocket_relay_closes_the_browser_with_the_runtimes_code_and_reason() -> None:
+    async def runtime(connection: ServerConnection) -> None:
+        # What marimo answers a second tab opening the same session with.
+        await connection.close(code=1003, reason="MARIMO_ALREADY_CONNECTED")
+
+    async with _relay_in_front_of(runtime) as url, connect_websocket(url) as browser:
+        with pytest.raises(ConnectionClosed):
+            await asyncio.wait_for(browser.recv(), timeout=10)
+
+    assert browser.close_code == 1003
+    assert browser.close_reason == "MARIMO_ALREADY_CONNECTED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_gateway_settings")
+async def test_websocket_relay_reports_a_runtime_lost_mid_connection_as_bad_gateway() -> None:
+    async def runtime(connection: ServerConnection) -> None:
+        connection.transport.abort()  # the Runtime's process dies mid-connection
+
+    async with _relay_in_front_of(runtime) as url, connect_websocket(url) as browser:
+        with pytest.raises(ConnectionClosed):
+            await asyncio.wait_for(browser.recv(), timeout=10)
+
+    assert browser.close_code == 1014
+
+
+@pytest.mark.parametrize(
+    ("runtime_code", "runtime_reason", "browser_close"),
+    [
+        (1000, "", (1000, "")),
+        (1001, "going away", (1001, "going away")),
+        (1003, "MARIMO_ALREADY_CONNECTED", (1003, "MARIMO_ALREADY_CONNECTED")),
+        (3000, "MARIMO_UNAUTHORIZED", (3000, "MARIMO_UNAUTHORIZED")),
+        (1005, "", (1000, "")),  # a close frame without a code
+        (1006, "", (1014, "")),  # no close frame at all
+    ],
+)
+def test_client_close_frame_mirrors_the_runtime_or_maps_codes_no_frame_may_carry(
+    runtime_code: int, runtime_reason: str, browser_close: tuple[int, str]
+) -> None:
+    upstream = SimpleNamespace(close_code=runtime_code, close_reason=runtime_reason)
+
+    assert marimo_proxy._client_close_frame(cast("ClientConnection", upstream)) == browser_close
 
 
 # ── edit_save_callback: guard conditions + swallow-on-failure ───────────────
@@ -591,3 +838,105 @@ async def test_streamed_response_release_helper_closes_upstream_and_stops_lease(
 
     assert closed == ["response", "client"]
     assert lease._task is None  # stopped, not merely requested to stop
+
+
+# ── _forward_http: one retry when the connection itself fails ───────────────
+
+
+async def _forward_with_flaky_connect(
+    monkeypatch: pytest.MonkeyPatch, failures: list[Exception]
+) -> tuple[int, Response | Exception]:
+    """Forward a POST to a Runtime whose first connects raise `failures` in order."""
+    attempts = 0
+    real_async_client = httpx.AsyncClient
+
+    def _flaky_client(*, follow_redirects: bool, timeout: httpx.Timeout) -> httpx.AsyncClient:
+        def _runtime(upstream_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if failures:
+                raise failures.pop(0)
+            assert upstream_request.content == b"payload"
+            return httpx.Response(200, content=b"ok")
+
+        return real_async_client(
+            transport=httpx.MockTransport(_runtime),
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+        )
+
+    async def _ignore_body(response: httpx.Response, body: bytes) -> None:
+        return None
+
+    monkeypatch.setattr(marimo_proxy.httpx, "AsyncClient", _flaky_client)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [],
+            "query_string": b"",
+        },
+        receive=_body_receiver(b"payload"),
+    )
+    lease = ActivityLease(cast("SessionManager", _FakeManager()), _SESSION_ID, interval_seconds=60)
+    try:
+        result: Response | Exception = await marimo_proxy._forward_http(
+            request,
+            _PROXY_TARGET,
+            "api/kernel/instantiate",
+            lease=lease,
+            response_body_callback=_ignore_body,
+        )
+    except UpstreamUnreachable as exc:
+        result = exc
+    return attempts, result
+
+
+def _body_receiver(body: bytes):  # noqa: ANN202 -- an ASGI receive callable
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return receive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectTimeout("connect timed out"), httpx.ConnectError("connection refused")],
+    ids=["connect-timeout", "connect-error"],
+)
+async def test_forward_http_retries_once_when_the_connect_fails(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    """A failed connect sent nothing, so one resend (body included) is safe and usually succeeds."""
+    attempts, result = await _forward_with_flaky_connect(monkeypatch, [failure])
+
+    assert attempts == 2
+    assert isinstance(result, Response)
+    assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_forward_http_gives_up_after_a_second_failed_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts, result = await _forward_with_flaky_connect(
+        monkeypatch, [httpx.ConnectTimeout("first"), httpx.ConnectTimeout("second")]
+    )
+
+    assert attempts == 2
+    assert isinstance(result, UpstreamUnreachable)
+
+
+@pytest.mark.asyncio
+async def test_forward_http_never_retries_once_the_request_may_have_been_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read timeout means the Runtime may have acted on the request; resending could repeat it."""
+    attempts, result = await _forward_with_flaky_connect(
+        monkeypatch, [httpx.ReadTimeout("no response")]
+    )
+
+    assert attempts == 1
+    assert isinstance(result, UpstreamUnreachable)

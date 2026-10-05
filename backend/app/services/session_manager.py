@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import enum
+import threading
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -139,7 +140,12 @@ class SessionManager(Protocol):
         ...
 
     async def shutdown(self) -> None:
-        """Tear down every session this manager is responsible for."""
+        """Release the manager's own resources before the process exits.
+
+        Sessions that cannot outlive the process (the subprocess backend's
+        child processes) are torn down here; a cluster-backed manager leaves
+        its Runtimes running and only closes its own API client.
+        """
         ...
 
 
@@ -184,32 +190,53 @@ class SessionNotFoundError(SessionManagerError):
     status = status.HTTP_404_NOT_FOUND
 
 
+_manager_lock = threading.Lock()
 _manager_state: dict[str, SessionManager | None] = {"instance": None}
 
 
+def _build_session_manager() -> SessionManager:
+    settings = get_settings()
+    # Imported lazily: both backends import this module for the protocol,
+    # value objects, and errors they implement, so a top-level import here
+    # would be circular.
+    if settings.SESSION_BACKEND is SessionBackend.KUBE:
+        from app.services.kube_session_manager import KubeSessionManager  # noqa: PLC0415
+
+        return KubeSessionManager.from_settings(settings)
+    from app.services.subprocess_backend import SubprocessSessionManager  # noqa: PLC0415
+
+    return SubprocessSessionManager.from_settings(settings)
+
+
 def get_session_manager() -> SessionManager:
-    """Return the process-wide session manager, creating it on first use."""
+    """Return the process-wide session manager, creating it on first use.
+
+    FastAPI runs this sync dependency in its threadpool, so a burst of first
+    requests reaches it from many threads at once. Creation is locked and
+    re-checked once the lock is held: without that, each racing thread built
+    its own manager (and, on first use, its own Kubernetes client and
+    connection pool), and every one but the last was dropped unclosed.
+    """
     manager = _manager_state["instance"]
-    if manager is None:
-        settings = get_settings()
-        # Imported lazily: both backends import this module for the protocol,
-        # value objects, and errors they implement, so a top-level import here
-        # would be circular.
-        if settings.SESSION_BACKEND is SessionBackend.KUBE:
-            from app.services.kube_session_manager import KubeSessionManager  # noqa: PLC0415
-
-            manager = KubeSessionManager.from_settings(settings)
-        else:
-            from app.services.subprocess_backend import SubprocessSessionManager  # noqa: PLC0415
-
-            manager = SubprocessSessionManager.from_settings(settings)
-        _manager_state["instance"] = manager
+    if manager is not None:
+        return manager
+    with _manager_lock:
+        manager = _manager_state["instance"]
+        if manager is None:
+            manager = _build_session_manager()
+            _manager_state["instance"] = manager
     return manager
 
 
 async def shutdown_session_manager() -> None:
-    """Shut down and clear the process-wide session manager, if any."""
-    manager = _manager_state["instance"]
+    """Shut down and clear the process-wide session manager, if any.
+
+    The instance is detached under the lock, so two concurrent calls can never
+    shut down the same manager twice; the shutdown itself runs after the lock
+    is released, since a thread lock must never be held across an `await`.
+    """
+    with _manager_lock:
+        manager = _manager_state["instance"]
+        _manager_state["instance"] = None
     if manager is not None:
         await manager.shutdown()
-        _manager_state["instance"] = None

@@ -1,6 +1,9 @@
 package controller
 
 import (
+	"slices"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
@@ -8,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	marimohubv1alpha1 "github.com/karthedew/marimohub/marimohub-operator/api/v1alpha1"
@@ -147,6 +151,71 @@ func markMainExited(pod *corev1.Pod, exitCode int32, reason string) {
 		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: exitCode, Reason: reason}},
 	}}
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// markEvicted reports what the kubelet leaves behind after a node-pressure
+// eviction: a Failed Pod with reason Evicted and a DisruptionTarget
+// condition, its marimo container killed, and no deletionTimestamp. Nothing
+// deletes such a Pod until someone does.
+func markEvicted(pod *corev1.Pod) {
+	markInitSucceeded(pod)
+	pod.Status.Phase = corev1.PodFailed
+	pod.Status.Reason = podReasonEvicted
+	pod.Status.Message = "The node was low on resource: memory."
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:   corev1.DisruptionTarget,
+		Status: corev1.ConditionTrue,
+		Reason: corev1.PodReasonTerminationByKubelet,
+	}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  mainContainerName,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"}},
+	}}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// markDisruptionTarget sets pod's DisruptionTarget condition to status: True
+// as the scheduler, the eviction API, or the taint manager does right before
+// deleting a Pod, and False as the disruption controller does when it resets
+// a disruption that never went ahead.
+func markDisruptionTarget(pod *corev1.Pod, status corev1.ConditionStatus) {
+	cond := corev1.PodCondition{Type: corev1.DisruptionTarget, Status: status, Reason: corev1.PodReasonPreemptionByScheduler}
+	if i := slices.IndexFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool { return c.Type == corev1.DisruptionTarget }); i >= 0 {
+		pod.Status.Conditions[i] = cond
+	} else {
+		pod.Status.Conditions = append(pod.Status.Conditions, cond)
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// testPodFinalizer holds a deleted Pod in Terminating. envtest has no
+// kubelet, so a deleted Pod otherwise disappears at once, and the window
+// the controller has to survive never opens: the Pod still exists, with a
+// deletionTimestamp, while its containers report how they were stopped. No
+// production code path writes a finalizer.
+const testPodFinalizer = "marimohub.io/test-hold"
+
+// holdPod adds testPodFinalizer to cr's live Pod, so deleting it leaves it
+// Terminating until releasePod. The cleanup releases it if a spec stops
+// early, so a failed spec never leaks a Pod that can't be deleted.
+func holdPod(cr *marimohubv1alpha1.MarimoSession) {
+	pod := getPod(cr)
+	controllerutil.AddFinalizer(pod, testPodFinalizer)
+	Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+	DeferCleanup(func() {
+		if pod := getPodIfExists(cr); pod != nil && controllerutil.RemoveFinalizer(pod, testPodFinalizer) {
+			Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+		}
+	})
+}
+
+// releasePod removes testPodFinalizer from cr's held, already-deleted Pod
+// and waits until the Pod is gone.
+func releasePod(cr *marimohubv1alpha1.MarimoSession) {
+	pod := getPod(cr)
+	Expect(controllerutil.RemoveFinalizer(pod, testPodFinalizer)).To(BeTrue())
+	Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+	Eventually(func() bool { return getPodIfExists(cr) == nil }).Should(BeTrue())
 }
 
 func markMainWaiting(pod *corev1.Pod, reason string) {

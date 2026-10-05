@@ -63,7 +63,8 @@ legacy annotation handling, or compatibility branches for the reviewed draft.
 - No dynamic `marimo --sandbox` dependency installation or public package-registry egress.
 - No user-facing CPU, memory, storage, image, or network controls.
 - No per-Workspace Runtime images or policies in this phase.
-- No durable Runtime filesystem, Workspace PVC, or Deployment PVC.
+- No per-Runtime or Deployment PVC. Workspace Files on one shared claim are in scope; see
+  `docs/adr/0002-workspace-files-on-shared-storage.md`.
 - No Deployment revision history or rollback UI; only the current deployed snapshot is retained.
 - No automatic retry of quota-rejected attempts or deterministic workload failures.
 - No public access to `/api/internal/*`.
@@ -78,8 +79,9 @@ legacy annotation handling, or compatibility branches for the reviewed draft.
 - `MarimoSession` remains the Kubernetes resource name for both kinds of Runtime.
 - A Deployment runs an immutable source and Runtime-image snapshot captured at deploy time. Notebook
   edits do not affect it until an Editor or Owner redeploys.
-- A Runtime filesystem is ephemeral. Only Notebook source and explicitly stored Notebook data survive
-  Pod replacement or scale-to-zero.
+- A Runtime filesystem is ephemeral. Only Notebook source, explicitly stored Notebook data, and
+  Workspace Files (mounted read-write into edit Runtimes and read-only into run Runtimes, never into
+  deploy Runtimes) survive Pod replacement or scale-to-zero.
 - Archiving a Workspace stops all of its Sessions and Deployments.
 
 ## Target Architecture
@@ -224,8 +226,9 @@ their cause is resolved.
 
 1. New CR + missing/invalid Secret -> `Pending`, `CredentialsAvailable=False`.
 2. Valid Secret -> create/reconcile Service, record a start attempt, enter `Starting`, create Pod.
-3. Pod passes startup and authenticated readiness -> `Ready`; set `lastActivity=now` and do not run
-   idle evaluation in the same reconcile.
+3. Pod passes startup and authenticated readiness -> `Ready`; set `lastActivity=now`, do not run
+   idle evaluation in the same reconcile, and requeue for one full idle window. The predicate drops the
+   Ready status write, so that requeue is the only trigger for a Runtime that never sees activity.
 4. New activity token -> acknowledge it in status and set `lastActivity` from the controller clock.
 5. Idle edit/run -> delete the CR; owner-reference GC removes all children.
 6. Idle deploy -> first persist `Sleeping` and clear `podName`, then delete the Pod; retain CR, Service,

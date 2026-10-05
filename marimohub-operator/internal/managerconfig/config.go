@@ -14,11 +14,15 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
+	"path"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/karthedew/marimohub/marimohub-operator/api/v1alpha1"
 	"github.com/karthedew/marimohub/marimohub-operator/internal/session"
@@ -34,6 +38,15 @@ const MinIdleTimeoutSeconds = 30
 // a manager started without --idle-grace-period-seconds keeps behaving
 // exactly as it did before the flag existed.
 const defaultIdleGracePeriodSeconds = 20
+
+// defaultWorkspaceMountPath puts the Workspace directory beside the fetched
+// notebook.py, so notebook code can reach it with a relative path from the
+// Runtime image's /work working directory.
+const defaultWorkspaceMountPath = "/work/workspace"
+
+// maxGroupID is the largest group ID Kubernetes accepts in a Pod's
+// supplementalGroups.
+const maxGroupID = 2147483647
 
 // imageDigestPattern reuses the exact rule the CRD applies to spec.image, so
 // the manager's own --fetcher-image flag and the API server's admission
@@ -102,6 +115,14 @@ type Config struct {
 	// deadlines, which stay internal constants until something actually
 	// needs to configure them.
 	IdleGracePeriod time.Duration
+
+	// WorkspaceStorage mounts each Workspace's durable directory into its
+	// edit and run Runtimes; the zero value disables it.
+	WorkspaceStorage session.WorkspaceStorage
+
+	// SharedVolumes are the administrator-provided data volumes mounted
+	// into Runtimes, already defaulted and validated.
+	SharedVolumes []session.SharedVolume
 }
 
 // flagValues holds the raw, unvalidated flag destinations. Keeping this
@@ -123,6 +144,10 @@ type flagValues struct {
 	idleTimeoutRun       int
 	idleTimeoutDeploy    int
 	idleGracePeriod      int
+	workspaceClaimName   string
+	workspaceMountPath   string
+	workspaceGroups      string
+	sharedVolumesJSON    string
 }
 
 // FlagSet is the handle RegisterFlags returns; call Resolve after the
@@ -168,6 +193,18 @@ func RegisterFlags(fs *flag.FlagSet) *FlagSet {
 	fs.IntVar(&v.idleGracePeriod, "idle-grace-period-seconds", defaultIdleGracePeriodSeconds,
 		"Additional grace period added on top of the effective idle timeout before any idle action, "+
 			"absorbing the backend's own activity-signal interval. Must stay comfortably larger than that interval.")
+	fs.StringVar(&v.workspaceClaimName, "workspace-claim-name", "",
+		"ReadWriteMany PersistentVolumeClaim in --runtime-namespace holding every Workspace directory under "+
+			"workspaces/<workspaceId>. Optional; empty disables Workspace storage.")
+	fs.StringVar(&v.workspaceMountPath, "workspace-mount-path", defaultWorkspaceMountPath,
+		"Absolute path where edit and run Runtimes see their Workspace directory.")
+	fs.StringVar(&v.workspaceGroups, "workspace-supplemental-groups", "",
+		"Comma-separated group IDs added to every Pod that mounts --workspace-claim-name. Optional.")
+	fs.StringVar(&v.sharedVolumesJSON, "shared-volumes", "",
+		`JSON list of administrator-provided volumes to mount into Runtimes, e.g. `+
+			`[{"name":"datasets","claimName":"nfs-datasets","mountPath":"/mnt/datasets"}]. Each entry may `+
+			`also set subPath, readOnly (default true), modes (default ["edit","run"]; "deploy" only when `+
+			`read-only) and supplementalGroups. Optional.`)
 	return &FlagSet{values: v}
 }
 
@@ -263,10 +300,221 @@ func (f *FlagSet) Resolve() (Config, error) {
 		errs = append(errs, fmt.Errorf("--idle-grace-period-seconds must not be negative, got %d", v.idleGracePeriod))
 	}
 
+	if storage, storageErrs := resolveWorkspaceStorage(v); len(storageErrs) > 0 {
+		errs = append(errs, storageErrs...)
+	} else {
+		cfg.WorkspaceStorage = storage
+	}
+
+	if shared, sharedErrs := resolveSharedVolumes(v.sharedVolumesJSON, cfg.WorkspaceStorage); len(sharedErrs) > 0 {
+		errs = append(errs, sharedErrs...)
+	} else {
+		cfg.SharedVolumes = shared
+	}
+
 	if len(errs) > 0 {
 		return Config{}, errors.Join(errs...)
 	}
 	return cfg, nil
+}
+
+// resolveWorkspaceStorage validates the three Workspace storage flags
+// together. With no claim configured the other two are ignored, so the
+// chart can always pass the mount path default without enabling anything.
+func resolveWorkspaceStorage(v *flagValues) (session.WorkspaceStorage, []error) {
+	if v.workspaceClaimName == "" {
+		return session.WorkspaceStorage{}, nil
+	}
+	var errs []error
+	for _, msg := range validation.IsDNS1123Subdomain(v.workspaceClaimName) {
+		errs = append(errs, fmt.Errorf("--workspace-claim-name %q: %s", v.workspaceClaimName, msg))
+	}
+	if err := validateRuntimeMountPath(v.workspaceMountPath); err != nil {
+		errs = append(errs, fmt.Errorf("--workspace-mount-path: %w", err))
+	}
+	groups, err := parseSupplementalGroups(v.workspaceGroups)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("--workspace-supplemental-groups: %w", err))
+	}
+	return session.WorkspaceStorage{
+		ClaimName:          v.workspaceClaimName,
+		MountPath:          v.workspaceMountPath,
+		SupplementalGroups: groups,
+	}, errs
+}
+
+// validateRuntimeMountPath refuses a Workspace or shared-volume mount path
+// that would shadow one of the Runtime's own mounts or land inside the
+// read-only credential projection. Nesting under a scratch mount (the
+// /work/workspace default) is fine and intended: it puts the Workspace
+// directory next to notebook.py.
+func validateRuntimeMountPath(p string) error {
+	if !path.IsAbs(p) || path.Clean(p) != p {
+		return fmt.Errorf("%q must be a clean absolute path", p)
+	}
+	reserved := session.ReservedMountPaths()
+	if slices.Contains(reserved, p) {
+		return fmt.Errorf("%q collides with a mount every Runtime already has (%s)", p, strings.Join(reserved[1:], ", "))
+	}
+	secrets := reserved[len(reserved)-1]
+	if strings.HasPrefix(p, secrets+"/") {
+		return fmt.Errorf("%q must not be inside the read-only credential mount %s", p, secrets)
+	}
+	return nil
+}
+
+// sharedVolumeSpec is one --shared-volumes entry as given. Pointers and
+// nil slices mark fields left to their defaults.
+type sharedVolumeSpec struct {
+	Name               string                 `json:"name"`
+	ClaimName          string                 `json:"claimName"`
+	SubPath            string                 `json:"subPath"`
+	MountPath          string                 `json:"mountPath"`
+	ReadOnly           *bool                  `json:"readOnly"`
+	Modes              []v1alpha1.RuntimeMode `json:"modes"`
+	SupplementalGroups []int64                `json:"supplementalGroups"`
+}
+
+// maxSharedVolumeNameLength keeps "shared-<name>" within a Pod volume
+// name's DNS-label limit of 63 characters.
+const maxSharedVolumeNameLength = 63 - len("shared-")
+
+// resolveSharedVolumes parses, defaults and validates --shared-volumes. A
+// share defaults to read-only, edit and run Runtimes, and /mnt/<name>.
+// Deploy Runtimes are public applications, so a share may reach them only
+// read-only. Mount paths may not collide with a Runtime's own mounts, the
+// Workspace directory, or each other.
+func resolveSharedVolumes(raw string, workspace session.WorkspaceStorage) ([]session.SharedVolume, []error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var specs []sharedVolumeSpec
+	if err := decoder.Decode(&specs); err != nil {
+		return nil, []error{fmt.Errorf("--shared-volumes: invalid JSON: %w", err)}
+	}
+
+	type claimedPath struct{ path, owner string }
+	var errs []error
+	var claimed []claimedPath
+	if workspace.Enabled() {
+		claimed = append(claimed, claimedPath{workspace.MountPath, "the Workspace directory"})
+	}
+	seen := map[string]bool{}
+	volumes := make([]session.SharedVolume, 0, len(specs))
+	for i, spec := range specs {
+		label := fmt.Sprintf("--shared-volumes[%d]", i)
+		if spec.Name != "" {
+			label = fmt.Sprintf("--shared-volumes %q", spec.Name)
+		}
+		volume, specErrs := resolveSharedVolume(spec, label)
+		errs = append(errs, specErrs...)
+		if seen[volume.Name] {
+			errs = append(errs, fmt.Errorf("%s: name is used more than once", label))
+		}
+		seen[volume.Name] = true
+		if volume.MountPath != "" {
+			for _, other := range claimed {
+				if pathsOverlap(volume.MountPath, other.path) {
+					errs = append(errs, fmt.Errorf("%s: mountPath %q overlaps %s at %q",
+						label, volume.MountPath, other.owner, other.path))
+				}
+			}
+			claimed = append(claimed, claimedPath{volume.MountPath, label})
+		}
+		volumes = append(volumes, volume)
+	}
+	return volumes, errs
+}
+
+func resolveSharedVolume(spec sharedVolumeSpec, label string) (session.SharedVolume, []error) {
+	var errs []error
+	volume := session.SharedVolume{
+		Name:               spec.Name,
+		ClaimName:          spec.ClaimName,
+		SubPath:            spec.SubPath,
+		MountPath:          spec.MountPath,
+		ReadOnly:           spec.ReadOnly == nil || *spec.ReadOnly,
+		Modes:              spec.Modes,
+		SupplementalGroups: spec.SupplementalGroups,
+	}
+
+	if msgs := validation.IsDNS1123Label(spec.Name); len(msgs) > 0 || len(spec.Name) > maxSharedVolumeNameLength {
+		errs = append(errs, fmt.Errorf("%s: name must be a DNS label of at most %d characters", label, maxSharedVolumeNameLength))
+	}
+	for _, msg := range validation.IsDNS1123Subdomain(spec.ClaimName) {
+		errs = append(errs, fmt.Errorf("%s: claimName %q: %s", label, spec.ClaimName, msg))
+	}
+	if spec.SubPath != "" && (path.IsAbs(spec.SubPath) || path.Clean(spec.SubPath) != spec.SubPath ||
+		spec.SubPath == ".." || strings.HasPrefix(spec.SubPath, "../")) {
+		errs = append(errs, fmt.Errorf("%s: subPath %q must be a clean relative path inside the claim", label, spec.SubPath))
+	}
+	if volume.MountPath == "" && spec.Name != "" {
+		volume.MountPath = "/mnt/" + spec.Name
+	}
+	if err := validateRuntimeMountPath(volume.MountPath); err != nil {
+		errs = append(errs, fmt.Errorf("%s: mountPath: %w", label, err))
+	}
+	if volume.Modes == nil {
+		volume.Modes = []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit, v1alpha1.RuntimeModeRun}
+	}
+	errs = append(errs, validateSharedVolumeModes(volume, label)...)
+	for _, gid := range spec.SupplementalGroups {
+		if gid < 1 || gid > maxGroupID {
+			errs = append(errs, fmt.Errorf("%s: supplementalGroups: %d is not a group ID between 1 and %d", label, gid, maxGroupID))
+		}
+	}
+	return volume, errs
+}
+
+func validateSharedVolumeModes(volume session.SharedVolume, label string) []error {
+	var errs []error
+	if len(volume.Modes) == 0 {
+		errs = append(errs, fmt.Errorf("%s: modes must name at least one of edit, run, deploy", label))
+	}
+	seen := map[v1alpha1.RuntimeMode]bool{}
+	for _, mode := range volume.Modes {
+		switch mode {
+		case v1alpha1.RuntimeModeEdit, v1alpha1.RuntimeModeRun:
+		case v1alpha1.RuntimeModeDeploy:
+			if !volume.ReadOnly {
+				errs = append(errs, fmt.Errorf("%s: deploy Runtimes are public, so only a read-only volume may list mode deploy", label))
+			}
+		default:
+			errs = append(errs, fmt.Errorf("%s: unknown mode %q", label, mode))
+		}
+		if seen[mode] {
+			errs = append(errs, fmt.Errorf("%s: mode %q is listed more than once", label, mode))
+		}
+		seen[mode] = true
+	}
+	return errs
+}
+
+// pathsOverlap reports whether one path equals the other or lies under it;
+// two mounts that overlap would shadow one another.
+func pathsOverlap(a, b string) bool {
+	return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+}
+
+// parseSupplementalGroups accepts a comma-separated list of positive group
+// IDs. Group 0 is refused: Runtime images already run with it as their
+// primary group, so naming it here could only ever be a mistake.
+func parseSupplementalGroups(raw string) ([]int64, error) {
+	var groups []int64
+	for field := range strings.SplitSeq(raw, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		gid, err := strconv.ParseInt(field, 10, 64)
+		if err != nil || gid < 1 || gid > maxGroupID {
+			return nil, fmt.Errorf("%q is not a group ID between 1 and %d", field, maxGroupID)
+		}
+		groups = append(groups, gid)
+	}
+	return groups, nil
 }
 
 func validateInternalAPIURL(raw string) error {

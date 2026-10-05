@@ -199,6 +199,9 @@ func checkPodSecurity(t *testing.T, opts Options, pod *corev1.Pod) {
 	if pod.Spec.EnableServiceLinks == nil || *pod.Spec.EnableServiceLinks {
 		t.Error("EnableServiceLinks must be false")
 	}
+	if pod.Spec.ShareProcessNamespace == nil || !*pod.Spec.ShareProcessNamespace {
+		t.Error("ShareProcessNamespace must be true so marimo is never PID 1 and exits promptly on SIGTERM")
+	}
 	if pod.Spec.ServiceAccountName != opts.ServiceAccountName {
 		t.Errorf("ServiceAccountName = %q, want %q", pod.Spec.ServiceAccountName, opts.ServiceAccountName)
 	}
@@ -436,6 +439,127 @@ func checkCommonVolumeMounts(t *testing.T, label string, mounts []corev1.VolumeM
 	}
 }
 
+func testWorkspaceStorage() WorkspaceStorage {
+	return WorkspaceStorage{
+		ClaimName:          "marimohub-workspaces",
+		MountPath:          "/work/workspace",
+		SupplementalGroups: []int64{1000},
+	}
+}
+
+func volumeMountNamed(mounts []corev1.VolumeMount, name string) (corev1.VolumeMount, bool) {
+	for _, m := range mounts {
+		if m.Name == name {
+			return m, true
+		}
+	}
+	return corev1.VolumeMount{}, false
+}
+
+// TestBuildPodWorkspaceStorageDisabled pins that the zero-value
+// WorkspaceStorage leaves the Pod exactly as it was before Workspace
+// storage existed: no claim, no extra init container, no group change.
+func TestBuildPodWorkspaceStorageDisabled(t *testing.T) {
+	for _, mode := range []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit, v1alpha1.RuntimeModeRun, v1alpha1.RuntimeModeDeploy} {
+		pod := BuildPod(testSession(mode, ubiImage), testOptions())
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == workspaceVolumeName {
+				t.Errorf("%s: unexpected %q volume with storage disabled", mode, workspaceVolumeName)
+			}
+		}
+		if len(pod.Spec.InitContainers) != 1 {
+			t.Errorf("%s: InitContainers = %d, want only the fetcher", mode, len(pod.Spec.InitContainers))
+		}
+		if pod.Spec.SecurityContext.SupplementalGroups != nil {
+			t.Errorf("%s: SupplementalGroups = %v, want unset", mode, pod.Spec.SecurityContext.SupplementalGroups)
+		}
+	}
+}
+
+// TestBuildPodWorkspaceStorage pins each mode's access: edit read-write,
+// run read-only, deploy not mounted at all.
+func TestBuildPodWorkspaceStorage(t *testing.T) {
+	cases := []struct {
+		mode         v1alpha1.RuntimeMode
+		wantMounted  bool
+		wantReadOnly bool
+	}{
+		{v1alpha1.RuntimeModeEdit, true, false},
+		{v1alpha1.RuntimeModeRun, true, true},
+		{v1alpha1.RuntimeModeDeploy, false, false},
+	}
+	for _, c := range cases {
+		t.Run(string(c.mode), func(t *testing.T) {
+			opts := testOptions()
+			opts.WorkspaceStorage = testWorkspaceStorage()
+			cr := testSession(c.mode, ubiImage)
+			pod := BuildPod(cr, opts)
+
+			if !c.wantMounted {
+				if len(pod.Spec.InitContainers) != 1 || pod.Spec.SecurityContext.SupplementalGroups != nil {
+					t.Fatalf("deploy Pod must not carry any Workspace storage: init=%d groups=%v",
+						len(pod.Spec.InitContainers), pod.Spec.SecurityContext.SupplementalGroups)
+				}
+				if _, ok := volumeMountNamed(pod.Spec.Containers[0].VolumeMounts, workspaceVolumeName); ok {
+					t.Fatal("deploy Runtime must not mount the Workspace directory")
+				}
+				return
+			}
+
+			var claim *corev1.PersistentVolumeClaimVolumeSource
+			for _, v := range pod.Spec.Volumes {
+				if v.Name == workspaceVolumeName {
+					claim = v.PersistentVolumeClaim
+				}
+			}
+			if claim == nil || claim.ClaimName != opts.WorkspaceStorage.ClaimName || claim.ReadOnly {
+				t.Errorf("workspace volume claim = %+v, want writable claim %q", claim, opts.WorkspaceStorage.ClaimName)
+			}
+			if !reflect.DeepEqual(pod.Spec.SecurityContext.SupplementalGroups, opts.WorkspaceStorage.SupplementalGroups) {
+				t.Errorf("SupplementalGroups = %v, want %v", pod.Spec.SecurityContext.SupplementalGroups, opts.WorkspaceStorage.SupplementalGroups)
+			}
+
+			if len(pod.Spec.InitContainers) != 2 || pod.Spec.InitContainers[0].Name != fetcherContainerName {
+				t.Fatalf("InitContainers = %d, want the fetcher followed by %s", len(pod.Spec.InitContainers), WorkspaceInitContainerName)
+			}
+			initC := pod.Spec.InitContainers[1]
+			if initC.Name != WorkspaceInitContainerName || initC.Image != opts.FetcherImage {
+				t.Errorf("workspace init = %s/%s, want %s/%s", initC.Name, initC.Image, WorkspaceInitContainerName, opts.FetcherImage)
+			}
+			wantArgs := []string{"-p", "-m", workspaceDirMode, workspacesInitMountPath + "/" + testWorkspaceID}
+			if !reflect.DeepEqual(initC.Command, []string{"mkdir"}) || !reflect.DeepEqual(initC.Args, wantArgs) {
+				t.Errorf("workspace init command = %v %v, want [mkdir] %v", initC.Command, initC.Args, wantArgs)
+			}
+			wantInitMounts := []corev1.VolumeMount{{Name: workspaceVolumeName, MountPath: workspacesInitMountPath, SubPath: workspacesSubPath}}
+			if !reflect.DeepEqual(initC.VolumeMounts, wantInitMounts) {
+				t.Errorf("workspace init mounts = %v, want only %v", initC.VolumeMounts, wantInitMounts)
+			}
+			checkRestrictedSecurityContext(t, "workspace init container", initC.SecurityContext)
+
+			main := pod.Spec.Containers[0]
+			mount, ok := volumeMountNamed(main.VolumeMounts, workspaceVolumeName)
+			if !ok {
+				t.Fatal("runtime container does not mount the Workspace directory")
+			}
+			wantMount := corev1.VolumeMount{
+				Name:      workspaceVolumeName,
+				MountPath: opts.WorkspaceStorage.MountPath,
+				SubPath:   workspacesSubPath + "/" + testWorkspaceID,
+				ReadOnly:  c.wantReadOnly,
+			}
+			if mount != wantMount {
+				t.Errorf("runtime workspace mount = %+v, want %+v", mount, wantMount)
+			}
+			if env, ok := envValue(main.Env, workspaceDirEnv); !ok || env.Value != opts.WorkspaceStorage.MountPath {
+				t.Errorf("%s env = %+v, want %q", workspaceDirEnv, env, opts.WorkspaceStorage.MountPath)
+			}
+			if _, ok := volumeMountNamed(pod.Spec.InitContainers[0].VolumeMounts, workspaceVolumeName); ok {
+				t.Error("the source fetcher must never mount Workspace storage")
+			}
+		})
+	}
+}
+
 // TestBuildPodResourcesOverride pins that spec.resources overrides only the
 // Runtime container's resources, never the fetcher's: fetcher sizing is
 // platform-controlled policy, not something a Runtime requester's
@@ -474,6 +598,105 @@ func TestModeCommand(t *testing.T) {
 	for _, c := range cases {
 		if got := modeCommand(c.mode); got != c.want {
 			t.Errorf("modeCommand(%s) = %q, want %q", c.mode, got, c.want)
+		}
+	}
+}
+
+const (
+	testShareDatasets = "datasets"
+	testShareScratch  = "scratch"
+)
+
+func testSharedVolumes() []SharedVolume {
+	return []SharedVolume{
+		{
+			Name:               testShareDatasets,
+			ClaimName:          "nfs-datasets",
+			MountPath:          "/mnt/datasets",
+			ReadOnly:           true,
+			Modes:              []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit, v1alpha1.RuntimeModeRun, v1alpha1.RuntimeModeDeploy},
+			SupplementalGroups: []int64{1000},
+		},
+		{
+			Name:               testShareScratch,
+			ClaimName:          "nfs-team",
+			SubPath:            testShareScratch,
+			MountPath:          "/mnt/scratch",
+			ReadOnly:           false,
+			Modes:              []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit},
+			SupplementalGroups: []int64{2000},
+		},
+	}
+}
+
+// TestBuildPodSharedVolumes pins which Runtime modes mount each shared
+// volume, how, and that only the marimo container ever sees one.
+func TestBuildPodSharedVolumes(t *testing.T) {
+	cases := []struct {
+		mode       v1alpha1.RuntimeMode
+		wantShared []string
+		wantGroups []int64
+	}{
+		// Workspace storage contributes 1000 first; the datasets volume's
+		// 1000 is not repeated.
+		{v1alpha1.RuntimeModeEdit, []string{testShareDatasets, testShareScratch}, []int64{1000, 2000}},
+		{v1alpha1.RuntimeModeRun, []string{testShareDatasets}, []int64{1000}},
+		{v1alpha1.RuntimeModeDeploy, []string{testShareDatasets}, []int64{1000}},
+	}
+	byName := map[string]SharedVolume{}
+	for _, shared := range testSharedVolumes() {
+		byName[shared.Name] = shared
+	}
+	for _, c := range cases {
+		t.Run(string(c.mode), func(t *testing.T) {
+			opts := testOptions()
+			opts.WorkspaceStorage = testWorkspaceStorage()
+			opts.SharedVolumes = testSharedVolumes()
+			pod := BuildPod(testSession(c.mode, ubiImage), opts)
+
+			var gotShared []string
+			for _, volume := range pod.Spec.Volumes {
+				name, ok := strings.CutPrefix(volume.Name, sharedVolumePrefix)
+				if !ok {
+					continue
+				}
+				gotShared = append(gotShared, name)
+				want := byName[name]
+				if volume.PersistentVolumeClaim == nil || volume.PersistentVolumeClaim.ClaimName != want.ClaimName ||
+					volume.PersistentVolumeClaim.ReadOnly != want.ReadOnly {
+					t.Errorf("volume %q = %+v, want claim %q readOnly %v", volume.Name, volume.PersistentVolumeClaim, want.ClaimName, want.ReadOnly)
+				}
+				mount, ok := volumeMountNamed(pod.Spec.Containers[0].VolumeMounts, volume.Name)
+				wantMount := corev1.VolumeMount{Name: volume.Name, MountPath: want.MountPath, SubPath: want.SubPath, ReadOnly: want.ReadOnly}
+				if !ok || mount != wantMount {
+					t.Errorf("runtime mount for %q = %+v, want %+v", volume.Name, mount, wantMount)
+				}
+				for _, initC := range pod.Spec.InitContainers {
+					if _, mounted := volumeMountNamed(initC.VolumeMounts, volume.Name); mounted {
+						t.Errorf("init container %q must not mount shared volume %q", initC.Name, volume.Name)
+					}
+				}
+			}
+			if !reflect.DeepEqual(gotShared, c.wantShared) {
+				t.Errorf("shared volumes = %v, want %v (in configuration order)", gotShared, c.wantShared)
+			}
+			if !reflect.DeepEqual(pod.Spec.SecurityContext.SupplementalGroups, c.wantGroups) {
+				t.Errorf("SupplementalGroups = %v, want %v", pod.Spec.SecurityContext.SupplementalGroups, c.wantGroups)
+			}
+		})
+	}
+}
+
+// TestBuildPodWithoutSharedVolumesIsUnchanged pins that configuring none
+// leaves the Pod exactly as before shared volumes existed.
+func TestBuildPodWithoutSharedVolumesIsUnchanged(t *testing.T) {
+	for _, mode := range []v1alpha1.RuntimeMode{v1alpha1.RuntimeModeEdit, v1alpha1.RuntimeModeRun, v1alpha1.RuntimeModeDeploy} {
+		withNil := BuildPod(testSession(mode, ubiImage), testOptions())
+		opts := testOptions()
+		opts.SharedVolumes = []SharedVolume{}
+		withEmpty := BuildPod(testSession(mode, ubiImage), opts)
+		if !reflect.DeepEqual(withNil, withEmpty) {
+			t.Errorf("%s: an empty SharedVolumes list changed the Pod", mode)
 		}
 	}
 }

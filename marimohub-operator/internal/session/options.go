@@ -9,6 +9,8 @@ package session
 
 import (
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/karthedew/marimohub/marimohub-operator/api/v1alpha1"
 )
 
 // CABundle names the Secret and key the internal API's TLS certificate is
@@ -91,4 +93,68 @@ type Options struct {
 	// ImagePullSecrets are attached to the Pod directly so a private
 	// registry works without relying on a ServiceAccount-level grant.
 	ImagePullSecrets []corev1.LocalObjectReference
+
+	// WorkspaceStorage mounts each Workspace's durable directory into its
+	// edit and run Runtimes. The zero value disables it, leaving every
+	// Runtime with only its ephemeral scratch volumes.
+	WorkspaceStorage WorkspaceStorage
+
+	// SharedVolumes are administrator-provided data volumes, typically NFS
+	// exports such as a team's datasets, mounted into every Runtime whose
+	// mode each one lists. Unlike WorkspaceStorage, every Workspace sees
+	// the same files.
+	SharedVolumes []SharedVolume
+}
+
+// SharedVolume is one administrator-provided claim mounted into Runtimes.
+// The platform creates the claim (an NFS PersistentVolume in production);
+// the operator only ever references it.
+type SharedVolume struct {
+	// Name identifies the volume; the Pod volume is named "shared-<Name>".
+	Name string
+
+	// ClaimName is the PersistentVolumeClaim in the Runtime namespace.
+	ClaimName string
+
+	// SubPath is an optional existing directory inside the claim. It must
+	// already exist: a read-only mount cannot create it.
+	SubPath string
+
+	// MountPath is where the marimo container sees the volume.
+	MountPath string
+
+	// ReadOnly mounts the volume, and the claim, read-only.
+	ReadOnly bool
+
+	// Modes lists the Runtime modes that mount the volume.
+	Modes []v1alpha1.RuntimeMode
+
+	// SupplementalGroups are added to every Pod that mounts this volume,
+	// for exports whose files are group-owned.
+	SupplementalGroups []int64
+}
+
+// WorkspaceStorage names the one administrator-provisioned ReadWriteMany
+// claim (an NFS export in production) every Workspace directory lives on.
+// The claim's root must already contain a `workspaces/` directory the
+// Runtime Pods' group can write to; each Runtime then sees only
+// `workspaces/<workspaceId>`, never a sibling Workspace's directory.
+type WorkspaceStorage struct {
+	// ClaimName is the PersistentVolumeClaim in the Runtime namespace.
+	// Empty disables Workspace storage entirely.
+	ClaimName string
+
+	// MountPath is where the marimo container sees its Workspace directory.
+	MountPath string
+
+	// SupplementalGroups are added to every Pod that mounts the claim, so a
+	// share whose `workspaces/` directory is group-owned (the usual shape of
+	// an NFS export, which honors neither fsGroup nor a Pod's arbitrary UID)
+	// stays writable without pinning a UID.
+	SupplementalGroups []int64
+}
+
+// Enabled reports whether Runtimes get a Workspace directory at all.
+func (w WorkspaceStorage) Enabled() bool {
+	return w.ClaimName != ""
 }

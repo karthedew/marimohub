@@ -1,6 +1,8 @@
 package session
 
 import (
+	"slices"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -11,15 +13,38 @@ import (
 	"github.com/karthedew/marimohub/marimohub-operator/internal/runtimecontract"
 )
 
+// WorkspaceInitContainerName is exported because the reconciler's failure
+// classification must tell this init container apart from the source
+// fetcher: a fetcher exit code means something entirely different from
+// mkdir's.
+const WorkspaceInitContainerName = "workspace-init"
+
 const (
 	fetcherContainerName = "source-fetcher"
 	runtimeContainerName = "marimo"
 
-	workVolumeName    = "work"
-	tmpVolumeName     = "tmp"
-	homeVolumeName    = "home"
-	cacheVolumeName   = "cache"
-	secretsVolumeName = "marimohub-secrets"
+	workVolumeName      = "work"
+	tmpVolumeName       = "tmp"
+	homeVolumeName      = "home"
+	cacheVolumeName     = "cache"
+	secretsVolumeName   = "marimohub-secrets"
+	workspaceVolumeName = "workspace"
+
+	// workspacesSubPath is the directory under the claim's root that holds
+	// one subdirectory per Workspace. workspace-init mounts only this
+	// directory, never the claim root, and the marimo container mounts only
+	// its own Workspace's subdirectory of it.
+	workspacesSubPath       = "workspaces"
+	workspacesInitMountPath = "/mnt/workspaces"
+	// workspaceDirMode is owner+group only, with setgid so every file a
+	// Runtime later creates keeps the share's group rather than the Pod's
+	// primary group.
+	workspaceDirMode = "2770"
+	workspaceDirEnv  = "MARIMOHUB_WORKSPACE_DIR"
+
+	// sharedVolumePrefix namespaces administrator-provided volumes so
+	// their names can never collide with the Pod's own volumes.
+	sharedVolumePrefix = "shared-"
 
 	workMountPath    = "/work"
 	tmpMountPath     = "/tmp"
@@ -135,7 +160,7 @@ func BuildPod(cr *v1alpha1.MarimoSession, opts Options) *corev1.Pod {
 		args = append(args, "--skip-update-check")
 	}
 
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            runtimecontract.ChildName(cr.Name),
 			Namespace:       cr.Namespace,
@@ -143,9 +168,22 @@ func BuildPod(cr *v1alpha1.MarimoSession, opts Options) *corev1.Pod {
 			OwnerReferences: []metav1.OwnerReference{ownerReference(cr)},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                 corev1.RestartPolicyNever,
-			AutomountServiceAccountToken:  ptr.To(false),
-			EnableServiceLinks:            ptr.To(false),
+			RestartPolicy:                corev1.RestartPolicyNever,
+			AutomountServiceAccountToken: ptr.To(false),
+			EnableServiceLinks:           ptr.To(false),
+			// Shared only so that marimo is never PID 1. On SIGTERM, marimo's uvicorn
+			// shuts down gracefully, restores the default SIGTERM disposition, and
+			// re-raises the signal to exit. The kernel silently drops a
+			// default-action signal aimed at PID 1, so Python instead runs its
+			// normal exit, where multiprocessing waits forever on the still-live
+			// kernel subprocess. Every Runtime that had run a cell then sat out the
+			// whole termination grace period and was SIGKILLed, and each Session
+			// stop outlasted the backend's delete wait. With the pause container as
+			// PID 1, the re-raised signal terminates marimo immediately, and the
+			// pause container also reaps the kernel's orphaned subprocesses. The
+			// only process this exposes to the marimo container is the pause
+			// container, since the init containers have exited before it starts.
+			ShareProcessNamespace:         ptr.To(true),
 			ServiceAccountName:            opts.ServiceAccountName,
 			ImagePullSecrets:              opts.ImagePullSecrets,
 			TerminationGracePeriodSeconds: ptr.To(terminationGracePeriodSeconds),
@@ -158,6 +196,128 @@ func BuildPod(cr *v1alpha1.MarimoSession, opts Options) *corev1.Pod {
 			Containers:     []corev1.Container{buildRuntimeContainer(cr, opts, args)},
 		},
 	}
+	if mounted, readOnly := workspaceAccess(cr.Spec.Mode); mounted && opts.WorkspaceStorage.Enabled() {
+		attachWorkspace(pod, cr, opts, readOnly)
+	}
+	attachSharedVolumes(pod, cr, opts.SharedVolumes)
+	return pod
+}
+
+// attachSharedVolumes mounts each administrator-provided shared volume whose
+// modes include this Runtime's, into the marimo container only: neither init
+// container needs shared data, and the source fetcher must never see it.
+// Volumes are attached in configuration order, so the Pod stays a pure,
+// deterministic function of its inputs.
+func attachSharedVolumes(pod *corev1.Pod, cr *v1alpha1.MarimoSession, volumes []SharedVolume) {
+	runtime := &pod.Spec.Containers[0]
+	for _, shared := range volumes {
+		if !slices.Contains(shared.Modes, cr.Spec.Mode) {
+			continue
+		}
+		name := sharedVolumePrefix + shared.Name
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: shared.ClaimName,
+					ReadOnly:  shared.ReadOnly,
+				},
+			},
+		})
+		runtime.VolumeMounts = append(runtime.VolumeMounts, corev1.VolumeMount{
+			Name:      name,
+			MountPath: shared.MountPath,
+			SubPath:   shared.SubPath,
+			ReadOnly:  shared.ReadOnly,
+		})
+		addSupplementalGroups(pod, shared.SupplementalGroups)
+	}
+}
+
+// addSupplementalGroups adds each group not already present, in order, so
+// a group shared by Workspace storage and several shared volumes appears
+// once.
+func addSupplementalGroups(pod *corev1.Pod, groups []int64) {
+	for _, group := range groups {
+		if !slices.Contains(pod.Spec.SecurityContext.SupplementalGroups, group) {
+			pod.Spec.SecurityContext.SupplementalGroups = append(pod.Spec.SecurityContext.SupplementalGroups, group)
+		}
+	}
+}
+
+// workspaceAccess reports whether a Runtime of this mode mounts its
+// Workspace directory, and if so whether read-only. It mirrors who the
+// backend lets start each mode: edit requires an Editor, so it gets
+// read-write; run needs only read access to the Notebook (a Viewer, or an
+// anonymous visitor to a Public Notebook), so it gets read-only; deploy
+// serves an immutable deploy-time snapshot as a public application, and
+// live, mutable Workspace files would quietly break that guarantee, so it
+// gets none.
+func workspaceAccess(mode v1alpha1.RuntimeMode) (mounted, readOnly bool) {
+	switch mode {
+	case v1alpha1.RuntimeModeEdit:
+		return true, false
+	case v1alpha1.RuntimeModeRun:
+		return true, true
+	default:
+		return false, false
+	}
+}
+
+// attachWorkspace adds the shared claim, the workspace-init container that
+// creates this Workspace's directory on first use, and the marimo
+// container's mount of exactly that directory. The kubelet would otherwise
+// auto-create a missing subPath itself, but as root and with the claim
+// root's mode, which an arbitrary-UID Runtime could then not write to.
+//
+// spec.workspaceId is admission-validated as a UUID, so it can never
+// traverse out of workspaces/ in either the mkdir argument or the subPath.
+func attachWorkspace(pod *corev1.Pod, cr *v1alpha1.MarimoSession, opts Options, readOnly bool) {
+	storage := opts.WorkspaceStorage
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: workspaceVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: storage.ClaimName},
+		},
+	})
+	addSupplementalGroups(pod, storage.SupplementalGroups)
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, buildWorkspaceInitContainer(cr, opts))
+
+	runtime := &pod.Spec.Containers[0]
+	runtime.VolumeMounts = append(runtime.VolumeMounts, corev1.VolumeMount{
+		Name:      workspaceVolumeName,
+		MountPath: storage.MountPath,
+		SubPath:   workspacesSubPath + "/" + cr.Spec.WorkspaceID,
+		ReadOnly:  readOnly,
+	})
+	runtime.Env = append(runtime.Env, corev1.EnvVar{Name: workspaceDirEnv, Value: storage.MountPath})
+}
+
+// buildWorkspaceInitContainer reuses the fetcher image only because it is
+// the platform's one trusted minimal image already guaranteed to be present
+// on the node; it runs plain mkdir, never the fetch script. It runs before
+// any notebook code, so mounting the whole workspaces/ directory here does
+// not expose sibling Workspaces to a Runtime.
+func buildWorkspaceInitContainer(cr *v1alpha1.MarimoSession, opts Options) corev1.Container {
+	return corev1.Container{
+		Name:            WorkspaceInitContainerName,
+		Image:           opts.FetcherImage,
+		ImagePullPolicy: opts.ImagePullPolicy,
+		Command:         []string{"mkdir"},
+		Args:            []string{"-p", "-m", workspaceDirMode, workspacesInitMountPath + "/" + cr.Spec.WorkspaceID},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: workspaceVolumeName, MountPath: workspacesInitMountPath, SubPath: workspacesSubPath},
+		},
+		Resources:       opts.FetcherResources,
+		SecurityContext: restrictedContainerSecurityContext(),
+	}
+}
+
+// ReservedMountPaths are the paths every Runtime container already mounts.
+// A configured Workspace mount path must not collide with one of them, or
+// with anything under the read-only credential projection.
+func ReservedMountPaths() []string {
+	return []string{"/", workMountPath, tmpMountPath, homeMountPath, cacheMountPath, secretsMountPath}
 }
 
 // childLabels are applied to every child Pod/Service. LabelSession lets the
