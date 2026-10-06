@@ -71,9 +71,9 @@ async function warmUpBackend() {
  * browser tests, and returns a teardown function Playwright calls once the
  * run finishes.
  *
- * This intentionally never touches the development database (`molab`, from
- * `make dev-db`) or a running dev server: it uses its own ports and its own
- * throwaway database, so a developer can run both alongside this suite.
+ * This intentionally never touches the development database (`molab`) or a
+ * running dev server: it uses its own ports and its own throwaway database,
+ * so a developer can run both alongside this suite.
  */
 export default async function globalSetup() {
 	const databaseUrl = requireE2EDatabaseUrl();

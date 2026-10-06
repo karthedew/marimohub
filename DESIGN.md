@@ -9,7 +9,7 @@ This document has two parts:
 - **Design Tasks** — scoped, subagent-sized design areas (DT-*), each with acceptance criteria, likely files, and `Status: pending`.
 
 Target-state inputs (constrain every design task). Both are built, so they were removed from the
-repository on 2026-10-04; read them with `git show a818bea:marimohub-schema-redesign.md` and
+repository on 2026-10-05; read them with `git show a818bea:marimohub-schema-redesign.md` and
 `git show a818bea:marimosession-crd-spec.md`.
 - `marimohub-schema-redesign.md` — ownership moves users → workspaces; `identities` + `local_credentials` split out of `users`; visibility `draft` → `private`; drop `deployments.port`.
 - `marimosession-crd-spec.md` — replace the subprocess `ProcessManager` with a pod-per-session `MarimoSession` CRD + controller; drop the port allocator and in-process idle reaper; add an internal source endpoint.
