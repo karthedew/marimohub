@@ -8,7 +8,9 @@ This document has two parts:
 - **Current State** — a factual map of the backend as built today, with diagrams and an explicit gap analysis against the two authoritative spec documents.
 - **Design Tasks** — scoped, subagent-sized design areas (DT-*), each with acceptance criteria, likely files, and `Status: pending`.
 
-Authoritative target-state inputs (constrain every design task):
+Target-state inputs (constrain every design task). Both are built, so they were removed from the
+repository on 2026-10-04; read them with `git show a818bea:marimohub-schema-redesign.md` and
+`git show a818bea:marimosession-crd-spec.md`.
 - `marimohub-schema-redesign.md` — ownership moves users → workspaces; `identities` + `local_credentials` split out of `users`; visibility `draft` → `private`; drop `deployments.port`.
 - `marimosession-crd-spec.md` — replace the subprocess `ProcessManager` with a pod-per-session `MarimoSession` CRD + controller; drop the port allocator and in-process idle reaper; add an internal source endpoint.
 
@@ -1335,7 +1337,7 @@ flowchart TD
   I/O and JWKS state; the verifier adapter yields `OIDCClaims` so the service is pure DB + testable.
 - **Return the bearer token from the callback (JSON, or in the redirect's fragment).** Rejected: the
   callback is a top-level navigation on the API's URL, which the SPA never sees as JSON (another
-  origin in compose; `/api` routes past the SPA in kind), and a JWT in a URL leaks into history and
+  origin in the host loop, with Vite on :5173 and the backend on :8000; `/api` routes past the SPA in kind), and a JWT in a URL leaks into history and
   logs. The verifier-bound handoff is useless without the originating tab's PKCE verifier.
 - **Store the login state in the database / server-side session.** Rejected: the signed,
   path-scoped login cookie needs no table, no sweeper and no shared state between replicas.
@@ -3792,8 +3794,9 @@ count as unset; surrounding whitespace is stripped) append
 to `OIDC_PROVIDERS`, with `hosted_domain` from `GOOGLE_HOSTED_DOMAIN`. Defining slug `google` in
 `OIDC_PROVIDERS` as well is a startup validation error, as are only one of the pair, or
 `GOOGLE_HOSTED_DOMAIN` without it. Register these redirect URIs on the Google "Web application"
-client: `http://localhost:8000/api/auth/oidc/google/callback` (compose) and
-`https://localhost/api/auth/oidc/google/callback` (kind — Google rejects `*.localhost` hosts).
+client: `http://localhost:8000/api/auth/oidc/google/callback` (the host loop) and
+`https://<MARIMOHUB_HOST>/api/auth/oidc/google/callback` (kind, `https://localhost` by default).
+Google rejects `*.localhost` hosts and single-label ones such as `marimohub`.
 
 The routes look a provider up by `slug` and build
 `redirect_uri = f"{PUBLIC_API_URL}/api/auth/oidc/{slug}/callback"` — derived, never stored, so the

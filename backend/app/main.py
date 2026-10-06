@@ -32,8 +32,9 @@ def cors_allow_origins(settings: Settings) -> list[str]:
     """Return the browser origins allowed to call this API with credentials.
 
     The dev SPA's origin always; plus the origin of ``PUBLIC_APP_URL`` when it
-    is explicitly set (an SPA served from another origin, e.g. compose's
-    frontend port). Unset, the SPA shares the API's origin and needs no CORS.
+    is explicitly set (an SPA served from another origin, e.g. the e2e suite's
+    frontend on E2E_FRONTEND_PORT). Unset, the SPA shares the API's origin and
+    needs no CORS.
     """
     origins = [DEV_SPA_ORIGIN]
     if settings.PUBLIC_APP_URL is not None:

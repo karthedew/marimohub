@@ -1,7 +1,7 @@
 [project]
 name = "backend"
 version = "0.1.0"
-description = "MoLab FastAPI backend"
+description = "MarimoHub FastAPI backend"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.18.4",

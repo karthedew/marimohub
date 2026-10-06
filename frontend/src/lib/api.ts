@@ -278,8 +278,9 @@ export function deploymentProxyUrl(slug: string) {
 // redirects on to the identity provider. It is only ever used for a full-page
 // navigation (`window.location.assign`), never `fetch` or `goto` — the browser
 // has to follow the redirect chain itself. Absolute when PUBLIC_API_URL names
-// a separate backend origin (compose), a same-origin `/api` path otherwise
-// (the ingress in kind routes `/api` to the backend).
+// a separate backend origin (the host loop: Vite on :5173, backend on :8000),
+// a same-origin `/api` path otherwise (the ingress in kind routes `/api` to
+// the backend).
 export function oidcLoginUrl(slug: string, challenge: string) {
 	return resolveApiUrl(buildUrl(`/api/auth/oidc/${encodeURIComponent(slug)}/login`, { challenge }));
 }

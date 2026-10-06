@@ -5,8 +5,8 @@ fix = true
 show-fixes = true
 respect-gitignore = true
 # Match the analysis surface of the other tools (pyright/complexipy/radon all
-# scope to app + tests); spikes/ holds throwaway exploration scripts.
-extend-exclude = ["spikes", "reports"]
+# scope to app + tests).
+extend-exclude = ["reports"]
 
 [format]
 quote-style = "double"
