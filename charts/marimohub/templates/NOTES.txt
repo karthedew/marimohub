@@ -2,8 +2,9 @@ MarimoHub has been {{ if .Release.IsUpgrade }}upgraded{{ else }}installed{{ end 
 
 Endpoints
 {{- if eq .Values.platform "openshift" }}
-  Public application: https://{{ .Values.routes.host | default "<routes.host not set -- see values-openshift.yaml>" }}/
-  Public API:          https://{{ .Values.routes.host | default "<routes.host not set -- see values-openshift.yaml>" }}/api
+  Public application: https://{{ .Values.routes.host }}/
+  Public API:          https://{{ .Values.routes.host }}/api
+  Google redirect URI: https://{{ .Values.routes.host }}/api/auth/oidc/google/callback
 {{- else if .Values.ingress.enabled }}
   Public application: https://{{ .Values.ingress.host }}/
   Public API:          https://{{ .Values.ingress.host }}/api
@@ -31,13 +32,15 @@ Follow-up checks
 {{- if eq .Values.platform "openshift" }}
   4. Confirm both Routes admitted and share the same host:
        kubectl get routes -n {{ .Values.namespaces.app }}
+  5. Confirm every Pod runs under the restricted-v2 SCC (repeat for {{ .Values.namespaces.controller }}):
+       oc -n {{ .Values.namespaces.app }} get pods -o custom-columns='NAME:.metadata.name,SCC:.metadata.annotations.openshift\.io/scc'
 {{- else if .Values.ingress.enabled }}
   4. Confirm the Ingress has an assigned address:
        kubectl get ingress -n {{ .Values.namespaces.app }}
 {{- end }}
 
-Before upgrading this release again, re-apply the canonical CRD with server-side apply if it
-changed (Helm's own crds/ directory only ever installs a CRD on first install, never on upgrade):
+This chart does not install the MarimoSession CRD. Before upgrading this release, update the CRD:
+upgrade the marimohub-platform release first, or, if you applied the CRD yourself, run
        kubectl apply --server-side -f deploy/crd/marimosession.yaml
 
 Uninstalling this release first runs a pre-delete hook that foreground-deletes every

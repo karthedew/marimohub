@@ -14,10 +14,7 @@ spec:
       {{- include "marimohub.componentSelectorLabels" (dict "ctx" $ "component" "uninstall-drain") | nindent 6 }}
   policyTypes: ["Ingress", "Egress"]
   egress:
-    - to:
-        - namespaceSelector: {}
-      ports:
-        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- include "marimohub.dnsEgressRule" . | nindent 4 }}
     {{- if .Values.network.kubernetesApi.cidrs }}
     - to:
         {{- range .Values.network.kubernetesApi.cidrs }}

@@ -8,14 +8,11 @@
 # forbidden from creating on the installer's behalf (see the Namespace
 # Boundaries table), so a missing one has to fail loudly here instead.
 #
-# Also validates the production (OpenShift-shaped) policy CIDR inputs the
-# chart's NetworkPolicy templates render as conditional egress rules
-# (network.kubernetesApi.cidrs / network.database.cidrs): those values
-# render fine when left empty -- `helm template` stays deterministic either
-# way -- but an install that actually leaves them empty gives the operator
-# and both backend Deployments no egress path to the Kubernetes API or
-# PostgreSQL at all, which is exactly the silent gap this command exists to
-# catch before Helm creates a single object.
+# The Kubernetes API and database egress values are not checked here any
+# more: the app chart's openshift profile refuses to render without them,
+# which checks the values the release really uses rather than copies typed on
+# this command line. --platform, --kubernetes-api-cidrs and --database-cidrs
+# are still accepted, and ignored with a notice.
 #
 # Secret existence/key checks (the application Secret, TLS Secrets, the
 # database CA, image-pull Secrets) are a separate, larger surface this
@@ -23,24 +20,20 @@
 # needs real cluster access the same way this script does.
 set -Eeuo pipefail
 
-PREFLIGHT_VERSION="0.2.0"
+PREFLIGHT_VERSION="0.3.0"
 KUBECTL="${KUBECTL:-kubectl}"
 
 usage() {
 	cat <<'EOF'
-Usage: check-namespaces.sh [--kubeconfig FILE] [--platform openshift|portable]
-                            [--kubernetes-api-cidrs CSV] [--database-cidrs CSV]
-                            [--require-nonempty NAME=VALUE ...]
+Usage: check-namespaces.sh [--kubeconfig FILE] [--require-nonempty NAME=VALUE ...]
                             APP_NAMESPACE CONTROLLER_NAMESPACE SESSIONS_NAMESPACE [LABEL=VALUE ...]
 
-Verifies that each namespace exists and, if LABEL=VALUE pairs are given,
-that every one of them carries every listed label.
+Verifies that each namespace exists and is Active and, if LABEL=VALUE pairs
+are given, that every one of them carries every listed label, for example
+pod-security.kubernetes.io/enforce=restricted.
 
-When --platform openshift is given, also requires --kubernetes-api-cidrs and
---database-cidrs to each name at least one CIDR: the chart's NetworkPolicy
-templates render an empty egress rule set for either one left blank, which
-is a silent no-egress-path install on the profile that carries a STIG
-claim. --platform portable (or omitting --platform) skips this check.
+--platform, --kubernetes-api-cidrs and --database-cidrs are ignored since
+0.3.0: the app chart checks those values when it renders.
 
 --require-nonempty NAME=VALUE may be repeated for any other installer-
 supplied value that must not be empty before a production install (e.g.
@@ -62,9 +55,6 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 kubeconfig_args=()
-platform=""
-kubernetes_api_cidrs=""
-database_cidrs=""
 require_nonempty=()
 
 while [[ "${1:-}" == --* ]]; do
@@ -73,16 +63,8 @@ while [[ "${1:-}" == --* ]]; do
 		kubeconfig_args=(--kubeconfig "$2")
 		shift 2
 		;;
-	--platform)
-		platform="$2"
-		shift 2
-		;;
-	--kubernetes-api-cidrs)
-		kubernetes_api_cidrs="$2"
-		shift 2
-		;;
-	--database-cidrs)
-		database_cidrs="$2"
+	--platform | --kubernetes-api-cidrs | --database-cidrs)
+		echo "preflight: $1 is ignored since 0.3.0; the app chart checks network values when it renders" >&2
 		shift 2
 		;;
 	--require-nonempty)
@@ -129,7 +111,10 @@ check_namespace() {
 		local key="${pair%%=*}"
 		local want="${pair#*=}"
 		local got
-		got=$("${KUBECTL}" "${kubeconfig_args[@]}" get namespace "${ns}" -o jsonpath="{.metadata.labels.${key}}" 2>/dev/null || true)
+		# kubectl's jsonpath reads every unescaped dot as a field separator,
+		# and label keys such as pod-security.kubernetes.io/enforce contain
+		# dots, so each one is escaped.
+		got=$("${KUBECTL}" "${kubeconfig_args[@]}" get namespace "${ns}" -o jsonpath="{.metadata.labels.${key//./\\.}}" 2>/dev/null || true)
 		if [[ "${got}" != "${want}" ]]; then
 			echo "preflight: namespace '${ns}' label '${key}' = '${got:-<absent>}', want '${want}'" >&2
 			failures=$((failures + 1))
@@ -140,17 +125,6 @@ check_namespace() {
 check_namespace "${app_ns}"
 check_namespace "${controller_ns}"
 check_namespace "${sessions_ns}"
-
-if [[ "${platform}" == "openshift" ]]; then
-	if [[ -z "${kubernetes_api_cidrs}" ]]; then
-		echo "preflight: --platform openshift requires --kubernetes-api-cidrs (network.kubernetesApi.cidrs is empty -- the operator and backend Deployments would have no egress path to the Kubernetes API)" >&2
-		failures=$((failures + 1))
-	fi
-	if [[ -z "${database_cidrs}" ]]; then
-		echo "preflight: --platform openshift requires --database-cidrs (network.database.cidrs is empty -- backendPublic/backendInternal/the migration Job would have no egress path to PostgreSQL)" >&2
-		failures=$((failures + 1))
-	fi
-fi
 
 for pair in "${require_nonempty[@]}"; do
 	name="${pair%%=*}"

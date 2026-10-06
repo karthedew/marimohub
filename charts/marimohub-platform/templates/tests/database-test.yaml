@@ -1,0 +1,73 @@
+{{- /*
+helm test: the evaluation database accepts a verified TLS connection
+(sslmode=verify-full against the platform CA) as the app role, and pgvector
+is installed.
+*/}}
+{{- if .Values.postgresql.enabled }}
+{{- $v := .Values }}
+{{- $name := $v.postgresql.name }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-database-test
+  namespace: {{ $v.namespaces.database }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: platform-test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+    {{- with $v.postgresql.podSecurityContext }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  containers:
+    - name: check
+      image: {{ $v.postgresql.image }}
+      command: ["psql"]
+      args:
+        - "host={{ $name }}.{{ $v.namespaces.database }}.svc port=5432 dbname=marimohub user=marimohub sslmode=verify-full sslrootcert=/etc/postgresql/ca/ca.crt"
+        - -v
+        - ON_ERROR_STOP=1
+        - -tAc
+        - "select 'pgvector ' || extversion || ', tls ' || ssl::text from pg_extension, pg_stat_ssl where extname = 'vector' and pid = pg_backend_pid()"
+      env:
+        - name: HOME
+          value: /tmp
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ $name }}
+              key: password
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 10m, memory: 32Mi, ephemeral-storage: 16Mi }
+        limits: { cpu: 200m, memory: 128Mi, ephemeral-storage: 32Mi }
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: ca
+          mountPath: /etc/postgresql/ca
+          readOnly: true
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 16Mi
+    - name: ca
+      secret:
+        secretName: {{ $name }}-tls
+        items:
+          - key: ca.crt
+            path: ca.crt
+{{- end }}

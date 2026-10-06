@@ -1,0 +1,95 @@
+{{- /*
+helm test: mounts every claim the way a Runtime does, under the restricted
+profile with the configured groups. workspaces/ must exist and be writable,
+every share readable, and a read-only share must refuse writes.
+*/}}
+{{- $v := .Values }}
+{{- $shares := include "platform.shares" . | fromJsonArray }}
+{{- if or $v.storage.workspaces.enabled $shares }}
+{{- $groups := list }}
+{{- if $v.storage.workspaces.enabled }}{{ $groups = concat $groups $v.storage.workspaces.supplementalGroups }}{{ end }}
+{{- range $shares }}{{ $groups = concat $groups .supplementalGroups }}{{ end }}
+{{- $intGroups := list }}
+{{- range $groups }}{{ $intGroups = append $intGroups (int64 .) }}{{ end }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-storage-test
+  namespace: {{ $v.namespaces.sessions }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: platform-test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    {{- if ne $v.platform "openshift" }}
+    # An arbitrary non-root UID in group 0, the way OpenShift runs Pods.
+    runAsUser: 1001
+    runAsGroup: 0
+    {{- end }}
+    seccompProfile:
+      type: RuntimeDefault
+    {{- with ($intGroups | uniq) }}
+    supplementalGroups: {{ toJson . }}
+    {{- end }}
+  containers:
+    - name: check
+      image: {{ $v.tests.image }}
+      command: ["/bin/bash", "-ec"]
+      args:
+        - |
+          id
+          {{- if $v.storage.workspaces.enabled }}
+          test -d /mnt/workspaces/workspaces || { echo "workspaces/ is missing at the root of claim {{ $v.storage.workspaces.claimName }}"; exit 1; }
+          probe=/mnt/workspaces/workspaces/.platform-test-$HOSTNAME
+          if ! touch "$probe"; then echo "workspaces/ is not writable by groups $(id -G)"; exit 1; fi
+          rm -f "$probe"
+          echo "{{ $v.storage.workspaces.claimName }}: workspaces/ is writable"
+          {{- end }}
+          {{- range $shares }}
+          ls -A /mnt/share-{{ .name }} >/dev/null || { echo "share {{ .name }} is not readable by groups $(id -G)"; exit 1; }
+          {{- if .readOnly }}
+          if touch /mnt/share-{{ .name }}/.platform-test 2>/dev/null; then echo "share {{ .name }} is writable but should be read-only"; exit 1; fi
+          {{- end }}
+          echo "share {{ .name }}: readable{{ if .readOnly }}, read-only{{ end }}"
+          {{- end }}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 10m, memory: 32Mi, ephemeral-storage: 16Mi }
+        limits: { cpu: 100m, memory: 64Mi, ephemeral-storage: 32Mi }
+      volumeMounts:
+        {{- if $v.storage.workspaces.enabled }}
+        - name: workspaces
+          mountPath: /mnt/workspaces
+        {{- end }}
+        {{- range $shares }}
+        - name: share-{{ .name }}
+          mountPath: /mnt/share-{{ .name }}
+          readOnly: {{ .readOnly }}
+          {{- with .subPath }}
+          subPath: {{ . }}
+          {{- end }}
+        {{- end }}
+  volumes:
+    {{- if $v.storage.workspaces.enabled }}
+    - name: workspaces
+      persistentVolumeClaim:
+        claimName: {{ $v.storage.workspaces.claimName }}
+    {{- end }}
+    {{- range $shares }}
+    - name: share-{{ .name }}
+      persistentVolumeClaim:
+        claimName: {{ .claimName }}
+        readOnly: {{ .readOnly }}
+    {{- end }}
+{{- end }}

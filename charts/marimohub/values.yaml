@@ -3,9 +3,18 @@
 # This chart never creates or deletes the three trust-boundary namespaces it
 # installs into (`namespaces.app`, `namespaces.controller`, `namespaces.sessions`
 # below): the platform pre-creates and owns them, and Helm only ever installs
-# namespace-scoped objects inside them. It also never installs PostgreSQL: every
-# `existingSecret`/`existingConfigMap` field below names a Secret or ConfigMap an
-# administrator already created in the target namespace.
+# namespace-scoped objects inside them. It also never installs PostgreSQL or
+# the MarimoSession CRD: every `existingSecret`/`existingConfigMap` field below
+# names a Secret or ConfigMap an administrator already created in the target
+# namespace. The marimohub-platform chart (charts/marimohub-platform) creates
+# the namespaces, the CRD, those Secrets and the storage claims, and writes the
+# values that point this chart at them; deploy/ holds the same pieces as plain
+# manifests.
+#
+# Images: the ghcr.io digests below are not published yet. Until the release
+# workflow publishes them, build the images (`make images`), push them to a
+# registry the cluster can pull from, and override every repository/digest
+# pair and runtime.images entry.
 
 namespaces:
   # Frontend, both backend APIs, and the migration Job run here.
@@ -40,6 +49,7 @@ imagePullSecrets: []
 # ── frontend ─────────────────────────────────────────────────────────────
 frontend:
   replicaCount: 2
+  # Not published yet; see the Images note at the top of this file.
   image:
     repository: ghcr.io/karthedew/marimohub-frontend
     digest: sha256:e4d8d7bbe48f46c06bfef8cf6ee1e020c588a7ddac7ee4ffe44f3e1ebdba3efa
@@ -76,16 +86,19 @@ frontend:
 # ── backend-public ───────────────────────────────────────────────────────
 backendPublic:
   replicaCount: 2
+  # Not published yet; see the Images note at the top of this file.
   image:
     repository: ghcr.io/karthedew/marimohub-backend
     digest: sha256:5d59fdd14fc64c473a252f82e594ea3984bdb8bd2b3261406338ab92e33dea61
   imagePullPolicy: IfNotPresent
   port: 8000
-  # Existing Secret an administrator populates with DATABASE_URL, SECRET_KEY,
-  # and PUBLIC_API_URL (the public https:// URL of this install, which every
-  # sign-in redirect URI is built from). Required; the chart only wires the
-  # reference, never the value. backend-internal, the migration Job, and the
-  # maintenance CronJobs load the same Secret, so identity-provider
+  # Existing Secret an administrator populates with DATABASE_URL and
+  # SECRET_KEY. Required; the chart only wires the reference, never the
+  # value. PUBLIC_API_URL (the public https:// URL every sign-in redirect URI
+  # is built from) is set from routes.host on openshift and from ingress.host
+  # when the Ingress is enabled, overriding any value in this Secret; only an
+  # install with neither needs it here. backend-internal, the migration Job,
+  # and the maintenance CronJobs load the same Secret, so identity-provider
   # credentials belong in oidc.existingSecret below instead.
   existingSecret: ""
   # Absolute URL of the browser app. After an identity-provider sign-in the
@@ -159,6 +172,7 @@ backendPublic:
 # ── backend-internal ─────────────────────────────────────────────────────
 backendInternal:
   replicaCount: 2
+  # Not published yet; see the Images note at the top of this file.
   image:
     repository: ghcr.io/karthedew/marimohub-backend
     digest: sha256:5d59fdd14fc64c473a252f82e594ea3984bdb8bd2b3261406338ab92e33dea61
@@ -188,6 +202,7 @@ backendInternal:
 # ── operator ──────────────────────────────────────────────────────────────
 operator:
   replicaCount: 2
+  # Not published yet; see the Images note at the top of this file.
   image:
     repository: ghcr.io/karthedew/marimohub-operator
     digest: sha256:1f8db095a1b8d539288f838bdbe34b57e78ef576d4067c53b9ac5db5a41e9d09
@@ -230,6 +245,7 @@ database:
 # a MarimoSession spec overrides idleTimeoutSeconds/resources itself.
 runtime:
   defaultImageFlavor: ubi
+  # Not published yet; see the Images note at the top of this file.
   images:
     ubi: ghcr.io/karthedew/marimohub-runtime-ubi@sha256:bba30906147ea4f24a531548cd54f7dded3b071932af2e97b64d05df244fe49a
     ubuntu: ghcr.io/karthedew/marimohub-runtime-ubuntu@sha256:f82c757db7b38372e8e3d75e1566e7f43025c9dde2d61ca8f49ef475cc57a394
@@ -251,8 +267,10 @@ runtime:
   imagePullSecrets: []
   # An existing Secret/key in namespaces.sessions holding the CA certificate
   # Runtime Pods use to validate the internal API's TLS certificate. Must
-  # name real material an administrator (or the OpenShift service CA) has
-  # already placed in that namespace; the chart never mints or copies it.
+  # name real material already placed in that namespace; the chart never
+  # mints or copies it. The marimohub-platform chart writes it (the service
+  # CA on OpenShift, its own CA elsewhere) as marimohub-internal-api-ca, key
+  # ca.crt.
   internalApiCA:
     secretName: ""
     secretKey: ca.crt
@@ -422,6 +440,12 @@ monitoring:
 # rather than a selector this chart could compute for you.
 network:
   dns:
+    # NetworkPolicyPeer objects every component may send DNS queries to. The
+    # default allows any Pod in any namespace on the ports below. OpenShift
+    # DNS Pods listen on 5353 behind the dns-default Service's port 53, so
+    # values-openshift.yaml names the openshift-dns Pods and adds 5353.
+    to:
+      - namespaceSelector: {}
     ports:
       - { port: 53, protocol: UDP }
       - { port: 53, protocol: TCP }
@@ -429,16 +453,25 @@ network:
     # e.g. ["10.0.0.1/32"] -- the API server endpoint(s) this cluster's
     # `kubernetes.default.svc` actually resolves to. Left empty by default;
     # a production install must set this or the operator/backend workloads
-    # that need API access get no egress path to it at all.
+    # that need API access get no egress path to it at all. The openshift
+    # profile refuses to render without it.
     cidrs: []
     port: 6443
   database:
     cidrs: []
+    # NetworkPolicyPeer objects for a PostgreSQL that runs in the cluster
+    # (CloudNativePG, Crunchy, or the marimohub-platform chart's evaluation
+    # database), which has no stable CIDR. Rendered next to cidrs, e.g.
+    #   - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: marimohub-database } }
+    #     podSelector: { matchLabels: { app.kubernetes.io/name: marimohub-postgresql } }
+    peers: []
     port: 5432
   router:
     # Ingress source allowed to reach the frontend/backend-public Services.
-    # OpenShift sets this to the router namespace; the portable profile
-    # points it at its Ingress controller's own namespace/pods instead.
+    # OpenShift selects every router, including host-network ones, through
+    # the policy-group.network.openshift.io/ingress namespace label with an
+    # empty podSelector; the portable profile points it at its Ingress
+    # controller's own namespace/pods instead.
     namespaceSelector: {}
     podSelector: {}
   externalProxy:
@@ -476,20 +509,37 @@ openshift:
     enabled: false
 
 # OpenShift only: same-host path Routes, /api -> backendPublic and / ->
-# frontend, both re-encrypt TLS. host has no safe repository-wide default
-# (it is the public hostname the installer's DNS points at this cluster's
-# router) and is left empty here; render still succeeds with it empty (an
-# OpenShift Route with no host auto-generates one, which is a functional gap
-# an installer must close, not a template-time error) -- set it, and
-# destinationCACertificate, before a real install. destinationCACertificate
-# is the cluster's own service-ca bundle content (the `service-ca.crt` key
-# OpenShift publishes as the `openshift-service-ca.crt` ConfigMap in every
-# namespace), required for the router to trust openshift.serviceServingCerts
-# Service certificates; without it the router falls back to its own default
-# CA and re-encrypt TLS to these Services fails.
+# frontend, both re-encrypt TLS.
 routes:
+  # The public host name, for example marimohub.apps.example.com. Required on
+  # the openshift profile: a Route without a host gets a generated one per
+  # Route, so / and /api would stop sharing one origin. A host under the
+  # cluster's apps domain uses the router's default certificate.
   host: ""
+  # Leave empty. Without it the router verifies the origin certificates
+  # against the service CA, which issues them, and keeps trusting it across
+  # service-CA rotations. A pinned copy of the service CA goes stale on
+  # rotation and, on routers affected by CVE-2022-1632, turns off backend
+  # certificate checks. Set it only for an origin certificate that the
+  # service CA did not issue.
   destinationCACertificate: ""
+  # Strict-Transport-Security sent on both Routes (the
+  # haproxy.router.openshift.io/hsts_header annotation), for example
+  # max-age=31536000. Clusters that enforce HSTS per domain reject Routes
+  # without a compliant value. Empty sends none.
+  hsts: ""
+  # Idle timeout for notebook WebSockets on the /api Route (the
+  # haproxy.router.openshift.io/timeout-tunnel annotation), for example 1h.
+  # Empty uses the IngressController's tunnelTimeout (1h by default).
+  tunnelTimeout: ""
+  tls:
+    # Existing kubernetes.io/tls Secret in namespaces.app with the public
+    # certificate for host, for a host outside the cluster's apps domain.
+    # Rendered as spec.tls.externalCertificate (GA in OpenShift 4.19,
+    # Technology Preview in 4.17 and 4.18), together with a Role that lets
+    # the router read only this Secret. Empty uses the router's default
+    # certificate.
+    externalCertificateSecretName: ""
 
 ingress:
   enabled: false

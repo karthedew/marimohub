@@ -1,0 +1,74 @@
+{{- /*
+Statically bound ReadWriteMany volumes in namespaces.sessions: one for
+Workspace Files and one per shared export. Pods reach NFS only through these
+claims; restricted-v2 and Pod Security "restricted" forbid inline nfs
+volumes. PV names carry the sessions namespace, since PVs are cluster-wide.
+A PV's source (server and path) cannot change: delete the claim and the PV
+first. mountOptions and labels change in place.
+*/}}
+{{- $v := .Values }}
+{{- $volumes := list }}
+{{- if $v.storage.workspaces.enabled }}
+{{- with $v.storage.workspaces }}
+{{- $path := clean .path }}
+{{- $volumes = append $volumes (dict "claimName" .claimName "capacity" .capacity "path" $path "server" (.server | default $v.storage.nfs.server) "hostPath" (.hostPath | default $path) "readOnly" false "role" "workspaces") }}
+{{- end }}
+{{- end }}
+{{- range include "platform.shares" . | fromJsonArray }}
+{{- $volumes = append $volumes (dict "claimName" .claimName "capacity" .capacity "path" .path "server" .server "hostPath" .hostPath "readOnly" .readOnly "role" (printf "share-%s" .name)) }}
+{{- end }}
+{{- range $vol := $volumes }}
+{{- $pvName := printf "%s-%s" $v.namespaces.sessions $vol.claimName }}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: {{ $pvName }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+    marimohub.io/storage: {{ $vol.role }}
+  annotations:
+    {{- include "platform.keep" $ | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ $vol.capacity }}
+  accessModes: ["ReadWriteMany"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  claimRef:
+    namespace: {{ $v.namespaces.sessions }}
+    name: {{ $vol.claimName }}
+  {{- if eq $v.storage.mode "nfs" }}
+  {{- $options := $v.storage.nfs.mountOptions | default list }}
+  {{- if $vol.readOnly }}{{ $options = append $options "ro" }}{{ end }}
+  {{- with $options }}
+  mountOptions:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  nfs:
+    server: {{ $vol.server }}
+    path: {{ $vol.path }}
+  {{- else }}
+  hostPath:
+    path: {{ $vol.hostPath }}
+    type: Directory
+  {{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $vol.claimName }}
+  namespace: {{ $v.namespaces.sessions }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+    marimohub.io/storage: {{ $vol.role }}
+  annotations:
+    {{- include "platform.keep" $ | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ""
+  volumeName: {{ $pvName }}
+  resources:
+    requests:
+      storage: {{ $vol.capacity }}
+{{- end }}

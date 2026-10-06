@@ -1,0 +1,19 @@
+apiVersion: v2
+name: marimohub-platform
+description: >-
+  Cluster-admin prerequisites for the marimohub chart: its namespaces, the
+  MarimoSession CRD and admission policy, the Secrets and storage claims the
+  app chart references, and an optional evaluation PostgreSQL.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/karthedew/marimohub
+sources:
+  - https://github.com/karthedew/marimohub
+keywords:
+  - marimo
+  - notebook
+  - openshift
+maintainers:
+  - name: MarimoHub maintainers

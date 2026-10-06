@@ -3,12 +3,13 @@
 # so the /api Route below always wins over the / Route for API traffic
 # without either needing an explicit priority field. Both terminate
 # re-encrypt: the router decrypts the client's TLS, then re-encrypts to the
-# origin Service's own TLS listener (see frontend.tls/backendPublic.tls),
-# verified against routes.destinationCACertificate -- the cluster's
-# service-ca bundle content, since both origins present
-# service-serving-certificate-issued certificates when
-# openshift.serviceServingCerts.enabled.
+# origin Service's own TLS listener (see frontend.tls/backendPublic.tls).
+# With no destinationCACertificate the router verifies that listener against
+# the service CA, which issues the origins' certificates when
+# openshift.serviceServingCerts.enabled, and keeps trusting it across
+# service-CA rotations.
 {{- if eq .Values.platform "openshift" }}
+{{- $host := required "routes.host is required on the openshift profile" .Values.routes.host }}
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
@@ -20,8 +21,15 @@ metadata:
     # Session start and Deployment wake requests block until the Runtime is
     # ready; see runtime.startTimeoutSeconds.
     haproxy.router.openshift.io/timeout: {{ include "marimohub.routerTimeoutSeconds" . }}s
+    {{- with .Values.routes.tunnelTimeout }}
+    # Idle limit for notebook WebSockets on /api/proxy/*.
+    haproxy.router.openshift.io/timeout-tunnel: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.routes.hsts }}
+    haproxy.router.openshift.io/hsts_header: {{ . | quote }}
+    {{- end }}
 spec:
-  host: {{ .Values.routes.host }}
+  host: {{ $host }}
   path: /api
   to:
     kind: Service
@@ -30,8 +38,14 @@ spec:
     targetPort: http
   tls:
     termination: reencrypt
-    destinationCACertificate: {{ .Values.routes.destinationCACertificate | quote }}
     insecureEdgeTerminationPolicy: Redirect
+    {{- with .Values.routes.destinationCACertificate }}
+    destinationCACertificate: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.routes.tls.externalCertificateSecretName }}
+    externalCertificate:
+      name: {{ . }}
+    {{- end }}
 ---
 apiVersion: route.openshift.io/v1
 kind: Route
@@ -40,8 +54,12 @@ metadata:
   namespace: {{ .Values.namespaces.app }}
   labels:
     {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "frontend") | nindent 4 }}
+  {{- with .Values.routes.hsts }}
+  annotations:
+    haproxy.router.openshift.io/hsts_header: {{ . | quote }}
+  {{- end }}
 spec:
-  host: {{ .Values.routes.host }}
+  host: {{ $host }}
   path: /
   to:
     kind: Service
@@ -50,6 +68,12 @@ spec:
     targetPort: http
   tls:
     termination: reencrypt
-    destinationCACertificate: {{ .Values.routes.destinationCACertificate | quote }}
     insecureEdgeTerminationPolicy: Redirect
+    {{- with .Values.routes.destinationCACertificate }}
+    destinationCACertificate: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.routes.tls.externalCertificateSecretName }}
+    externalCertificate:
+      name: {{ . }}
+    {{- end }}
 {{- end }}

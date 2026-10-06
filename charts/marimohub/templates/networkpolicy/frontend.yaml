@@ -23,10 +23,7 @@ spec:
         - port: {{ .Values.frontend.port }}
           protocol: TCP
   egress:
-    - to:
-        - namespaceSelector: {}
-      ports:
-        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- include "marimohub.dnsEgressRule" . | nindent 4 }}
     # Server-side data loads to backend-public; the browser's own calls go
     # through the router's /api path instead of this in-cluster edge.
     - to:

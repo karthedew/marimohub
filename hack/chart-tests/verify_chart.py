@@ -11,12 +11,18 @@ component rather than only checking that something is present. An exact-set
 comparison catches an accidentally over-broad grant the same way it catches
 an accidentally missing one.
 
+On the openshift profile it also renders the chart again with values that
+must fail (no Route host, no Kubernetes API or database egress) and with an
+external Route certificate, and checks both outcomes.
+
 Usage: verify_chart.py CHART_DIR VALUES_FILE [VALUES_FILE ...]
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -35,6 +41,10 @@ HELM = os.environ.get("HELM", "helm")
 # explicitly rather than relying on a real API server to supply one.
 KUBE_VERSION = "1.35.0"
 
+# 53 behind every cluster DNS Service; OpenShift's DNS Pods listen on 5353,
+# and OVN-Kubernetes matches egress after the Service DNAT.
+DNS_PORTS = {53, 5353}
+
 # The operator's own RBAC sources, which the chart's operator Roles must
 # mirror: role.yaml is generated from the kubebuilder markers in
 # internal/controller/ by `make generate`; leader_election_role.yaml is
@@ -44,12 +54,26 @@ OPERATOR_RBAC_DIR = os.path.join(
 )
 
 
-def helm_template(chart_dir: str, values_files: list[str]) -> list[dict]:
-    cmd = [HELM, "template", RELEASE, chart_dir, "--kube-version", KUBE_VERSION]
+def helm_template_cmd(chart_dir: str, values_files: list[str], extra: list[str] | None = None) -> list[str]:
+    # --include-crds: the app chart must not ship a CRD (marimohub-platform
+    # owns it), so the render that proves that has to ask for them.
+    cmd = [HELM, "template", RELEASE, chart_dir, "--kube-version", KUBE_VERSION, "--include-crds"]
     for values_file in values_files:
         cmd += ["-f", values_file]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return cmd + (extra or [])
+
+
+def helm_template(chart_dir: str, values_files: list[str], extra: list[str] | None = None) -> list[dict]:
+    result = subprocess.run(helm_template_cmd(chart_dir, values_files, extra), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"verify_chart: helm template failed for {values_files} {extra or []}:\n{result.stderr}")
     return [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+
+
+def helm_template_error(chart_dir: str, values_files: list[str], extra: list[str]) -> str | None:
+    """The render's error output, or None when it unexpectedly succeeds."""
+    result = subprocess.run(helm_template_cmd(chart_dir, values_files, extra), capture_output=True, text=True)
+    return None if result.returncode == 0 else result.stderr
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -323,11 +347,11 @@ def check_networkpolicy(index: dict, check: Check, ns: dict, network: dict) -> N
     )
 
     def egress_ports(policy: dict) -> set[int]:
-        """Every port an egress policy allows, ignoring DNS's fixed 53/UDP+TCP pair."""
+        """Every port an egress policy allows, ignoring DNS (53, and 5353 for OpenShift's DNS Pods)."""
         ports: set[int] = set()
         for rule in networkpolicy_edges(policy, "egress"):
             for port_entry in rule.get("ports", []):
-                if port_entry.get("port") != 53:
+                if port_entry.get("port") not in DNS_PORTS:
                     ports.add(port_entry["port"])
         return ports
 
@@ -357,7 +381,7 @@ def check_networkpolicy(index: dict, check: Check, ns: dict, network: dict) -> N
     for component in ("reconcile-runtimes", "purge-workspaces"):
         maintenance_policy = index[("NetworkPolicy", f"{RELEASE}-{component}", ns["app"])]
         ports = egress_ports(maintenance_policy)
-        if network["database"]["cidrs"]:
+        if network["database"]["cidrs"] or network["database"].get("peers"):
             check.true(f"{component} NetworkPolicy egress targets the database port", network["database"]["port"] in ports)
         if network["kubernetesApi"]["cidrs"]:
             check.true(
@@ -573,6 +597,238 @@ def check_tls_certificates(index: dict, check: Check, ns: dict, values: dict) ->
             )
 
 
+_QUANTITY_SUFFIXES = {
+    "m": 1e-3,
+    "": 1.0,
+    "k": 1e3,
+    "M": 1e6,
+    "G": 1e9,
+    "T": 1e12,
+    "Ki": 2**10,
+    "Mi": 2**20,
+    "Gi": 2**30,
+    "Ti": 2**40,
+}
+
+
+def parse_quantity(value) -> float:
+    """A Kubernetes resource quantity (250m, 512Mi, 20, 1Gi) as a plain number."""
+    match = re.fullmatch(r"([0-9.]+)([a-zA-Z]*)", str(value))
+    if not match or match.group(2) not in _QUANTITY_SUFFIXES:
+        raise ValueError(f"unsupported quantity {value!r}")
+    return float(match.group(1)) * _QUANTITY_SUFFIXES[match.group(2)]
+
+
+def policies_with_egress(index: dict) -> list[dict]:
+    return [doc for key, doc in index.items() if key[0] == "NetworkPolicy" and doc["spec"].get("egress")]
+
+
+def dns_rules(policy: dict) -> list[dict]:
+    return [
+        rule
+        for rule in networkpolicy_edges(policy, "egress")
+        if any(port.get("port") in DNS_PORTS for port in rule.get("ports", []))
+    ]
+
+
+def database_rules(policy: dict, port: int) -> list[dict]:
+    return [
+        rule
+        for rule in networkpolicy_edges(policy, "egress")
+        if any(entry.get("port") == port for entry in rule.get("ports", []))
+    ]
+
+
+def check_dns_egress(index: dict, check: Check, values: dict) -> None:
+    """Every component's DNS rule is exactly network.dns.to on network.dns.ports."""
+    policies = policies_with_egress(index)
+    # backend-public, backend-internal, frontend, operator, runtime, migration,
+    # reconcile-runtimes, purge-workspaces and uninstall-drain.
+    check.eq("NetworkPolicies with egress rules", len(policies), 9)
+    for policy in policies:
+        name = policy["metadata"]["name"]
+        rules = dns_rules(policy)
+        check.eq(f"NetworkPolicy {name} has exactly one DNS egress rule", len(rules), 1)
+        for rule in rules:
+            check.eq(f"NetworkPolicy {name} DNS peers", rule.get("to"), values["network"]["dns"]["to"])
+            check.eq(f"NetworkPolicy {name} DNS ports", rule.get("ports"), values["network"]["dns"]["ports"])
+
+
+def check_no_crd(index: dict, check: Check) -> None:
+    check.true(
+        "the app chart renders no CustomResourceDefinition (charts/marimohub-platform owns the CRD)",
+        not any(k[0] == "CustomResourceDefinition" for k in index),
+    )
+
+
+def check_public_url(index: dict, check: Check, ns: dict, values: dict) -> None:
+    """backend-public builds sign-in redirect URIs from PUBLIC_API_URL, so it must be the public host."""
+    backend_public = index[("Deployment", f"{RELEASE}-backend-public", ns["app"])]
+    env = {item["name"]: item.get("value") for item in backend_public["spec"]["template"]["spec"]["containers"][0]["env"]}
+    want = None
+    if values["platform"] == "openshift":
+        want = f"https://{values['routes']['host']}"
+    elif values["ingress"]["enabled"] and values["ingress"]["host"]:
+        want = f"https://{values['ingress']['host']}"
+    check.eq("backend-public PUBLIC_API_URL", env.get("PUBLIC_API_URL"), want)
+
+
+def check_quota_sizing(index: dict, check: Check, ns: dict, values: dict) -> None:
+    """The quota admits `pods` Runtimes at their default requests and limits.
+
+    A Runtime Pod's effective request is the larger of its marimo container
+    and its init containers (source-fetcher and workspace-init both use
+    fetcherResources), which is what quota admission charges.
+    """
+    hard = index[("ResourceQuota", f"{RELEASE}-runtime", ns["sessions"])]["spec"]["hard"]
+    pods = int(hard["pods"])
+    runtime = values["runtime"]
+    for kind in ("requests", "limits"):
+        for resource in ("cpu", "memory", "ephemeral-storage"):
+            per_pod = max(
+                parse_quantity(runtime["resources"][kind][resource]),
+                parse_quantity(runtime["fetcherResources"][kind][resource]),
+            )
+            check.true(
+                f"ResourceQuota {kind}.{resource} ({hard[f'{kind}.{resource}']}) covers {pods} Runtimes",
+                parse_quantity(hard[f"{kind}.{resource}"]) >= pods * per_pod * (1 - 1e-9),
+            )
+
+
+OPENSHIFT_DNS_PEER = {
+    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "openshift-dns"}},
+    "podSelector": {"matchLabels": {"dns.operator.openshift.io/daemonset-dns": "default"}},
+}
+OPENSHIFT_DNS_PORTS = {(5353, "UDP"), (5353, "TCP"), (53, "UDP"), (53, "TCP")}
+# OVN-Kubernetes matches host-network router Pods only through this namespace
+# label with an empty podSelector.
+OPENSHIFT_ROUTER_PEER = {
+    "namespaceSelector": {"matchLabels": {"policy-group.network.openshift.io/ingress": ""}},
+    "podSelector": {},
+}
+# Both openshift-monitoring and openshift-user-workload-monitoring carry it.
+OPENSHIFT_MONITORING_PEER = {
+    "namespaceSelector": {"matchLabels": {"network.openshift.io/policy-group": "monitoring"}},
+    "podSelector": {"matchLabels": {"app.kubernetes.io/name": "prometheus"}},
+}
+
+
+def check_openshift(index: dict, check: Check, ns: dict, values: dict) -> None:
+    for policy in policies_with_egress(index):
+        name = policy["metadata"]["name"]
+        for rule in dns_rules(policy):
+            check.eq(f"NetworkPolicy {name} DNS egress targets only the openshift-dns Pods", rule.get("to"), [OPENSHIFT_DNS_PEER])
+            check.eq(
+                f"NetworkPolicy {name} DNS ports",
+                {(port["port"], port["protocol"]) for port in rule["ports"]},
+                OPENSHIFT_DNS_PORTS,
+            )
+
+    for component in ("frontend", "backend-public"):
+        policy = index[("NetworkPolicy", f"{RELEASE}-{component}", ns["app"])]
+        router = networkpolicy_edges(policy, "ingress")[0]["from"][0]
+        check.eq(f"{component} ingress router peer", router, OPENSHIFT_ROUTER_PEER)
+
+    operator_policy = index[("NetworkPolicy", f"{RELEASE}-operator", ns["controller"])]
+    check.eq(
+        "operator ingress monitoring peer",
+        networkpolicy_edges(operator_policy, "ingress")[0]["from"][0],
+        OPENSHIFT_MONITORING_PEER,
+    )
+
+    api = index[("Route", f"{RELEASE}-api", ns["app"])]
+    frontend = index[("Route", f"{RELEASE}-frontend", ns["app"])]
+    for route in (api, frontend):
+        name = route["metadata"]["name"]
+        tls = route["spec"]["tls"]
+        check.true(f"Route {name} host is set", bool(route["spec"].get("host")))
+        check.eq(f"Route {name} host", route["spec"].get("host"), values["routes"]["host"])
+        check.eq(f"Route {name} insecureEdgeTerminationPolicy", tls.get("insecureEdgeTerminationPolicy"), "Redirect")
+        if not values["routes"]["destinationCACertificate"]:
+            check.true(
+                f"Route {name} has no destinationCACertificate (the router verifies the service CA itself)",
+                "destinationCACertificate" not in tls,
+            )
+        hsts = (route["metadata"].get("annotations") or {}).get("haproxy.router.openshift.io/hsts_header", "")
+        check.true(f"Route {name} hsts_header starts with max-age=N: {hsts!r}", re.match(r"^max-age=\d+", hsts) is not None)
+    annotations = api["metadata"].get("annotations") or {}
+    check.eq(
+        "Route api timeout",
+        annotations.get("haproxy.router.openshift.io/timeout"),
+        f"{values['runtime']['startTimeoutSeconds'] + 30}s",
+    )
+    check.true("Route api timeout-tunnel is set", bool(annotations.get("haproxy.router.openshift.io/timeout-tunnel")))
+
+    tls_config = index[("ServiceMonitor", f"{RELEASE}-operator", ns["controller"])]["spec"]["endpoints"][0].get("tlsConfig", {})
+    check.true("ServiceMonitor verifies TLS (no insecureSkipVerify)", not tls_config.get("insecureSkipVerify"))
+    check.eq("ServiceMonitor CA", tls_config.get("ca"), {"configMap": {"name": "openshift-service-ca.crt", "key": "service-ca.crt"}})
+    check.eq("ServiceMonitor serverName", tls_config.get("serverName"), f"{RELEASE}-operator.{ns['controller']}.svc")
+
+    quota = index[("ResourceQuota", f"{RELEASE}-runtime", ns["sessions"])]["spec"]["hard"]
+    check.true(
+        f"ResourceQuota admits at least 80 Runtime Pods for 50 concurrent users (pods={quota['pods']})",
+        int(quota["pods"]) >= 80,
+    )
+    migration = index[("Job", f"{RELEASE}-migration", ns["app"])]
+    check.true(
+        "migration activeDeadlineSeconds leaves room for a cold image pull (>= 900)",
+        migration["spec"]["activeDeadlineSeconds"] >= 900,
+    )
+
+
+def check_openshift_variants(chart_dir: str, values_files: list[str], check: Check, ns: dict) -> None:
+    """Renders that must fail, and renders with an in-cluster database or an external certificate."""
+    negatives = [
+        (["--set", "routes.host="], "routes.host is required"),
+        (["--set-json", "network.kubernetesApi.cidrs=[]"], "network.kubernetesApi.cidrs is required"),
+        (
+            ["--set-json", "network.database.cidrs=[]", "--set-json", "network.database.peers=[]"],
+            "network.database.cidrs or network.database.peers is required",
+        ),
+    ]
+    for extra, message in negatives:
+        error = helm_template_error(chart_dir, values_files, extra)
+        check.true(f"render with {' '.join(extra)} fails with {message!r}", error is not None and message in error)
+
+    peer = {
+        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "marimohub-database"}},
+        "podSelector": {"matchLabels": {"app.kubernetes.io/name": "marimohub-postgresql"}},
+    }
+    index = index_objects(
+        helm_template(
+            chart_dir,
+            values_files,
+            ["--set-json", "network.database.cidrs=[]", "--set-json", f"network.database.peers={json.dumps([peer])}"],
+        )
+    )
+    for component in ("backend-public", "backend-internal", "migration", "reconcile-runtimes", "purge-workspaces"):
+        rules = database_rules(index[("NetworkPolicy", f"{RELEASE}-{component}", ns["app"])], 5432)
+        check.eq(f"{component} database egress with peers only", [rule.get("to") for rule in rules], [[peer]])
+
+    secret = "marimohub-public-tls"
+    index = index_objects(helm_template(chart_dir, values_files, ["--set", f"routes.tls.externalCertificateSecretName={secret}"]))
+    role = index[("Role", f"{RELEASE}-route-certificate", ns["app"])]
+    check.eq(
+        "route-certificate Role reads only the certificate Secret",
+        role["rules"],
+        [{"apiGroups": [""], "resources": ["secrets"], "resourceNames": [secret], "verbs": ["get", "list", "watch"]}],
+    )
+    binding = index[("RoleBinding", f"{RELEASE}-route-certificate", ns["app"])]
+    check.eq("route-certificate RoleBinding roleRef", binding["roleRef"]["name"], f"{RELEASE}-route-certificate")
+    check.eq(
+        "route-certificate RoleBinding subject",
+        binding["subjects"],
+        [{"kind": "ServiceAccount", "name": "router", "namespace": "openshift-ingress"}],
+    )
+    for name in ("api", "frontend"):
+        tls = index[("Route", f"{RELEASE}-{name}", ns["app"])]["spec"]["tls"]
+        check.eq(f"Route {RELEASE}-{name} externalCertificate", tls.get("externalCertificate"), {"name": secret})
+    check.true(
+        "no ClusterRole or ClusterRoleBinding with an external certificate",
+        not any(k[0] in ("ClusterRole", "ClusterRoleBinding") for k in index),
+    )
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
@@ -589,6 +845,13 @@ def main() -> int:
     }
 
     check = Check()
+    check_no_crd(index, check)
+    check_dns_egress(index, check, values)
+    check_public_url(index, check, ns, values)
+    check_quota_sizing(index, check, ns, values)
+    if values["platform"] == "openshift":
+        check_openshift(index, check, ns, values)
+        check_openshift_variants(chart_dir, values_files, check, ns)
     check_rbac(index, check, ns)
     check_networkpolicy(index, check, ns, values["network"])
     check_images(docs, check)

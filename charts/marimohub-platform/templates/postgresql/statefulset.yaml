@@ -1,0 +1,157 @@
+{{- /*
+Evaluation PostgreSQL: one replica, TLS only, runs under OpenShift
+restricted-v2 and Pod Security "restricted". PGDATA is a subdirectory of the
+volume, so initdb creates and owns it under any UID.
+*/}}
+{{- if .Values.postgresql.enabled }}
+{{- $v := .Values }}
+{{- $name := $v.postgresql.name }}
+{{- $ns := $v.namespaces.database }}
+{{- /*
+PostgreSQL reads its certificate only at start, so the Pod template carries
+the leaf's restart key: secrets.yaml makes the same keep-or-issue decision
+from the same lookups, and the key changes only when the leaf is issued
+again (new DNS names, a new CA, or a deleted Secret).
+*/}}
+{{- $caSecret := lookup "v1" "Secret" .Release.Namespace $v.tls.caSecretName }}
+{{- $caCert := "" }}
+{{- if $caSecret }}{{ $caCert = index $caSecret.data "tls.crt" | b64dec }}{{ end }}
+{{- $tlsRestartKey := include "platform.leafRestartKey" (dict "namespace" $ns "name" (printf "%s-tls" $name) "sans" (include "platform.databaseSANs" . | fromJsonArray) "caCert" $caCert "revision" .Release.Revision) }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/part-of: marimohub
+      annotations:
+        marimohub.io/config-sha256: {{ include (print $.Template.BasePath "/postgresql/configmap.yaml") . | sha256sum }}
+        marimohub.io/tls-restart-key: {{ $tlsRestartKey }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+        {{- with $v.postgresql.podSecurityContext }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: postgresql
+          image: {{ $v.postgresql.image }}
+          imagePullPolicy: {{ $v.postgresql.imagePullPolicy }}
+          args:
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/etc/postgresql/tls/tls.crt
+            - -c
+            - ssl_key_file=/etc/postgresql/tls/tls.key
+            - -c
+            - hba_file=/etc/postgresql/config/pg_hba.conf
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_DB
+              value: marimohub
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}
+                  key: postgres-password
+            - name: MARIMOHUB_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $name }}
+                  key: password
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "--host=/var/run/postgresql", "--username=postgres", "--dbname=marimohub"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "--host=/var/run/postgresql", "--username=postgres", "--dbname=marimohub"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml $v.postgresql.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            - name: tls
+              mountPath: /etc/postgresql/tls
+              readOnly: true
+            - name: config
+              mountPath: /etc/postgresql/config
+              readOnly: true
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: run
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: tls
+          secret:
+            secretName: {{ $name }}-tls
+            # Root-owned and group-readable through fsGroup: PostgreSQL
+            # accepts a root-owned key file with mode 0640 or tighter.
+            defaultMode: 0440
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+            items:
+              - key: pg_hba.conf
+                path: pg_hba.conf
+        - name: initdb
+          configMap:
+            name: {{ $name }}-config
+            defaultMode: 0555
+            items:
+              - key: 10-marimohub.sh
+                path: 10-marimohub.sh
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $v.postgresql.storage.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $v.postgresql.storage.size }}
+{{- end }}

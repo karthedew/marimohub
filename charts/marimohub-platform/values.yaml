@@ -1,0 +1,180 @@
+# Default values for marimohub-platform.
+#
+# A cluster administrator installs this chart once per environment, before
+# the marimohub app chart. It creates what the app chart only references:
+# its namespaces, the MarimoSession CRD and admission policy, the Secrets it
+# names, and the storage claims notebooks mount. Install it into a namespace
+# of its own (marimohub-platform, with --create-namespace): Helm keeps every
+# rendered manifest there, including the generated Secrets, so only cluster
+# administrators may read that namespace.
+
+# "openshift" or "portable" (kind and other Kubernetes).
+platform: portable
+
+namespaces:
+  # These three must equal the app chart's namespaces.* values.
+  app: marimohub
+  controller: marimohub-controller
+  sessions: marimohub-sessions
+  # Created only when postgresql.enabled.
+  database: marimohub-database
+  # Pod Security level enforced, audited and warned in every namespace this
+  # chart creates. Every MarimoHub workload meets "restricted".
+  podSecurity: restricted
+  # Extra labels and annotations for every namespace this chart creates.
+  labels: {}
+  annotations: {}
+  # OpenShift only: node selector for every Pod in namespaces.sessions,
+  # written as the openshift.io/node-selector annotation, for example
+  # "node-role.kubernetes.io/notebooks=".
+  sessionsNodeSelector: ""
+
+# The app chart's release name. Generated certificates name its Services, and
+# the database NetworkPolicy selects its Pods by it.
+app:
+  releaseName: marimohub
+
+# The MarimoSession CRD. Set false only when it already exists outside Helm
+# and you do not adopt it (see README.md).
+crd:
+  enabled: true
+
+# The ValidatingAdmissionPolicy that keeps a MarimoSession's identity labels
+# equal to its spec.
+admissionPolicy:
+  enabled: true
+
+# Secret in namespaces.app with DATABASE_URL and SECRET_KEY, loaded by both
+# backends, the migration Job and the maintenance CronJobs.
+backendEnv:
+  name: marimohub-backend-env
+  # Name of a Secret you created yourself in namespaces.app. Nothing is
+  # generated then.
+  existingSecret: ""
+
+# External PostgreSQL (16 with pgvector and TLS), used when
+# postgresql.enabled is false.
+database:
+  host: ""
+  port: 5432
+  name: marimohub
+  user: marimohub
+  # Existing Secret holding the user's password, for example a CloudNativePG
+  # <cluster>-app Secret. Read with lookup to build DATABASE_URL.
+  passwordSecret:
+    namespace: ""
+    name: ""
+    key: password
+  # Where the database is, for the app chart's NetworkPolicies: CIDRs for a
+  # database outside the cluster, or NetworkPolicyPeer objects for one inside.
+  cidrs: []
+  peers: []
+  ca:
+    # Secret in namespaces.app, key ca.crt (app value database.tls.caSecretName).
+    name: marimohub-database-ca
+    # Name of a Secret you created yourself in namespaces.app, key ca.crt.
+    existingSecret: ""
+    # PEM of the CA that signed the database certificate (use --set-file).
+    bundle: ""
+    # Or copy it from an existing Secret, for example a CloudNativePG <cluster>-ca.
+    fromSecret:
+      namespace: ""
+      name: ""
+      key: ca.crt
+
+# Single-instance PostgreSQL with pgvector, for evaluation only. It runs under
+# restricted-v2 with TLS and a NetworkPolicy. Production uses an
+# operator-managed or external database instead.
+postgresql:
+  enabled: false
+  name: marimohub-postgresql
+  # Same pin as LOCAL_POSTGRES_IMAGE in hack/tools/versions.env.
+  image: pgvector/pgvector:pg16@sha256:131dcf7ff6a900545df8e7e092c270aa8c6db2f2c818e408cb45ec21316b74e6
+  imagePullPolicy: IfNotPresent
+  storage:
+    size: 10Gi
+    # Empty uses the cluster's default StorageClass.
+    storageClassName: ""
+  resources:
+    requests: { cpu: 250m, memory: 512Mi, ephemeral-storage: 64Mi }
+    limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+  # Portable profile only. OpenShift assigns the UID, GID and fsGroup itself
+  # and refuses fixed ones under restricted-v2.
+  podSecurityContext: {}
+
+# Certificates this chart signs: the evaluation database's and, on the
+# portable profile, the app's Service certificates. OpenShift's service CA
+# signs the app's certificates there.
+tls:
+  # CA Secret (with its key), kept in the release namespace.
+  caSecretName: marimohub-platform-ca
+  caValidityDays: 3650
+  certValidityDays: 825
+  # Portable profile: host names the Ingress serves, added to the frontend
+  # and backend-public certificates. Use the app chart's ingress.host.
+  publicHosts: []
+
+# CA Runtime Pods use to verify the internal API (app value
+# runtime.internalApiCA), in namespaces.sessions.
+internalApiCA:
+  name: marimohub-internal-api-ca
+  key: ca.crt
+  # OpenShift: PEM of the service CA. Empty reads ConfigMap
+  # openshift-config-managed/service-ca on every install and upgrade.
+  serviceCABundle: ""
+
+storage:
+  # "nfs", or "hostPath" for single-node test clusters (refused on openshift).
+  mode: nfs
+  nfs:
+    server: ""
+    # For example [nfsvers=4.2, hard]. Read-only shares also get "ro".
+    mountOptions: []
+  # Workspace Files: one directory per Workspace under workspaces/ at the
+  # export's root.
+  workspaces:
+    enabled: true
+    claimName: marimohub-workspaces
+    # Export path whose root holds the workspaces/ directory. Must not be
+    # inside, or contain, any share below.
+    path: ""
+    # Defaults to storage.nfs.server.
+    server: ""
+    # hostPath mode: directory on the node. Defaults to path.
+    hostPath: ""
+    capacity: 1Ti
+    mountPath: /work/workspace
+    # Group that owns workspaces/ (setgid, mode 2775).
+    supplementalGroups: []
+  # Shared data exports mounted into notebooks. Each entry:
+  #   name:               DNS label, at most 56 characters
+  #   path:               export path; notebooks see it at this same path
+  #   server:             defaults to storage.nfs.server
+  #   hostPath:           hostPath mode: directory on the node; defaults to path
+  #   claimName:          defaults to marimohub-share-<name>
+  #   capacity:           defaults to 100Gi
+  #   mountPath:          defaults to path
+  #   subPath:            optional existing directory inside the export
+  #   readOnly:           default true
+  #   modes:              default edit and run; a read-only share may add deploy
+  #   supplementalGroups: groups that own the files
+  shares: []
+
+# OpenShift internal registry: the namespace whose image streams hold the
+# MarimoHub images, for example marimohub. The three app namespaces get
+# system:image-puller there. Empty creates nothing.
+imageRegistry:
+  internalPullerNamespace: ""
+
+network:
+  # DNS ports for this chart's own test Pod. OpenShift DNS Pods listen on
+  # 5353 behind the dns-default Service's port 53.
+  dnsPorts:
+    - { port: 53, protocol: UDP }
+    - { port: 53, protocol: TCP }
+    - { port: 5353, protocol: UDP }
+    - { port: 5353, protocol: TCP }
+
+# Image for the storage test Pod (helm test).
+tests:
+  image: registry.access.redhat.com/ubi9/ubi-minimal@sha256:17fd831ced9434de0a984d60b3fbe61008308261ba98bbc348d6fbdef05fa7c0

@@ -1,3 +1,4 @@
+{{- include "marimohub.openshiftGuard" . }}
 {{- if and .Values.backendInternal.tls.enabled (not .Values.runtime.internalApiCA.secretName) }}
 {{- fail "runtime.internalApiCA.secretName is required when backendInternal.tls.enabled (Runtime Pods must trust the internal API's certificate)" }}
 {{- end }}

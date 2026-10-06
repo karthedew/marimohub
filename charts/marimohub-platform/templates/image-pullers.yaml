@@ -1,0 +1,23 @@
+{{- /*
+OpenShift internal registry: Pods in the three app namespaces may pull the
+MarimoHub image streams kept in imageRegistry.internalPullerNamespace.
+*/}}
+{{- with .Values.imageRegistry.internalPullerNamespace }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: marimohub-image-pullers
+  namespace: {{ . }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:image-puller
+subjects:
+  {{- range list $.Values.namespaces.app $.Values.namespaces.controller $.Values.namespaces.sessions }}
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: system:serviceaccounts:{{ . }}
+  {{- end }}
+{{- end }}

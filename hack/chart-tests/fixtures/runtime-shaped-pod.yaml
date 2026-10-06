@@ -1,0 +1,87 @@
+# A Pod shaped like the operator's edit Runtime
+# (marimohub-operator/internal/session/pod.go): a workspace-init container
+# that creates the Workspace directory, then the marimo container with the
+# Workspace mounted read-write and the shared export read-only at its own
+# path. It runs with an arbitrary UID and no fixed group, the way OpenShift's
+# restricted-v2 SCC runs Pods. platform-install-test.sh fills in the @...@
+# placeholders.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: runtime-shaped
+  namespace: marimohub-sessions
+  labels:
+    app.kubernetes.io/component: platform-test
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: true
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000770000
+    fsGroup: 1000770000
+    supplementalGroups: [@WORKSPACE_GID@, @SHARE_GID@]
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    - name: workspace-init
+      image: @FETCHER_IMAGE@
+      imagePullPolicy: @PULL_POLICY@
+      command: ["mkdir"]
+      args: ["-p", "-m", "2770", "/mnt/workspaces/@WORKSPACE_ID@"]
+      securityContext: &restricted
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        privileged: false
+        capabilities:
+          drop: ["ALL"]
+      resources: &small
+        requests: { cpu: 25m, memory: 64Mi, ephemeral-storage: 32Mi }
+        limits: { cpu: 500m, memory: 512Mi, ephemeral-storage: 128Mi }
+      volumeMounts:
+        - name: workspace
+          mountPath: /mnt/workspaces
+          subPath: workspaces
+  containers:
+    - name: marimo
+      image: @RUNTIME_IMAGE@
+      imagePullPolicy: @PULL_POLICY@
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -e
+          id
+          echo written-by-runtime > /work/workspace/probe.txt
+          echo "workspace write: ok"
+          echo "share read: $(head -1 /data1/nfs/sales.csv)"
+          if touch /data1/nfs/.write-test 2>/tmp/share-write.err; then echo "share write: allowed"; exit 1; fi
+          echo "share write: $(cat /tmp/share-write.err)"
+          python3 -c "import marimo; print('marimo', marimo.__version__)"
+      env:
+        - name: HOME
+          value: /home/marimo
+        - name: XDG_CACHE_HOME
+          value: /cache
+      securityContext: *restricted
+      resources: *small
+      volumeMounts:
+        - { name: work, mountPath: /work }
+        - { name: tmp, mountPath: /tmp }
+        - { name: home, mountPath: /home/marimo }
+        - { name: cache, mountPath: /cache }
+        - { name: workspace, mountPath: /work/workspace, subPath: workspaces/@WORKSPACE_ID@ }
+        - { name: shared-nfs, mountPath: /data1/nfs, readOnly: true }
+  volumes:
+    - { name: work, emptyDir: { sizeLimit: 64Mi } }
+    - { name: tmp, emptyDir: { sizeLimit: 16Mi } }
+    - { name: home, emptyDir: { sizeLimit: 16Mi } }
+    - { name: cache, emptyDir: { sizeLimit: 64Mi } }
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: marimohub-workspaces
+    - name: shared-nfs
+      persistentVolumeClaim:
+        claimName: marimohub-nfs
+        readOnly: true

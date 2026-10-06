@@ -1,0 +1,31 @@
+{{- if .Values.postgresql.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.postgresql.name }}-config
+  namespace: {{ .Values.namespaces.database }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+data:
+  # The socket is reachable only inside the Pod; every network connection
+  # must use TLS and a password.
+  pg_hba.conf: |
+    local   all  all                trust
+    hostssl all  all  0.0.0.0/0     scram-sha-256
+    hostssl all  all  ::/0          scram-sha-256
+  # Runs once, on an empty data directory, as the superuser. The app role is
+  # not a superuser, so pgvector is created here and the migration's
+  # CREATE EXTENSION IF NOT EXISTS finds it. \getenv keeps the password off
+  # every command line.
+  10-marimohub.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'EOSQL'
+    \getenv app_password MARIMOHUB_DB_PASSWORD
+    CREATE ROLE marimohub LOGIN PASSWORD :'app_password';
+    ALTER DATABASE marimohub OWNER TO marimohub;
+    \connect marimohub
+    CREATE EXTENSION IF NOT EXISTS vector;
+    ALTER SCHEMA public OWNER TO marimohub;
+    EOSQL
+{{- end }}

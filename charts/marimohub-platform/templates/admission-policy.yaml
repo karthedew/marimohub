@@ -1,0 +1,15 @@
+{{- /*
+The label-identity ValidatingAdmissionPolicy and its binding, a byte-for-byte
+copy of marimohub-operator/config/policy/marimosession_label_identity.yaml.
+Removed on uninstall, unlike the CRD: it holds no data.
+*/}}
+{{- if .Values.admissionPolicy.enabled }}
+{{- range $doc := splitList "\n---\n" (.Files.Get "files/marimosession_label_identity.yaml") }}
+{{- $obj := $doc | fromYaml }}
+{{- if $obj.kind }}
+{{- $_ := set $obj.metadata "labels" (include "platform.labels" $ | fromYaml) }}
+---
+{{ toYaml $obj }}
+{{- end }}
+{{- end }}
+{{- end }}

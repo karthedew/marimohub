@@ -56,8 +56,38 @@
     "routes": {
       "type": "object",
       "properties": {
-        "host": { "type": "string" },
-        "destinationCACertificate": { "type": "string" }
+        "host": {
+          "description": "Public host name both OpenShift Routes share. Required on the openshift profile.",
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "destinationCACertificate": {
+          "description": "PEM CA the router uses to verify the origin certificates. Leave empty for service-CA certificates.",
+          "type": "string"
+        },
+        "hsts": {
+          "description": "Strict-Transport-Security value for both Routes (haproxy.router.openshift.io/hsts_header), e.g. max-age=31536000. Empty sends none.",
+          "type": "string",
+          "pattern": "^$|^max-age=[0-9]+(;\\s*(includeSubDomains|preload))*$"
+        },
+        "tunnelTimeout": {
+          "description": "Idle timeout for WebSockets on the /api Route (haproxy.router.openshift.io/timeout-tunnel), e.g. 1h. Empty uses the IngressController's tunnelTimeout.",
+          "type": "string",
+          "pattern": "^$|^[0-9]+(us|ms|s|m|h|d)$"
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "externalCertificateSecretName": {
+              "description": "Existing kubernetes.io/tls Secret in namespaces.app with the public certificate (spec.tls.externalCertificate, OpenShift 4.19+). Empty uses the router's default certificate.",
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            }
+          }
+        }
       }
     },
     "frontend": {
@@ -344,8 +374,16 @@
       "properties": {
         "dns": {
           "type": "object",
-          "required": ["ports"],
-          "properties": { "ports": { "$ref": "#/definitions/portProtocolList" } }
+          "required": ["to", "ports"],
+          "properties": {
+            "to": {
+              "description": "NetworkPolicyPeer objects every component may send DNS queries to.",
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/definitions/networkPolicyPeer" }
+            },
+            "ports": { "$ref": "#/definitions/portProtocolList" }
+          }
         },
         "kubernetesApi": {
           "type": "object",
@@ -360,6 +398,11 @@
           "required": ["cidrs", "port"],
           "properties": {
             "cidrs": { "type": "array", "items": { "type": "string" } },
+            "peers": {
+              "description": "NetworkPolicyPeer objects for a PostgreSQL running in the cluster, rendered next to cidrs.",
+              "type": "array",
+              "items": { "$ref": "#/definitions/networkPolicyPeer" }
+            },
             "port": { "$ref": "#/definitions/port" }
           }
         },
@@ -439,6 +482,33 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "secretName": { "type": "string" }
+      }
+    },
+    "labelSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "matchLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "matchExpressions": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "networkPolicyPeer": {
+      "description": "A NetworkPolicy peer: namespaceSelector and/or podSelector, or ipBlock.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+        "podSelector": { "$ref": "#/definitions/labelSelector" },
+        "ipBlock": {
+          "type": "object",
+          "required": ["cidr"],
+          "additionalProperties": false,
+          "properties": {
+            "cidr": { "type": "string" },
+            "except": { "type": "array", "items": { "type": "string" } }
+          }
+        }
       }
     },
     "portProtocolList": {

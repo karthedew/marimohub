@@ -1,0 +1,328 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "marimohub-platform",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "platform",
+    "namespaces",
+    "app",
+    "crd",
+    "admissionPolicy",
+    "backendEnv",
+    "database",
+    "postgresql",
+    "tls",
+    "internalApiCA",
+    "storage",
+    "imageRegistry",
+    "network",
+    "tests"
+  ],
+  "properties": {
+    "platform": {
+      "description": "Rendering profile: openshift or portable (kind and other Kubernetes).",
+      "type": "string",
+      "enum": ["openshift", "portable"]
+    },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app", "controller", "sessions", "database", "podSecurity"],
+      "properties": {
+        "app": { "description": "Namespace for the frontend, both backends and the migration Job. Must equal the app chart's namespaces.app.", "$ref": "#/definitions/dnsLabel" },
+        "controller": { "description": "Namespace for the operator. Must equal the app chart's namespaces.controller.", "$ref": "#/definitions/dnsLabel" },
+        "sessions": { "description": "Namespace for notebook Runtimes. Must equal the app chart's namespaces.sessions.", "$ref": "#/definitions/dnsLabel" },
+        "database": { "description": "Namespace for the evaluation PostgreSQL, created only when postgresql.enabled.", "$ref": "#/definitions/dnsLabel" },
+        "podSecurity": {
+          "description": "Pod Security level enforced, audited and warned in every namespace this chart creates.",
+          "type": "string",
+          "enum": ["restricted", "baseline"]
+        },
+        "labels": {
+          "description": "Extra labels for every namespace this chart creates.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "annotations": {
+          "description": "Extra annotations for every namespace this chart creates.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "sessionsNodeSelector": {
+          "description": "OpenShift only: node selector for every Pod in namespaces.sessions (openshift.io/node-selector), e.g. node-role.kubernetes.io/notebooks=.",
+          "type": "string"
+        }
+      }
+    },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releaseName"],
+      "properties": {
+        "releaseName": {
+          "description": "The app chart's release name. Generated certificates name its Services, and the database NetworkPolicy selects its Pods by it.",
+          "$ref": "#/definitions/dnsLabel"
+        }
+      }
+    },
+    "crd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "description": "Install and upgrade the MarimoSession CRD.", "type": "boolean" }
+      }
+    },
+    "admissionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "description": "Install the MarimoSession label-identity ValidatingAdmissionPolicy and its binding.", "type": "boolean" }
+      }
+    },
+    "backendEnv": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "existingSecret"],
+      "properties": {
+        "name": { "description": "Generated Secret in namespaces.app with DATABASE_URL and SECRET_KEY.", "$ref": "#/definitions/dnsSubdomain" },
+        "existingSecret": { "description": "Your own Secret in namespaces.app with DATABASE_URL and SECRET_KEY. Nothing is generated when set.", "$ref": "#/definitions/optionalDnsSubdomain" }
+      }
+    },
+    "database": {
+      "description": "External PostgreSQL 16 with pgvector and TLS, used when postgresql.enabled is false.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port", "name", "user", "passwordSecret", "cidrs", "peers", "ca"],
+      "properties": {
+        "host": { "description": "Database host name; must match its certificate.", "type": "string" },
+        "port": { "description": "Database port.", "type": "integer", "minimum": 1, "maximum": 65535 },
+        "name": { "description": "Database name.", "type": "string", "minLength": 1 },
+        "user": { "description": "Database user.", "type": "string", "minLength": 1 },
+        "passwordSecret": {
+          "description": "Existing Secret with the user's password, read with lookup to build DATABASE_URL.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["namespace", "name", "key"],
+          "properties": {
+            "namespace": { "description": "Namespace of the Secret. Empty means the release namespace.", "$ref": "#/definitions/optionalDnsLabel" },
+            "name": { "description": "Name of the Secret.", "$ref": "#/definitions/optionalDnsSubdomain" },
+            "key": { "description": "Key that holds the password.", "$ref": "#/definitions/secretKey" }
+          }
+        },
+        "cidrs": {
+          "description": "CIDRs of the database endpoints, passed to the app chart's network.database.cidrs.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "peers": {
+          "description": "NetworkPolicyPeer objects for a database inside the cluster, passed to the app chart's network.database.peers.",
+          "type": "array",
+          "items": { "type": "object", "minProperties": 1 }
+        },
+        "ca": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "existingSecret", "bundle", "fromSecret"],
+          "properties": {
+            "name": { "description": "Generated Secret in namespaces.app, key ca.crt, with the CA that signed the database certificate.", "$ref": "#/definitions/dnsSubdomain" },
+            "existingSecret": { "description": "Your own Secret in namespaces.app with key ca.crt. Nothing is generated when set.", "$ref": "#/definitions/optionalDnsSubdomain" },
+            "bundle": { "description": "PEM of the database's CA (use --set-file).", "type": "string" },
+            "fromSecret": {
+              "description": "Existing Secret to copy the CA from, for example a CloudNativePG <cluster>-ca.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["namespace", "name", "key"],
+              "properties": {
+                "namespace": { "description": "Namespace of the Secret. Empty means the release namespace.", "$ref": "#/definitions/optionalDnsLabel" },
+                "name": { "description": "Name of the Secret.", "$ref": "#/definitions/optionalDnsSubdomain" },
+                "key": { "description": "Key that holds the CA.", "$ref": "#/definitions/secretKey" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "postgresql": {
+      "description": "Single-instance PostgreSQL with pgvector and TLS, for evaluation only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "name", "image", "imagePullPolicy", "storage", "resources", "podSecurityContext"],
+      "properties": {
+        "enabled": { "description": "Run the evaluation PostgreSQL in namespaces.database.", "type": "boolean" },
+        "name": { "description": "Name of its StatefulSet, Service and Secrets.", "$ref": "#/definitions/dnsLabel" },
+        "image": { "description": "PostgreSQL image with pgvector, digest-pinned.", "type": "string", "pattern": "@sha256:[0-9a-f]{64}$" },
+        "imagePullPolicy": { "description": "Image pull policy.", "type": "string", "enum": ["Always", "IfNotPresent", "Never"] },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["size", "storageClassName"],
+          "properties": {
+            "size": { "description": "Size of the data volume.", "type": "string", "minLength": 1 },
+            "storageClassName": { "description": "StorageClass of the data volume. Empty uses the cluster default.", "type": "string" }
+          }
+        },
+        "resources": { "description": "Container requests and limits.", "$ref": "#/definitions/resources" },
+        "podSecurityContext": {
+          "description": "Portable profile only: extra Pod securityContext fields, e.g. runAsUser 999. Refused on openshift.",
+          "type": "object"
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caSecretName", "caValidityDays", "certValidityDays", "publicHosts"],
+      "properties": {
+        "caSecretName": { "description": "Secret in the release namespace with the platform CA and its key.", "$ref": "#/definitions/dnsSubdomain" },
+        "caValidityDays": { "description": "Validity of a newly generated platform CA, in days.", "type": "integer", "minimum": 1 },
+        "certValidityDays": { "description": "Validity of newly issued leaf certificates, in days.", "type": "integer", "minimum": 1 },
+        "publicHosts": {
+          "description": "Portable profile: host names the Ingress serves, added to the frontend and backend-public certificates.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/dnsSubdomain" }
+        }
+      }
+    },
+    "internalApiCA": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "key", "serviceCABundle"],
+      "properties": {
+        "name": { "description": "Secret in namespaces.sessions with the CA Runtime Pods use to verify the internal API.", "$ref": "#/definitions/dnsSubdomain" },
+        "key": { "description": "Key of that Secret.", "$ref": "#/definitions/secretKey" },
+        "serviceCABundle": { "description": "OpenShift: PEM of the service CA. Empty reads ConfigMap openshift-config-managed/service-ca on every install and upgrade.", "type": "string" }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "nfs", "workspaces", "shares"],
+      "properties": {
+        "mode": {
+          "description": "nfs, or hostPath for single-node test clusters (refused on openshift).",
+          "type": "string",
+          "enum": ["nfs", "hostPath"]
+        },
+        "nfs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["server", "mountOptions"],
+          "properties": {
+            "server": { "description": "Default NFS server for Workspace storage and every share.", "type": "string" },
+            "mountOptions": {
+              "description": "Mount options for every NFS PersistentVolume, e.g. nfsvers=4.2. Read-only shares also get ro.",
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "workspaces": {
+          "description": "Workspace Files: one directory per Workspace under workspaces/ at the export's root.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "claimName", "path", "server", "hostPath", "capacity", "mountPath", "supplementalGroups"],
+          "properties": {
+            "enabled": { "description": "Create the Workspace PersistentVolume and claim.", "type": "boolean" },
+            "claimName": { "description": "Claim name in namespaces.sessions.", "$ref": "#/definitions/dnsSubdomain" },
+            "path": { "description": "Export path whose root holds workspaces/. Must not be inside, or contain, any share.", "$ref": "#/definitions/optionalAbsolutePath" },
+            "server": { "description": "NFS server. Empty means storage.nfs.server.", "type": "string" },
+            "hostPath": { "description": "hostPath mode: directory on the node. Empty means path.", "$ref": "#/definitions/optionalAbsolutePath" },
+            "capacity": { "description": "Capacity of the PersistentVolume and claim.", "type": "string", "minLength": 1 },
+            "mountPath": { "description": "Where notebooks see their Workspace's directory.", "type": "string", "pattern": "^/" },
+            "supplementalGroups": { "description": "Group that owns workspaces/ (setgid, mode 2775).", "$ref": "#/definitions/groups" }
+          }
+        },
+        "shares": {
+          "description": "Shared data exports mounted into notebooks at the same path NFS clients use.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "path"],
+            "properties": {
+              "name": { "description": "Share name, a DNS label.", "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 56 },
+              "path": { "description": "Export path; also the default mountPath.", "type": "string", "pattern": "^/" },
+              "server": { "description": "NFS server. Empty means storage.nfs.server.", "type": "string" },
+              "hostPath": { "description": "hostPath mode: directory on the node. Empty means path.", "$ref": "#/definitions/optionalAbsolutePath" },
+              "claimName": { "description": "Claim name. Empty means marimohub-share-<name>.", "$ref": "#/definitions/optionalDnsSubdomain" },
+              "capacity": { "description": "Capacity of the PersistentVolume and claim. Empty means 100Gi.", "type": "string" },
+              "mountPath": { "description": "Where notebooks see the share. Empty means path.", "$ref": "#/definitions/optionalAbsolutePath" },
+              "subPath": { "description": "Existing directory inside the export to mount instead of its root.", "type": "string", "pattern": "^$|^[^/]" },
+              "readOnly": { "description": "Mount read-only (default true); adds the ro mount option in nfs mode.", "type": "boolean" },
+              "modes": {
+                "description": "Runtime modes that mount the share (default edit and run). deploy only for a read-only share.",
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "type": "string", "enum": ["edit", "run", "deploy"] }
+              },
+              "supplementalGroups": { "description": "Groups that own the share's files.", "$ref": "#/definitions/groups" }
+            }
+          }
+        }
+      }
+    },
+    "imageRegistry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["internalPullerNamespace"],
+      "properties": {
+        "internalPullerNamespace": {
+          "description": "OpenShift internal registry: namespace whose image streams hold the MarimoHub images. The three app namespaces get system:image-puller there. Empty creates nothing.",
+          "$ref": "#/definitions/optionalDnsLabel"
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dnsPorts"],
+      "properties": {
+        "dnsPorts": {
+          "description": "DNS ports the database test Pod may reach (53 and OpenShift's 5353).",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["port", "protocol"],
+            "properties": {
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "protocol": { "type": "string", "enum": ["TCP", "UDP"] }
+            }
+          }
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {
+        "image": { "description": "Image for the storage test Pod (helm test), digest-pinned.", "type": "string", "pattern": "@sha256:[0-9a-f]{64}$" }
+      }
+    }
+  },
+  "definitions": {
+    "dnsLabel": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 63 },
+    "optionalDnsLabel": { "type": "string", "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", "maxLength": 63 },
+    "dnsSubdomain": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "maxLength": 253 },
+    "optionalDnsSubdomain": { "type": "string", "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", "maxLength": 253 },
+    "secretKey": { "type": "string", "pattern": "^[-._a-zA-Z0-9]+$", "maxLength": 253 },
+    "optionalAbsolutePath": { "type": "string", "pattern": "^$|^/" },
+    "groups": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+    },
+    "resources": {
+      "type": "object",
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": { "type": "object" },
+        "limits": { "type": "object" }
+      }
+    }
+  }
+}

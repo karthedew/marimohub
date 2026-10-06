@@ -26,10 +26,7 @@ spec:
           protocol: TCP
   {{- end }}
   egress:
-    - to:
-        - namespaceSelector: {}
-      ports:
-        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- include "marimohub.dnsEgressRule" . | nindent 4 }}
     {{- if .Values.network.kubernetesApi.cidrs }}
     - to:
         {{- range .Values.network.kubernetesApi.cidrs }}

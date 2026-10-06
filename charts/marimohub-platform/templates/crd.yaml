@@ -1,0 +1,13 @@
+{{- /*
+The generated MarimoSession CRD, a byte-for-byte copy of
+deploy/crd/marimosession.yaml (make helm-check fails on drift). Rendered as a
+template, not from crds/, so helm upgrade applies CRD changes. Kept on
+uninstall: deleting it deletes every MarimoSession in the cluster.
+*/}}
+{{- if .Values.crd.enabled }}
+{{- $crd := .Files.Get "files/marimohub.io_marimosessions.yaml" | fromYaml }}
+{{- $meta := $crd.metadata }}
+{{- $_ := set $meta "labels" (include "platform.labels" . | fromYaml) }}
+{{- $_ := set $meta "annotations" (merge (dict "helm.sh/resource-policy" "keep") ($meta.annotations | default dict)) }}
+{{ toYaml $crd }}
+{{- end }}

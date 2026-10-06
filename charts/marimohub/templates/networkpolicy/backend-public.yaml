@@ -28,10 +28,7 @@ spec:
         - port: {{ .Values.backendPublic.port }}
           protocol: TCP
   egress:
-    - to:
-        - namespaceSelector: {}
-      ports:
-        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- include "marimohub.dnsEgressRule" . | nindent 4 }}
     # The Runtime Service in every Session/Deployment this backend proxies
     # to, never a specific Pod selector: the operator, not this policy,
     # decides which Runtime Pods exist.
@@ -42,15 +39,8 @@ spec:
       ports:
         - port: {{ include "marimohub.runtimePort" . }}
           protocol: TCP
-    {{- if .Values.network.database.cidrs }}
-    - to:
-        {{- range .Values.network.database.cidrs }}
-        - ipBlock:
-            cidr: {{ . }}
-        {{- end }}
-      ports:
-        - port: {{ .Values.network.database.port }}
-          protocol: TCP
+    {{- with include "marimohub.databaseEgressRule" . }}
+    {{- . | nindent 4 }}
     {{- end }}
     {{- if .Values.network.kubernetesApi.cidrs }}
     - to:

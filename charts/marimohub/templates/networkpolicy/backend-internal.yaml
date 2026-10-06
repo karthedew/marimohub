@@ -23,19 +23,9 @@ spec:
         - port: {{ .Values.backendInternal.port }}
           protocol: TCP
   egress:
-    - to:
-        - namespaceSelector: {}
-      ports:
-        {{- toYaml .Values.network.dns.ports | nindent 8 }}
-    {{- if .Values.network.database.cidrs }}
-    - to:
-        {{- range .Values.network.database.cidrs }}
-        - ipBlock:
-            cidr: {{ . }}
-        {{- end }}
-      ports:
-        - port: {{ .Values.network.database.port }}
-          protocol: TCP
+    {{- include "marimohub.dnsEgressRule" . | nindent 4 }}
+    {{- with include "marimohub.databaseEgressRule" . }}
+    {{- . | nindent 4 }}
     {{- end }}
     {{- if .Values.network.kubernetesApi.cidrs }}
     - to:

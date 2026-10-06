@@ -1,4 +1,5 @@
 {{- include "marimohub.databaseTLSGuard" . }}
+{{- include "marimohub.openshiftGuard" . }}
 {{- if and .Values.backendPublic.gitlabImport.enabled (not .Values.backendPublic.gitlabImport.allowedHosts) }}
 {{- fail "backendPublic.gitlabImport.allowedHosts is required when backendPublic.gitlabImport.enabled" }}
 {{- end }}
@@ -62,7 +63,7 @@ spec:
               containerPort: {{ .Values.backendPublic.port }}
               protocol: TCP
           {{- if not .Values.backendPublic.existingSecret }}
-          {{- fail "backendPublic.existingSecret is required (an existing Secret with DATABASE_URL, SECRET_KEY, and PUBLIC_API_URL)" }}
+          {{- fail "backendPublic.existingSecret is required (an existing Secret with DATABASE_URL and SECRET_KEY)" }}
           {{- end }}
           envFrom:
             - secretRef:
@@ -81,6 +82,13 @@ spec:
               value: "0.0.0.0"
             - name: PORT
               value: {{ .Values.backendPublic.port | quote }}
+            {{- /* The Route or Ingress host. An env entry wins over envFrom, so a
+            PUBLIC_API_URL left in existingSecret can never point sign-in
+            redirects at another host. */}}
+            {{- with include "marimohub.publicUrl" . }}
+            - name: PUBLIC_API_URL
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.backendPublic.tls.enabled }}
             - name: TLS_CERT_FILE
               value: /etc/marimohub/tls/tls.crt

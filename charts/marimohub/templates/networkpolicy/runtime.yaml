@@ -30,10 +30,7 @@ spec:
         - port: {{ include "marimohub.runtimePort" . }}
           protocol: TCP
   egress:
-    - to:
-        - namespaceSelector: {}
-      ports:
-        {{- toYaml .Values.network.dns.ports | nindent 8 }}
+    {{- include "marimohub.dnsEgressRule" . | nindent 4 }}
     # The internal API, and nothing else in namespaces.app: not
     # backend-public, not the frontend.
     - to:

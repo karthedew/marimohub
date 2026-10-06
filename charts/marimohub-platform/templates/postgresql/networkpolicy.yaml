@@ -1,0 +1,75 @@
+{{- if .Values.postgresql.enabled }}
+{{- $v := .Values }}
+{{- $name := $v.postgresql.name }}
+{{- $ns := $v.namespaces.database }}
+# Everything in the database namespace starts closed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $ns }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# Only the app's database clients, and this chart's test Pod, reach PostgreSQL.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $v.namespaces.app }}
+          podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/instance
+                operator: In
+                values: [{{ $v.app.releaseName | quote }}]
+              - key: app.kubernetes.io/component
+                operator: In
+                values: ["backend-public", "backend-internal", "migration", "reconcile-runtimes", "purge-workspaces"]
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: platform-test
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+# helm test: DNS and PostgreSQL only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-test
+  namespace: {{ $ns }}
+  labels:
+    {{- include "platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: platform-test
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        {{- toYaml $v.network.dnsPorts | nindent 8 }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ $name }}
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}

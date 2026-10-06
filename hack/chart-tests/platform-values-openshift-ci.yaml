@@ -1,0 +1,28 @@
+# Placeholders that make charts/marimohub-platform/values-openshift.yaml
+# render in make helm-check: an NFS server with one Workspace export and one
+# read-only share, an external database, and the internal registry.
+storage:
+  nfs:
+    server: nfs.example.internal
+    mountOptions: [nfsvers=4.2, hard]
+  workspaces:
+    path: /exports/marimohub
+    supplementalGroups: [5000]
+  shares:
+    - name: data
+      path: /data1/nfs
+      supplementalGroups: [5001]
+database:
+  host: db.example.internal
+  passwordSecret:
+    namespace: marimohub-platform
+    name: marimohub-db-password
+    key: password
+  cidrs: [10.0.1.0/24]
+  ca:
+    bundle: |
+      -----BEGIN CERTIFICATE-----
+      placeholder
+      -----END CERTIFICATE-----
+imageRegistry:
+  internalPullerNamespace: marimohub

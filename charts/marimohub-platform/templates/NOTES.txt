@@ -1,0 +1,31 @@
+{{- $openshift := eq .Values.platform "openshift" -}}
+MarimoHub platform prerequisites are {{ if .Release.IsUpgrade }}upgraded{{ else }}installed{{ end }} (release "{{ .Release.Name }}", namespace "{{ .Release.Namespace }}").
+
+Created: namespaces {{ .Values.namespaces.app }}, {{ .Values.namespaces.controller }}, {{ .Values.namespaces.sessions }}{{ if .Values.postgresql.enabled }}, {{ .Values.namespaces.database }}{{ end }} (Pod Security "{{ .Values.namespaces.podSecurity }}"){{ if .Values.crd.enabled }}, the MarimoSession CRD{{ end }}{{ if .Values.admissionPolicy.enabled }}, the label-identity admission policy{{ end }}, Secrets and storage claims{{ if .Values.postgresql.enabled }}, and the evaluation PostgreSQL{{ end }}.
+Helm keeps the generated Secrets in namespace "{{ .Release.Namespace }}" too. Only cluster administrators should read it.
+
+Next steps:
+  1. Check the claims{{ if .Values.postgresql.enabled }} and the database{{ end }}:
+       helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+     If a test fails, read its log:
+       kubectl -n {{ .Values.namespaces.sessions }} logs {{ .Release.Name }}-storage-test
+{{- if .Values.postgresql.enabled }}
+       kubectl -n {{ .Values.namespaces.database }} logs {{ .Release.Name }}-database-test
+{{- end }}
+  2. Save the app chart values that point at what this release created:
+       kubectl -n {{ .Values.namespaces.app }} get configmap marimohub-platform-values -o jsonpath='{.data.values\.yaml}' > platform-values.yaml
+  3. Install the app chart with the profile file, then that file, then your own values
+     ({{ if $openshift }}routes.host and the images{{ else }}ingress.host, one of tls.publicHosts, and the images{{ end }}):
+       helm install {{ .Values.app.releaseName }} charts/marimohub -n {{ .Values.namespaces.app }} \
+         -f charts/marimohub/values-{{ if $openshift }}openshift{{ else }}kind{{ end }}.yaml -f platform-values.yaml -f marimohub.yaml{{ if $openshift }} --timeout 15m{{ end }}
+
+Upgrade this release before the app release: it applies CRD and policy changes{{ if $openshift }} and copies
+the current service CA into {{ .Values.internalApiCA.name }}; run it again after OpenShift rotates the
+service CA{{ end }}.
+
+platform-values.yaml:
+{{ include "platform.appValues" . | indent 2 }}
+
+helm uninstall {{ .Release.Name }} keeps the namespaces, the CRD, the Secrets, the volumes and
+the claims (helm.sh/resource-policy: keep). Uninstall the app release first. See deploy/README.md
+to remove everything.

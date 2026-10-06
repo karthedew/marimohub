@@ -1,0 +1,10 @@
+# Placeholders that make charts/marimohub/values-openshift.yaml render in
+# make helm-check. A real install gets these from platform-values.yaml (the
+# marimohub-platform chart) and its own values file.
+routes:
+  host: marimohub.apps.example.com
+network:
+  kubernetesApi:
+    cidrs: [10.0.0.10/32, 10.0.0.11/32, 10.0.0.12/32]
+  database:
+    cidrs: [10.0.1.0/24]

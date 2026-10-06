@@ -1,0 +1,42 @@
+{{- include "platform.validate" . }}
+{{- /*
+The app chart's NetworkPolicies select these namespaces by the automatic
+kubernetes.io/metadata.name label, so their names alone must match its
+namespaces.* values. Never label them with network.openshift.io/policy-group
+or policy-group.network.openshift.io/*: OpenShift reserves those for its own
+namespaces. Kept on uninstall: the sessions namespace's UID range owns every
+Workspace file a Runtime wrote.
+*/}}
+{{- $namespaces := list .Values.namespaces.app .Values.namespaces.controller .Values.namespaces.sessions }}
+{{- if .Values.postgresql.enabled }}
+{{- $namespaces = append $namespaces .Values.namespaces.database }}
+{{- end }}
+{{- range $ns := $namespaces }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ $.Values.namespaces.podSecurity }}
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: {{ $.Values.namespaces.podSecurity }}
+    pod-security.kubernetes.io/warn: {{ $.Values.namespaces.podSecurity }}
+    {{- if eq $.Values.platform "openshift" }}
+    # Keeps OpenShift's label syncer from lowering audit and warn to match
+    # whatever SCC a ServiceAccount here is later granted.
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    {{- end }}
+    {{- with $.Values.namespaces.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    {{- include "platform.keep" $ | nindent 4 }}
+    {{- if and (eq $.Values.platform "openshift") (eq $ns $.Values.namespaces.sessions) $.Values.namespaces.sessionsNodeSelector }}
+    openshift.io/node-selector: {{ $.Values.namespaces.sessionsNodeSelector | quote }}
+    {{- end }}
+    {{- with $.Values.namespaces.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

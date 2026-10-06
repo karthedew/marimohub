@@ -1,8 +1,9 @@
-# OpenShift production profile: STIG-aligned, service-serving certificates,
-# and re-encrypt Routes (added once templates/routes/ exists). Replace the
-# Kubernetes API and database CIDRs with the values your cluster/network
-# team publishes -- this chart cannot discover either portably (see
-# values.yaml's network section for why).
+# OpenShift 4.17+ production profile (OVN-Kubernetes, restricted-v2 SCC):
+# service-serving certificates and re-encrypt Routes. Install the
+# marimohub-platform chart first and pass the platform-values.yaml it writes
+# after this file; it fills in the Kubernetes API endpoints and points every
+# Secret and claim name below at what it created. Then set routes.host and
+# the images in your own values file. See deploy/README.md, "OpenShift".
 
 platform: openshift
 
@@ -16,12 +17,13 @@ ingress:
 frontend:
   tls:
     enabled: true
-    # OpenShift auto-provisions this Secret because
-    # openshift.serviceServingCerts.enabled annotates the Service with it;
-    # the name only has to match, never be created by hand.
+    # OpenShift's service CA creates this Secret from the Service's
+    # serving-cert annotation (openshift.serviceServingCerts.enabled); the
+    # name only has to match, never be created by hand.
     secretName: marimohub-frontend-tls
 
 backendPublic:
+  # DATABASE_URL and SECRET_KEY. PUBLIC_API_URL comes from routes.host.
   existingSecret: marimohub-backend-env
   tls:
     enabled: true
@@ -34,17 +36,21 @@ backendInternal:
     secretName: marimohub-backend-internal-tls
 
 # Verified TLS to PostgreSQL is required in this profile (see the Security
-# Baseline): an administrator creates this Secret from the external
-# database's own CA before installing.
+# Baseline). The platform chart writes this Secret from the database's CA.
 database:
   tls:
     enabled: true
     caSecretName: marimohub-database-ca
     caSecretKey: ca.crt
 
-# Same service-serving-certificate pattern as frontend/backendPublic/
-# backendInternal above; cluster monitoring can then scrape this Service
-# over TLS the way network.monitoring.enabled below already allows into it.
+# The migration hook runs the backend image. On a fresh node its pull counts
+# against this deadline, so install and upgrade with --timeout 15m as well.
+migration:
+  activeDeadlineSeconds: 900
+
+# Same service-serving-certificate pattern as the frontend and backends. The
+# user-workload Prometheus scrapes the ServiceMonitor once a cluster admin
+# enables user-workload monitoring.
 monitoring:
   tls:
     enabled: true
@@ -52,47 +58,79 @@ monitoring:
   serviceMonitor:
     enabled: true
 
-# Both left empty for the same reason network.kubernetesApi/database.cidrs
-# below are: neither the public hostname nor the cluster's service-ca bundle
-# content is something this chart can discover or default safely. Set both
-# before a real install -- host to the hostname DNS points at this cluster's
-# router, destinationCACertificate to the contents of the
-# `openshift-service-ca.crt` ConfigMap any namespace already carries
-# (`oc get configmap openshift-service-ca.crt -o jsonpath='{.data.service-ca\.crt}'`).
 routes:
+  # Required: the public host name, for example marimohub.apps.example.com.
   host: ""
+  hsts: max-age=31536000
+  # Idle limit for notebook WebSockets. The /api Route also keeps
+  # haproxy.router.openshift.io/timeout at runtime.startTimeoutSeconds + 30s.
+  tunnelTimeout: 1h
+  # Leave empty: the router then verifies the service CA itself.
   destinationCACertificate: ""
+  tls:
+    # OpenShift 4.19+: a kubernetes.io/tls Secret in the marimohub namespace
+    # for a host outside the cluster's apps domain.
+    externalCertificateSecretName: ""
 
 runtime:
   internalApiCA:
-    # The cluster's own service-ca bundle, mirrored into namespaces.sessions
-    # (OpenShift publishes it cluster-wide as a ConfigMap, not a Secret, in
-    # every namespace as `openshift-service-ca.crt`; an administrator copies
-    # its content into this Secret once per Runtime namespace).
+    # Written by the platform chart from the cluster's service CA.
     secretName: marimohub-internal-api-ca
-    secretKey: service-ca.crt
+    secretKey: ca.crt
+  # 50 people running notebooks at once, each Runtime requesting
+  # 250m/512Mi/256Mi and limited to 1/2Gi/1Gi: 80 Pods leaves room for run
+  # Sessions, second notebooks and awake Deployments. Worker nodes need about
+  # 20 CPU and 40 GiB allocatable for Runtimes alone; limits are overcommitted.
+  quota:
+    hard:
+      pods: "80"
+      requests.cpu: "20"
+      requests.memory: 40Gi
+      requests.ephemeral-storage: 20Gi
+      limits.cpu: "80"
+      limits.memory: 160Gi
+      limits.ephemeral-storage: 80Gi
 
 network:
+  # OpenShift DNS Pods listen on 5353 behind the dns-default Service's port
+  # 53, and OVN-Kubernetes matches egress after the Service DNAT.
+  dns:
+    to:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: openshift-dns
+        podSelector:
+          matchLabels:
+            dns.operator.openshift.io/daemonset-dns: default
+    ports:
+      - { port: 5353, protocol: UDP }
+      - { port: 5353, protocol: TCP }
+      - { port: 53, protocol: UDP }
+      - { port: 53, protocol: TCP }
   kubernetesApi:
-    # The cluster's API server load balancer endpoint(s), from
-    # `oc get endpoints kubernetes -n default`.
+    # Required. platform-values.yaml fills these from the cluster.
     cidrs: []
     port: 6443
   database:
+    # Required: cidrs for an external database, or peers for one in the
+    # cluster. platform-values.yaml fills them from the platform chart.
     cidrs: []
+    peers: []
     port: 5432
+  # Every IngressController, including host-network ones on bare metal and
+  # vSphere. OVN-Kubernetes matches host-network router Pods only through
+  # this namespace label with an empty podSelector.
   router:
     namespaceSelector:
       matchLabels:
-        kubernetes.io/metadata.name: openshift-ingress
-    podSelector:
-      matchLabels:
-        ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default
+        policy-group.network.openshift.io/ingress: ""
+    podSelector: {}
+  # Both the platform and the user-workload Prometheus.
   monitoring:
     enabled: true
     namespaceSelector:
       matchLabels:
-        kubernetes.io/metadata.name: openshift-monitoring
+        network.openshift.io/policy-group: monitoring
     podSelector:
       matchLabels:
         app.kubernetes.io/name: prometheus

@@ -214,7 +214,6 @@ OPENSHIFT_SMOKE := hack/smoke/openshift/run.sh
 # a live cluster to ask, which is below the chart's own kubeVersion floor;
 # every offline render pins this explicitly instead.
 CHART_KUBE_VERSION := 1.35.0
-CHART_PROFILES := values-kind.yaml values-openshift.yaml
 
 .PHONY: bootstrap-tools verify-tools generate verify-generated \
 	operator-check operator-test backend-check frontend-check \
@@ -273,32 +272,15 @@ images:
 	$(ENGINE) build -f images/marimo-runtime/Containerfile.ubi -t marimohub-runtime-ubi:dev images/marimo-runtime
 
 # Lints, schema-validates (values.schema.json runs automatically as part of
-# lint/template whenever it is present), renders, and policy-checks the
-# chart against both shipped profiles. Nothing here renders bare
-# values.yaml alone: several required fields (TLS Secret names, the
-# database/Kubernetes API CIDRs) are deliberately left empty there so a
-# real install always supplies them through values-kind.yaml/
-# values-openshift.yaml or an equivalent override, never silently falls
-# back to an insecure or non-functional default.
+# lint/template), renders, and policy-checks charts/marimohub and
+# charts/marimohub-platform against every shipped profile: strict
+# kubeconform with pinned OpenShift Route and ServiceMonitor schemas,
+# kube-linter, the assertions in hack/chart-tests, and the preflight script
+# tests. Nothing here renders bare values.yaml alone: the openshift profiles
+# render with the placeholder overlays in hack/chart-tests, so a real install
+# always supplies the host, network and storage values itself.
 helm-check:
-	@set -e; \
-	for profile in $(CHART_PROFILES); do \
-		echo "== helm lint ($$profile) =="; \
-		.bin/helm lint $(CHARTS_DIR) -f "$(CHARTS_DIR)/$$profile" --kube-version $(CHART_KUBE_VERSION); \
-	done; \
-	rendered=$$(mktemp -d); \
-	trap 'rm -rf "$$rendered"' EXIT; \
-	for profile in $(CHART_PROFILES); do \
-		out="$$rendered/$${profile%.yaml}.yaml"; \
-		echo "== helm template ($$profile) =="; \
-		.bin/helm template marimohub-check $(CHARTS_DIR) -f "$(CHARTS_DIR)/$$profile" --kube-version $(CHART_KUBE_VERSION) --include-crds > "$$out"; \
-		echo "== kubeconform ($$profile) =="; \
-		.bin/kubeconform -kubernetes-version $(CHART_KUBE_VERSION) -summary -ignore-missing-schemas "$$out"; \
-		echo "== kube-linter ($$profile) =="; \
-		.bin/kube-linter lint "$$out"; \
-		echo "== RBAC/NetworkPolicy/image/security-context assertions ($$profile) =="; \
-		HELM=.bin/helm python3 hack/chart-tests/verify_chart.py $(CHARTS_DIR) "$(CHARTS_DIR)/$$profile"; \
-	done
+	@CHART_KUBE_VERSION=$(CHART_KUBE_VERSION) hack/chart-tests/helm-check.sh
 
 # A long-lived local cluster running the real Kubernetes Runtime backend,
 # with Workspace storage mocked by a host directory (MARIMOHUB_NFS_DIR,
@@ -326,6 +308,23 @@ openshift-smoke:
 		echo "openshift-smoke: $(OPENSHIFT_SMOKE) does not exist yet (Phase 9 adds it)"; \
 		exit 1; \
 	fi
+
+.PHONY: openshift-install-test openshift-image-smoke
+
+# Installs charts/marimohub-platform and charts/marimohub on a throwaway kind
+# cluster named ocp-test with its own kubeconfig, checks Pod Security
+# admission, NetworkPolicy, Secrets across upgrade and reinstall, the CRD
+# upgrade path, and the OpenShift Route and ServiceMonitor shapes against
+# their real CRDs, then deletes the cluster. It never touches another cluster
+# or the default kubeconfig. See hack/chart-tests/platform-install-test.sh for
+# running the app itself with locally built images.
+openshift-install-test:
+	@hack/chart-tests/platform-install-test.sh
+
+# Runs every image from `make images` the way OpenShift's restricted-v2 SCC
+# does: an arbitrary UID in group 0, a read-only root and no capabilities.
+openshift-image-smoke:
+	@hack/chart-tests/arbitrary-uid-images.sh
 
 # All checks that do not require a live cluster.
 verify: verify-tools verify-generated backend-check frontend-check operator-check helm-check

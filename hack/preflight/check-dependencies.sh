@@ -5,26 +5,32 @@
 # target namespace and carries every key the chart's templates read out of
 # it. This is real cluster access, unlike `helm template`/`helm lint`, which
 # stay offline-deterministic by design: Helm has no supported way to inspect
-# an external Secret's actual keys without `lookup`, and this repository's
-# conventions forbid `lookup` for anything beyond this versioned preflight
-# surface (see check-namespaces.sh for the same reasoning applied to
-# namespaces).
+# an external Secret's actual keys without `lookup`, and the app chart
+# (charts/marimohub) never uses `lookup`. Only the admin-installed
+# charts/marimohub-platform chart does, to generate the Secrets this script
+# checks and keep them across upgrades.
 #
 # Run once per required Secret, before `helm install`/`helm upgrade`, e.g.:
 #
 #   check-dependencies.sh marimohub marimohub-backend-env DATABASE_URL SECRET_KEY
+#   check-dependencies.sh marimohub marimohub-database-ca ca.crt
+#   check-dependencies.sh marimohub-sessions marimohub-internal-api-ca ca.crt
+#
+# and on the portable profile, where you supply the Service certificates:
+#
 #   check-dependencies.sh marimohub marimohub-frontend-tls tls.crt tls.key
 #   check-dependencies.sh marimohub marimohub-backend-public-tls tls.crt tls.key
 #   check-dependencies.sh marimohub marimohub-backend-internal-tls tls.crt tls.key
-#   check-dependencies.sh marimohub marimohub-database-ca ca.crt
-#   check-dependencies.sh marimohub-sessions marimohub-internal-api-ca ca.crt
+#
+# On OpenShift the service CA creates those three only after the app chart's
+# Services exist, so do not check them before installing there.
 #
 # A Secret name left empty in values (e.g. an unset runtime.imagePullSecrets
 # entry, or database.tls disabled) simply has nothing to check here -- only
 # invoke this for a Secret name the chosen values file actually configures.
 set -Eeuo pipefail
 
-PREFLIGHT_VERSION="0.1.0"
+PREFLIGHT_VERSION="0.2.0"
 KUBECTL="${KUBECTL:-kubectl}"
 
 usage() {
@@ -71,10 +77,10 @@ if ! secret_json=$("${KUBECTL}" "${kubeconfig_args[@]}" get secret "${secret_nam
 fi
 
 for key in "${required_keys[@]}"; do
-	# `.data["<key>"]` (not `.data.<key>`): a Secret key may itself contain
-	# dots (e.g. `ca.crt`), which jsonpath would otherwise parse as nested
-	# field access instead of one literal key.
-	value=$("${KUBECTL}" "${kubeconfig_args[@]}" get secret "${secret_name}" -n "${namespace}" -o jsonpath="{.data['${key}']}" 2>/dev/null || true)
+	# A Secret key may contain dots (e.g. `ca.crt`). kubectl's jsonpath reads
+	# an unescaped dot as a field separator, even inside `['...']`, and then
+	# prints nothing, so every dot is escaped: `{.data.ca\.crt}`.
+	value=$("${KUBECTL}" "${kubeconfig_args[@]}" get secret "${secret_name}" -n "${namespace}" -o jsonpath="{.data.${key//./\\.}}" 2>/dev/null || true)
 	if [[ -z "${value}" ]]; then
 		echo "preflight: Secret '${secret_name}' in namespace '${namespace}' is missing key '${key}' (or the key's value is empty)" >&2
 		failures=$((failures + 1))

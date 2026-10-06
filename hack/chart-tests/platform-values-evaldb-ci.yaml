@@ -1,0 +1,6 @@
+# Layered over platform-values-openshift-ci.yaml: the evaluation PostgreSQL
+# instead of the external database.
+postgresql:
+  enabled: true
+database:
+  host: ""

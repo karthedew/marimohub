@@ -82,11 +82,6 @@ and the operator/backend disagree about a number neither side ever varies.
 8080
 {{- end -}}
 
-{{/*
-Router timeout, in seconds, for the public API: the backend's own Runtime
-start timeout plus headroom, so the router never cuts off a start or wake
-request the backend is still legitimately waiting on.
-*/}}
 {{- define "marimohub.sharedVolumesJson" -}}
 {{- /*
 The operator's --shared-volumes value: runtime.sharedVolumes with the chart's
@@ -104,6 +99,11 @@ flag can never disagree about them.
 {{- toJson $volumes -}}
 {{- end -}}
 
+{{/*
+Router timeout, in seconds, for the public API: the backend's own Runtime
+start timeout plus headroom, so the router never cuts off a start or wake
+request the backend is still legitimately waiting on.
+*/}}
 {{- define "marimohub.routerTimeoutSeconds" -}}
 {{- add .Values.runtime.startTimeoutSeconds 30 -}}
 {{- end -}}
@@ -124,15 +124,6 @@ to a mutable "latest" tag.
 {{- end -}}
 
 {{/*
-The default host+zone topologySpreadConstraints for one component's own
-Pods, used whenever that component's own `topologySpreadConstraints` value
-is left empty. `ScheduleAnyway` (not `DoNotSchedule`) so a single-zone or
-single-node development cluster still schedules every replica instead of
-leaving Pods Pending -- production HA comes from the constraint steering
-the scheduler's preference, not from hard-blocking placement. Call as
-`include "marimohub.defaultTopologySpreadConstraints" (dict "ctx" $ "component" "frontend")`.
-*/}}
-{{/*
 Fails the render if verified PostgreSQL TLS is required but unconfigured:
 the openshift platform profile always requires database.tls.enabled (see
 the Security Baseline), and enabling it anywhere requires naming the
@@ -150,6 +141,86 @@ them.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Fails the render when an openshift install would come up broken without any
+error: Routes with no host each get a different generated host, so / and
+/api no longer share one origin; with no Kubernetes API or database egress,
+the operator and both backends cannot reach either one under default-deny.
+Called with no output next to databaseTLSGuard in every workload template.
+*/}}
+{{- define "marimohub.openshiftGuard" -}}
+{{- if eq .Values.platform "openshift" -}}
+{{- if not .Values.routes.host -}}
+{{- fail "routes.host is required on the openshift profile: both Routes must share one host" -}}
+{{- end -}}
+{{- if not .Values.network.kubernetesApi.cidrs -}}
+{{- fail "network.kubernetesApi.cidrs is required on the openshift profile (the API server endpoints; platform-values.yaml from the marimohub-platform chart sets them)" -}}
+{{- end -}}
+{{- if not (or .Values.network.database.cidrs .Values.network.database.peers) -}}
+{{- fail "network.database.cidrs or network.database.peers is required on the openshift profile" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The public https:// URL of this install, which every sign-in redirect URI is
+built from: the Route host on openshift, the Ingress host on portable, or
+empty when neither is rendered (backendPublic.existingSecret must then carry
+PUBLIC_API_URL itself).
+*/}}
+{{- define "marimohub.publicUrl" -}}
+{{- if eq .Values.platform "openshift" -}}
+{{- with .Values.routes.host }}https://{{ . }}{{ end -}}
+{{- else if .Values.ingress.enabled -}}
+{{- with .Values.ingress.host }}https://{{ . }}{{ end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+One NetworkPolicy egress rule for DNS: network.dns.to on network.dns.ports.
+Every component's policy renders DNS through this, so the profiles change it
+in one place. OpenShift's DNS Pods listen on 5353 behind the dns-default
+Service's port 53, and OVN-Kubernetes matches egress after the Service DNAT,
+so values-openshift.yaml names those Pods and both ports.
+*/}}
+{{- define "marimohub.dnsEgressRule" -}}
+- to:
+    {{- toYaml .Values.network.dns.to | nindent 4 }}
+  ports:
+    {{- toYaml .Values.network.dns.ports | nindent 4 }}
+{{- end -}}
+
+{{/*
+The egress rule to PostgreSQL: one ipBlock per network.database.cidrs entry,
+then each network.database.peers entry (NetworkPolicyPeer objects, for a
+database running in the cluster), on network.database.port/TCP. Renders
+nothing when both lists are empty.
+*/}}
+{{- define "marimohub.databaseEgressRule" -}}
+{{- if or .Values.network.database.cidrs .Values.network.database.peers -}}
+- to:
+    {{- range .Values.network.database.cidrs }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
+    {{- with .Values.network.database.peers }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  ports:
+    - port: {{ .Values.network.database.port }}
+      protocol: TCP
+{{- end -}}
+{{- end -}}
+
+{{/*
+The default host+zone topologySpreadConstraints for one component's own
+Pods, used whenever that component's own `topologySpreadConstraints` value
+is left empty. `ScheduleAnyway` (not `DoNotSchedule`) so a single-zone or
+single-node development cluster still schedules every replica instead of
+leaving Pods Pending -- production HA comes from the constraint steering
+the scheduler's preference, not from hard-blocking placement. Call as
+`include "marimohub.defaultTopologySpreadConstraints" (dict "ctx" $ "component" "frontend")`.
+*/}}
 {{- define "marimohub.defaultTopologySpreadConstraints" -}}
 {{- $labels := include "marimohub.componentSelectorLabels" (dict "ctx" .ctx "component" .component) -}}
 - maxSkew: 1

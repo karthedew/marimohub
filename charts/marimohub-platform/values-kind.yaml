@@ -1,0 +1,35 @@
+# Single-node kind test profile: hostPath volumes stand in for NFS exports,
+# and the evaluation PostgreSQL is on. Never use hostPath on OpenShift.
+#
+# The node directories match hack/kind/up.sh's node mounts. Each
+# supplementalGroups entry must equal the group that owns that directory on
+# the node: workspaces/ under /var/lib/marimohub/data (setgid, mode 2775) and
+# the files under /var/lib/marimohub/nfs.
+platform: portable
+
+tls:
+  # The host the app chart's Ingress serves (ingress.host).
+  publicHosts: [marimohub]
+
+storage:
+  mode: hostPath
+  workspaces:
+    path: /data1/marimohub
+    hostPath: /var/lib/marimohub/data
+    capacity: 100Gi
+    supplementalGroups: [5000]
+  shares:
+    - name: nfs
+      claimName: marimohub-nfs
+      path: /data1/nfs
+      hostPath: /var/lib/marimohub/nfs
+      modes: [edit, run, deploy]
+      supplementalGroups: [5001]
+
+postgresql:
+  enabled: true
+  # The postgres user of the pgvector image. OpenShift assigns its own.
+  podSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    fsGroup: 999

@@ -1,0 +1,35 @@
+{{- /*
+The router reads a Route's spec.tls.externalCertificate Secret with its own
+ServiceAccount, so it needs read access to exactly that one Secret in this
+namespace, and nothing else.
+*/}}
+{{- if and (eq .Values.platform "openshift") .Values.routes.tls.externalCertificateSecretName }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "route-certificate") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "route-certificate") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.routes.tls.externalCertificateSecretName | quote }}]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "route-certificate") }}
+  namespace: {{ .Values.namespaces.app }}
+  labels:
+    {{- include "marimohub.componentLabels" (dict "ctx" $ "component" "route-certificate") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "marimohub.componentName" (dict "ctx" $ "component" "route-certificate") }}
+subjects:
+  - kind: ServiceAccount
+    name: router
+    namespace: openshift-ingress
+{{- end }}

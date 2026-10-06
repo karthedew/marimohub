@@ -25,12 +25,24 @@ spec:
       {{- if .Values.monitoring.tls.enabled }}
       scheme: https
       tlsConfig:
+        {{- if eq .Values.platform "openshift" }}
+        # The service CA issues monitoring.tls.secretName from the Service's
+        # serving-cert annotation, and OpenShift keeps its bundle current in
+        # every namespace as the openshift-service-ca.crt ConfigMap.
+        # Prometheus scrapes Pod IPs, so serverName names the Service.
+        ca:
+          configMap:
+            name: openshift-service-ca.crt
+            key: service-ca.crt
+        serverName: {{ include "marimohub.componentName" (dict "ctx" $ "component" "operator") }}.{{ .Values.namespaces.controller }}.svc
+        {{- else }}
         # NetworkPolicy (network.monitoring), not certificate trust, is what
         # actually bounds who can reach this port; skipping verification
         # here avoids requiring Prometheus to separately trust whatever
-        # issued monitoring.tls.secretName (a service-serving certificate on
-        # OpenShift, an administrator-supplied Secret elsewhere) while still
-        # keeping the wire itself encrypted.
+        # issued monitoring.tls.secretName (an administrator-supplied Secret
+        # on the portable profile) while still keeping the wire itself
+        # encrypted.
         insecureSkipVerify: true
+        {{- end }}
       {{- end }}
 {{- end }}
